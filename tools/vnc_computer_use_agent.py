@@ -10,6 +10,7 @@ import base64
 import io
 import json
 import os
+import select
 import shutil
 import signal
 import struct
@@ -230,6 +231,19 @@ def resolve_keysym(key_name: str) -> int:
     raise ValueError(f"Unsupported key name: {key_name!r}")
 
 
+def summarize_for_overlay(
+    text: str,
+    fallback: str = "Awaiting next instruction",
+    max_len: int = 72,
+) -> str:
+    collapsed = " ".join((text or "").split())
+    if not collapsed:
+        return fallback
+    if len(collapsed) <= max_len:
+        return collapsed
+    return collapsed[: max(0, max_len - 3)] + "..."
+
+
 class AgentPausedError(RuntimeError):
     """Raised when synthetic input is blocked by operator PAUSE_AGENT."""
 
@@ -309,6 +323,11 @@ class VncDesktopExecutor:
             bool(resp.get("agent_paused", False)),
         )
 
+    def resume_agent(self) -> None:
+        resp, _ = self.client.request("RESUME_AGENT")
+        if not resp.get("ok"):
+            raise RuntimeError(f"RESUME_AGENT failed: {resp}")
+
     def wait_until_resumed(self) -> Tuple[int, List[str]]:
         st = self.get_status()
         start_human = int(st.get("human_action_count", 0))
@@ -318,15 +337,143 @@ class VncDesktopExecutor:
             action="paused",
             intent="Human collaborator in control - resume when ready",
         )
+        end_human = start_human
+        connected_ok = True
         while True:
-            st = self.get_status()
+            try:
+                st = self.get_status()
+            except (EOFError, ConnectionError, BrokenPipeError, OSError) as e:
+                print(f"  [COLLAB] Viewer connection closed while paused ({e}).")
+                connected_ok = False
+                break
+            end_human = int(st.get("human_action_count", end_human))
             if not st.get("agent_paused") or not st.get("connected"):
+                connected_ok = bool(st.get("connected"))
                 break
             time.sleep(0.25)
-        end_human = int(st.get("human_action_count", start_human))
-        notes, _, _ = self.poll_user_messages()
+        notes: List[str] = []
+        if connected_ok:
+            try:
+                notes, end_human, _ = self.poll_user_messages()
+            except (EOFError, ConnectionError, BrokenPipeError, OSError) as e:
+                print(f"  [COLLAB] Viewer connection closed while polling notes ({e}).")
         print(f"  [COLLAB] Resumed (human_actions={max(0, end_human - start_human)}, notes={len(notes)})")
         return max(0, end_human - start_human), notes
+
+    def wait_for_next_instruction(
+        self,
+        viewer_proc: Optional[subprocess.Popen] = None,
+        overlay_intent: str = "Awaiting your next instruction",
+        poll_interval: float = 0.25,
+        use_stdin: Optional[bool] = None,
+    ) -> Optional[Tuple[str, int]]:
+        try:
+            st = self.get_status()
+        except (EOFError, ConnectionError, BrokenPipeError, OSError) as e:
+            print(f"\n[COLLAB] Viewer disconnected ({e}); ending session.")
+            return None
+
+        if not st.get("connected"):
+            print("\n[COLLAB] VNC connection closed; ending session.")
+            return None
+
+        start_human = int(st.get("human_action_count", 0))
+        self.set_overlay(
+            state="waiting_user",
+            action="waiting",
+            intent=overlay_intent,
+        )
+
+        stdin_enabled = (
+            bool(sys.stdin is not None and sys.stdin.isatty())
+            if use_stdin is None
+            else bool(use_stdin)
+        )
+
+        print("\n[COLLAB] Waiting for your next instruction:")
+        print("  - In vncviewer: press Ctrl+Alt+N (or right-click -> 'Send note to agent...')")
+        if stdin_enabled:
+            print("  - Or type your next instruction below (type 'exit' or '/exit' to quit).")
+            print("collab> ", end="", flush=True)
+        else:
+            print("  - Send '/exit' or '/quit' as a note, or close vncviewer / press Ctrl+C to end.")
+
+        try:
+            while True:
+                if viewer_proc is not None and viewer_proc.poll() is not None:
+                    print(f"\n[COLLAB] vncviewer exited (code {viewer_proc.returncode}); ending session.")
+                    return None
+
+                try:
+                    st = self.get_status()
+                except (EOFError, ConnectionError, BrokenPipeError, OSError) as e:
+                    print(f"\n[COLLAB] Viewer disconnected ({e}); ending session.")
+                    return None
+
+                if not st.get("connected"):
+                    print("\n[COLLAB] VNC connection closed; ending session.")
+                    return None
+
+                if int(st.get("pending_user_messages", 0)) > 0:
+                    notes, end_human, paused = self.poll_user_messages()
+                    cleaned = [str(n).strip() for n in notes if str(n).strip()]
+                    if any(n.lower() in ("/exit", "/quit") for n in cleaned):
+                        print("\n[COLLAB] Received exit command; ending session.")
+                        return None
+                    if cleaned:
+                        instruction = "\n".join(cleaned)
+                        if paused:
+                            self.resume_agent()
+                        human_delta = max(0, end_human - start_human)
+                        print(f"\n[COLLAB] Received instruction from vncviewer: {instruction}")
+                        return instruction, human_delta
+
+                if stdin_enabled:
+                    readable, _, _ = select.select([sys.stdin], [], [], poll_interval)
+                    if readable:
+                        line = sys.stdin.readline()
+                        if line == "":
+                            print("\n[COLLAB] Stdin EOF received; ending session.")
+                            return None
+                        instruction = line.strip()
+                        if not instruction:
+                            print("collab> ", end="", flush=True)
+                            continue
+                        if instruction.lower() in ("exit", "quit", "/exit", "/quit"):
+                            print("\n[COLLAB] Exit requested; ending session.")
+                            return None
+
+                        try:
+                            st_now = self.get_status()
+                        except (EOFError, ConnectionError, BrokenPipeError, OSError) as e:
+                            print(f"\n[COLLAB] Viewer disconnected ({e}); ending session.")
+                            return None
+
+                        if not st_now.get("connected"):
+                            print("\n[COLLAB] VNC connection closed; ending session.")
+                            return None
+
+                        paused = bool(st_now.get("agent_paused"))
+                        end_human = int(st_now.get("human_action_count", start_human))
+                        if int(st_now.get("pending_user_messages", 0)) > 0:
+                            notes, end_human, paused = self.poll_user_messages()
+                            cleaned = [str(n).strip() for n in notes if str(n).strip()]
+                            if any(n.lower() in ("/exit", "/quit") for n in cleaned):
+                                print("\n[COLLAB] Received exit command; ending session.")
+                                return None
+                            if cleaned:
+                                instruction = instruction + "\n" + "\n".join(cleaned)
+
+                        if paused:
+                            self.resume_agent()
+                        human_delta = max(0, end_human - start_human)
+                        print(f"\n[COLLAB] Received instruction from terminal: {instruction}")
+                        return instruction, human_delta
+                else:
+                    time.sleep(poll_interval)
+        except KeyboardInterrupt:
+            print("\n[COLLAB] Interrupted by user; ending collaborative session.")
+            return None
 
     def _pointer(self, x: int, y: int, mask: int) -> None:
         resp, _ = self.client.request("POINTER_EVENT", x=int(x), y=int(y), button_mask=int(mask))
@@ -655,7 +802,9 @@ def run_agent(args: argparse.Namespace) -> int:
 
     temp_dir: Optional[str] = None
     viewer_proc: Optional[subprocess.Popen] = None
+    viewer_log: Optional[Any] = None
     socket_path = args.socket
+    collaborate_mode = bool(args.collaborate)
 
     windowed = bool(args.windowed or args.collaborate)
     action_delay = (
@@ -725,232 +874,333 @@ def run_agent(args: argparse.Namespace) -> int:
                 f"({status.get('desktop_name', '')})"
             )
 
-            init_png, init_hdr = executor.capture_png(settle_delay=0.2, max_wait=1.0)
-            if log_dir:
-                with open(os.path.join(log_dir, "turn_00_initial.png"), "wb") as f:
-                    f.write(init_png)
+            collaborate_mode = bool(args.collaborate or status.get("collaborate"))
+            stay_interactive = collaborate_mode and not bool(getattr(args, "one_shot", False))
 
-            print(f"Goal: {args.prompt}")
-            executor.set_overlay("thinking", "thinking", "Analyzing screen and planning next action...")
-            interaction = llm.create(
-                input_payload=[
-                    {"type": "text", "text": args.prompt},
+            def start_user_turn(
+                prompt_text: str,
+                png_bytes: bytes,
+                prev_id: Optional[str],
+            ) -> Dict[str, Any]:
+                payload = [
+                    {"type": "text", "text": prompt_text},
                     {
                         "type": "image",
-                        "data": base64.b64encode(init_png).decode("ascii"),
+                        "data": base64.b64encode(png_bytes).decode("ascii"),
                         "mime_type": "image/png",
                     },
                 ]
-            )
+                if prev_id:
+                    try:
+                        return llm.create(input_payload=payload, previous_interaction_id=prev_id)
+                    except RuntimeError as e:
+                        print(f"  [COLLAB] Starting fresh LLM session (previous interaction unavailable: {e})")
+                return llm.create(input_payload=payload, previous_interaction_id=None)
 
-            for turn in range(1, args.max_turns + 1):
-                print(f"\n--- Turn {turn} (interaction={interaction.get('id')}, status={interaction.get('status')}) ---")
-                steps = interaction.get("steps", [])
-                function_calls = [s for s in steps if s.get("type") == "function_call"]
+            global_turn = 0
+            task_index = 0
+            last_completed_interaction_id: Optional[str] = None
+            current_prompt: Optional[str] = args.prompt.strip() if args.prompt else ""
 
-                if not function_calls:
-                    final_text = extract_model_text(interaction)
-                    executor.set_overlay("done", "done", "Task completed")
-                    print(f"Agent finished:\n{final_text}")
-                    final_png, _ = executor.capture_png(settle_delay=0.2, max_wait=0.8)
-                    if log_dir:
-                        with open(os.path.join(log_dir, "final.png"), "wb") as f:
-                            f.write(final_png)
-                    if trace_file:
-                        trace_file.write(
-                            json.dumps(
-                                {
-                                    "turn": turn,
-                                    "status": interaction.get("status"),
-                                    "final_text": final_text,
-                                }
-                            )
-                            + "\n"
+            while True:
+                if not current_prompt:
+                    if stay_interactive:
+                        nxt = executor.wait_for_next_instruction(
+                            viewer_proc=viewer_proc,
+                            overlay_intent="Ready - awaiting your instruction",
                         )
-                        trace_file.flush()
-                    return 0
+                        if nxt is None:
+                            return 0
+                        next_text, human_delta = nxt
+                        if human_delta > 0:
+                            current_prompt = (
+                                f"[Human collaborator performed {human_delta} desktop action(s) before this instruction; "
+                                f"inspect the updated screenshot.]\n{next_text}"
+                            )
+                        else:
+                            current_prompt = next_text
+                    else:
+                        raise ValueError("--prompt must not be empty in non-collaborative mode")
 
-                halted_reason: Optional[str] = None
-                results: List[Tuple[str, str, Dict[str, Any]]] = []
-                turn_log_actions: List[Dict[str, Any]] = []
-                collab_notes: List[str] = []
-                collaborator_intervened = False
+                task_index += 1
+                init_png, _ = executor.capture_png(settle_delay=0.2, max_wait=1.0)
+                if log_dir:
+                    init_name = "turn_00_initial.png" if task_index == 1 else f"task_{task_index:02d}_initial.png"
+                    with open(os.path.join(log_dir, init_name), "wb") as f:
+                        f.write(init_png)
 
-                for idx, fc in enumerate(function_calls):
-                    fname = str(fc.get("name", ""))
-                    call_id = str(fc.get("id", ""))
-                    fc_args = fc.get("arguments") or {}
-                    intent = str(fc_args.get("intent", "N/A"))
-                    print(f"  -> Action: {fname}({{...}}) | Intent: {intent}")
+                print(f"Goal: {current_prompt}")
+                executor.set_overlay("thinking", "thinking", "Analyzing screen and planning next action...")
+                interaction = start_user_turn(current_prompt, init_png, last_completed_interaction_id)
+                current_prompt = None
 
-                    if args.collaborate:
-                        st_now = executor.get_status()
-                        if st_now.get("agent_paused"):
-                            human_delta, notes = executor.wait_until_resumed()
-                            collab_notes.extend(notes)
-                            collaborator_intervened = True
-                            for rem_fc in function_calls[idx:]:
-                                rem_name = str(rem_fc.get("name", ""))
-                                rem_id = str(rem_fc.get("id", ""))
-                                cancel_res: Dict[str, Any] = {
+                task_completed = False
+                task_halted = False
+                wait_intent = "Awaiting next instruction"
+
+                for task_turn in range(1, args.max_turns + 1):
+                    global_turn += 1
+                    print(
+                        f"\n--- Turn {global_turn} "
+                        f"(task={task_index}.{task_turn}, interaction={interaction.get('id')}, status={interaction.get('status')}) ---"
+                    )
+                    steps = interaction.get("steps", [])
+                    function_calls = [s for s in steps if s.get("type") == "function_call"]
+
+                    if not function_calls:
+                        final_text = extract_model_text(interaction)
+                        last_completed_interaction_id = interaction.get("id")
+                        print(f"Agent finished:\n{final_text}")
+                        final_png, _ = executor.capture_png(settle_delay=0.2, max_wait=0.8)
+                        if log_dir:
+                            with open(os.path.join(log_dir, "final.png"), "wb") as f:
+                                f.write(final_png)
+                            if task_index > 1:
+                                with open(os.path.join(log_dir, f"task_{task_index:02d}_final.png"), "wb") as f:
+                                    f.write(final_png)
+                        if trace_file:
+                            trace_file.write(
+                                json.dumps(
+                                    {
+                                        "turn": global_turn,
+                                        "task": task_index,
+                                        "status": interaction.get("status"),
+                                        "final_text": final_text,
+                                    },
+                                    ensure_ascii=False,
+                                )
+                                + "\n"
+                            )
+                            trace_file.flush()
+                        if not stay_interactive:
+                            executor.set_overlay("done", "done", "Task completed")
+                            return 0
+                        task_completed = True
+                        wait_intent = summarize_for_overlay(
+                            final_text,
+                            fallback="Task completed - awaiting next instruction",
+                        )
+                        break
+
+                    halted_reason: Optional[str] = None
+                    results: List[Tuple[str, str, Dict[str, Any]]] = []
+                    turn_log_actions: List[Dict[str, Any]] = []
+                    collab_notes: List[str] = []
+                    collaborator_intervened = False
+
+                    for idx, fc in enumerate(function_calls):
+                        fname = str(fc.get("name", ""))
+                        call_id = str(fc.get("id", ""))
+                        fc_args = fc.get("arguments") or {}
+                        intent = str(fc_args.get("intent", "N/A"))
+                        print(f"  -> Action: {fname}({{...}}) | Intent: {intent}")
+
+                        if collaborate_mode:
+                            st_now = executor.get_status()
+                            if st_now.get("agent_paused"):
+                                human_delta, notes = executor.wait_until_resumed()
+                                collab_notes.extend(notes)
+                                collaborator_intervened = True
+                                for rem_fc in function_calls[idx:]:
+                                    rem_name = str(rem_fc.get("name", ""))
+                                    rem_id = str(rem_fc.get("id", ""))
+                                    cancel_res: Dict[str, Any] = {
+                                        "status": "paused_for_human_takeover",
+                                        "human_actions": human_delta,
+                                        "note": "Human collaborator interacted with the desktop and resumed; inspect the updated screenshot before continuing.",
+                                    }
+                                    results.append((rem_name, rem_id, cancel_res))
+                                    turn_log_actions.append({"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": cancel_res})
+                                break
+
+                        action_result: Dict[str, Any] = {}
+                        safety_decision = fc_args.get("safety_decision")
+                        if isinstance(safety_decision, dict):
+                            if str(safety_decision.get("decision", "")).lower() == "require_confirmation":
+                                executor.set_overlay(
+                                    "waiting_confirmation",
+                                    fname,
+                                    str(safety_decision.get("explanation", "Safety confirmation required")),
+                                )
+                            s_status, ack = handle_safety_decision(safety_decision, args.auto_confirm)
+                            if s_status != "ALLOW":
+                                halted_reason = f"Safety decision {s_status}: {safety_decision.get('explanation', '')}"
+                                action_result = {"error": halted_reason}
+                                results.append((fname, call_id, action_result))
+                                turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
+                                break
+                            if ack:
+                                action_result["safety_acknowledgement"] = True
+
+                        px: Optional[int] = None
+                        py: Optional[int] = None
+                        ex: Optional[int] = None
+                        ey: Optional[int] = None
+                        bmask = 0
+                        pulse = False
+                        if fname == "drag_and_drop" and all(k in fc_args for k in ("start_x", "start_y", "end_x", "end_y")):
+                            px = denormalize_x(fc_args["start_x"], executor.width)
+                            py = denormalize_y(fc_args["start_y"], executor.height)
+                            ex = denormalize_x(fc_args["end_x"], executor.width)
+                            ey = denormalize_y(fc_args["end_y"], executor.height)
+                            bmask = 1
+                            pulse = True
+                        elif "x" in fc_args and "y" in fc_args and fc_args["x"] is not None and fc_args["y"] is not None:
+                            px = denormalize_x(fc_args["x"], executor.width)
+                            py = denormalize_y(fc_args["y"], executor.height)
+                            if fname == "right_click":
+                                bmask = 4
+                            elif fname == "middle_click":
+                                bmask = 2
+                            elif fname in ("click", "double_click", "triple_click", "mouse_down", "type"):
+                                bmask = 1
+                            pulse = (fname != "move")
+
+                        executor.set_overlay(
+                            state="acting",
+                            action=fname,
+                            intent=intent,
+                            x=px,
+                            y=py,
+                            end_x=ex,
+                            end_y=ey,
+                            pulse=pulse,
+                            button_mask=bmask,
+                        )
+                        if action_delay > 0:
+                            time.sleep(action_delay)
+
+                        try:
+                            exec_res = executor.execute(fname, fc_args)
+                            action_result.update(exec_res)
+                        except AgentPausedError as e:
+                            if collaborate_mode:
+                                human_delta, notes = executor.wait_until_resumed()
+                                collab_notes.extend(notes)
+                                collaborator_intervened = True
+                                action_result = {
                                     "status": "paused_for_human_takeover",
                                     "human_actions": human_delta,
-                                    "note": "Human collaborator interacted with the desktop and resumed; inspect the updated screenshot before continuing.",
+                                    "note": "Human collaborator paused and took control mid-action; inspect the updated screenshot.",
                                 }
-                                results.append((rem_name, rem_id, cancel_res))
-                                turn_log_actions.append({"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": cancel_res})
-                            break
-
-                    action_result: Dict[str, Any] = {}
-                    safety_decision = fc_args.get("safety_decision")
-                    if isinstance(safety_decision, dict):
-                        if str(safety_decision.get("decision", "")).lower() == "require_confirmation":
-                            executor.set_overlay(
-                                "waiting_confirmation",
-                                fname,
-                                str(safety_decision.get("explanation", "Safety confirmation required")),
-                            )
-                        s_status, ack = handle_safety_decision(safety_decision, args.auto_confirm)
-                        if s_status != "ALLOW":
-                            halted_reason = f"Safety decision {s_status}: {safety_decision.get('explanation', '')}"
+                                results.append((fname, call_id, action_result))
+                                turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
+                                for rem_fc in function_calls[idx + 1 :]:
+                                    rem_name = str(rem_fc.get("name", ""))
+                                    rem_id = str(rem_fc.get("id", ""))
+                                    cancel_res = {"status": "paused_for_human_takeover"}
+                                    results.append((rem_name, rem_id, cancel_res))
+                                    turn_log_actions.append({"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": cancel_res})
+                                break
+                            halted_reason = str(e)
                             action_result = {"error": halted_reason}
                             results.append((fname, call_id, action_result))
                             turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
                             break
-                        if ack:
-                            action_result["safety_acknowledgement"] = True
+                        except Exception as e:
+                            print(f"  [WARN] Error executing {fname}: {e}")
+                            action_result["error"] = str(e)
 
-                    px: Optional[int] = None
-                    py: Optional[int] = None
-                    ex: Optional[int] = None
-                    ey: Optional[int] = None
-                    bmask = 0
-                    pulse = False
-                    if fname == "drag_and_drop" and all(k in fc_args for k in ("start_x", "start_y", "end_x", "end_y")):
-                        px = denormalize_x(fc_args["start_x"], executor.width)
-                        py = denormalize_y(fc_args["start_y"], executor.height)
-                        ex = denormalize_x(fc_args["end_x"], executor.width)
-                        ey = denormalize_y(fc_args["end_y"], executor.height)
-                        bmask = 1
-                        pulse = True
-                    elif "x" in fc_args and "y" in fc_args and fc_args["x"] is not None and fc_args["y"] is not None:
-                        px = denormalize_x(fc_args["x"], executor.width)
-                        py = denormalize_y(fc_args["y"], executor.height)
-                        if fname == "right_click":
-                            bmask = 4
-                        elif fname == "middle_click":
-                            bmask = 2
-                        elif fname in ("click", "double_click", "triple_click", "mouse_down", "type"):
-                            bmask = 1
-                        pulse = (fname != "move")
-
-                    executor.set_overlay(
-                        state="acting",
-                        action=fname,
-                        intent=intent,
-                        x=px,
-                        y=py,
-                        end_x=ex,
-                        end_y=ey,
-                        pulse=pulse,
-                        button_mask=bmask,
-                    )
-                    if action_delay > 0:
-                        time.sleep(action_delay)
-
-                    try:
-                        exec_res = executor.execute(fname, fc_args)
-                        action_result.update(exec_res)
-                    except AgentPausedError as e:
-                        if args.collaborate:
-                            human_delta, notes = executor.wait_until_resumed()
-                            collab_notes.extend(notes)
-                            collaborator_intervened = True
-                            action_result = {
-                                "status": "paused_for_human_takeover",
-                                "human_actions": human_delta,
-                                "note": "Human collaborator paused and took control mid-action; inspect the updated screenshot.",
-                            }
-                            results.append((fname, call_id, action_result))
-                            turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
-                            for rem_fc in function_calls[idx + 1 :]:
-                                rem_name = str(rem_fc.get("name", ""))
-                                rem_id = str(rem_fc.get("id", ""))
-                                cancel_res = {"status": "paused_for_human_takeover"}
-                                results.append((rem_name, rem_id, cancel_res))
-                                turn_log_actions.append({"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": cancel_res})
-                            break
-                        halted_reason = str(e)
-                        action_result = {"error": halted_reason}
                         results.append((fname, call_id, action_result))
                         turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
-                        break
-                    except Exception as e:
-                        print(f"  [WARN] Error executing {fname}: {e}")
-                        action_result["error"] = str(e)
 
-                    results.append((fname, call_id, action_result))
-                    turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
+                    post_png, post_hdr = executor.capture_png(settle_delay=0.45, max_wait=1.2)
+                    drained_notes, _, _ = executor.poll_user_messages()
+                    collab_notes.extend(drained_notes)
+                    if collab_notes and results:
+                        results[0][2]["user_notes"] = collab_notes
+                        print(f"  [COLLAB] Delivering user notes to agent: {collab_notes}")
+                    if collaborator_intervened:
+                        print("  [COLLAB] Re-syncing model with post-takeover screenshot.")
 
-                post_png, post_hdr = executor.capture_png(settle_delay=0.45, max_wait=1.2)
-                drained_notes, _, _ = executor.poll_user_messages()
-                collab_notes.extend(drained_notes)
-                if collab_notes and results:
-                    results[0][2]["user_notes"] = collab_notes
-                    print(f"  [COLLAB] Delivering user notes to agent: {collab_notes}")
-                if collaborator_intervened:
-                    print("  [COLLAB] Re-syncing model with post-takeover screenshot.")
+                    if log_dir:
+                        with open(os.path.join(log_dir, f"turn_{global_turn:02d}.png"), "wb") as f:
+                            f.write(post_png)
+                        with open(os.path.join(log_dir, "final.png"), "wb") as f:
+                            f.write(post_png)
 
-                if log_dir:
-                    with open(os.path.join(log_dir, f"turn_{turn:02d}.png"), "wb") as f:
-                        f.write(post_png)
-                    with open(os.path.join(log_dir, "final.png"), "wb") as f:
-                        f.write(post_png)
-
-                if trace_file:
-                    trace_file.write(
-                        json.dumps(
-                            {
-                                "turn": turn,
-                                "interaction_id": interaction.get("id"),
-                                "actions": turn_log_actions,
-                                "frame_seq": post_hdr.get("frame_seq"),
-                                "halted_reason": halted_reason,
-                                "user_notes": collab_notes,
-                            },
-                            ensure_ascii=False,
+                    if trace_file:
+                        trace_file.write(
+                            json.dumps(
+                                {
+                                    "turn": global_turn,
+                                    "task": task_index,
+                                    "interaction_id": interaction.get("id"),
+                                    "actions": turn_log_actions,
+                                    "frame_seq": post_hdr.get("frame_seq"),
+                                    "halted_reason": halted_reason,
+                                    "user_notes": collab_notes,
+                                },
+                                ensure_ascii=False,
+                            )
+                            + "\n"
                         )
-                        + "\n"
+                        trace_file.flush()
+
+                    if halted_reason:
+                        print(f"Agent halted: {halted_reason}")
+                        if not stay_interactive:
+                            return 2
+                        task_halted = True
+                        last_completed_interaction_id = None
+                        wait_intent = summarize_for_overlay(
+                            f"Halted: {halted_reason}",
+                            fallback="Action halted - awaiting next instruction",
+                        )
+                        break
+
+                    post_b64 = base64.b64encode(post_png).decode("ascii")
+                    function_responses = []
+                    for fname, call_id, res in results:
+                        function_responses.append(
+                            {
+                                "type": "function_result",
+                                "name": fname,
+                                "call_id": call_id,
+                                "result": [
+                                    {"type": "text", "text": json.dumps(res)},
+                                    {"type": "image", "data": post_b64, "mime_type": "image/png"},
+                                ],
+                            }
+                        )
+
+                    executor.set_overlay("thinking", "thinking", "Analyzing screen and planning next action...")
+                    interaction = llm.create(
+                        input_payload=function_responses,
+                        previous_interaction_id=interaction["id"],
                     )
-                    trace_file.flush()
 
-                if halted_reason:
-                    print(f"Agent halted: {halted_reason}")
-                    return 2
+                if not task_completed and not task_halted:
+                    if not stay_interactive:
+                        print(f"Reached turn limit ({args.max_turns}) before task completion.")
+                        return 1
+                    print(f"Reached per-task turn limit ({args.max_turns}); returning to collaborative wait.")
+                    last_completed_interaction_id = None
+                    wait_intent = f"Turn limit ({args.max_turns}) reached - awaiting next instruction"
 
-                post_b64 = base64.b64encode(post_png).decode("ascii")
-                function_responses = []
-                for fname, call_id, res in results:
-                    function_responses.append(
-                        {
-                            "type": "function_result",
-                            "name": fname,
-                            "call_id": call_id,
-                            "result": [
-                                {"type": "text", "text": json.dumps(res)},
-                                {"type": "image", "data": post_b64, "mime_type": "image/png"},
-                            ],
-                        }
-                    )
-
-                executor.set_overlay("thinking", "thinking", "Analyzing screen and planning next action...")
-                interaction = llm.create(
-                    input_payload=function_responses,
-                    previous_interaction_id=interaction["id"],
+                nxt = executor.wait_for_next_instruction(
+                    viewer_proc=viewer_proc,
+                    overlay_intent=wait_intent,
                 )
+                if nxt is None:
+                    return 0
+                next_text, human_delta = nxt
+                if human_delta > 0:
+                    current_prompt = (
+                        f"[Human collaborator performed {human_delta} desktop action(s) before this instruction; "
+                        f"inspect the updated screenshot.]\n{next_text}"
+                    )
+                else:
+                    current_prompt = next_text
 
-            print(f"Reached turn limit ({args.max_turns}) before task completion.")
-            return 1
+    except KeyboardInterrupt:
+        print("\n[COLLAB] Interrupted; ending session.")
+        return 0
+    except (EOFError, ConnectionError, BrokenPipeError) as e:
+        if collaborate_mode:
+            print(f"\n[COLLAB] Viewer disconnected ({e}); ending session.")
+            return 0
+        raise
 
     finally:
         if trace_file:
@@ -963,6 +1213,8 @@ def run_agent(args: argparse.Namespace) -> int:
                 except subprocess.TimeoutExpired:
                     viewer_proc.kill()
                     viewer_proc.wait()
+        if viewer_log:
+            viewer_log.close()
         if temp_dir and os.path.isdir(temp_dir):
             shutil.rmtree(temp_dir, ignore_errors=True)
 
@@ -977,7 +1229,7 @@ def main() -> int:
             "Create a new text document on the desktop named hello.txt containing the text "
             "'Hello from TigerVNC Computer Use Agent!' and make sure it is saved and visible on the desktop."
         ),
-        help="Task instruction for the agent",
+        help="Task instruction for the agent (pass '' with --collaborate to start waiting for user input)",
     )
     parser.add_argument(
         "--socket",
@@ -992,7 +1244,7 @@ def main() -> int:
         help="Path to Gemini API key file",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model name supporting computer_use")
-    parser.add_argument("--max-turns", type=int, default=20, help="Maximum agent turns")
+    parser.add_argument("--max-turns", type=int, default=20, help="Maximum agent turns per task")
     parser.add_argument("--log-dir", default="/tmp/vnc_agent_run", help="Directory for trace.jsonl and PNG snapshots")
     parser.add_argument(
         "--auto-confirm",
@@ -1012,7 +1264,15 @@ def main() -> int:
     parser.add_argument(
         "--collaborate",
         action="store_true",
-        help="Enable windowed collaborative mode (-AgentOverlay -AgentCollaborate) with automatic human takeover/resume",
+        help=(
+            "Enable windowed collaborative mode (-AgentOverlay -AgentCollaborate) with automatic human "
+            "takeover/resume and interactive waiting for follow-up instructions after completion"
+        ),
+    )
+    parser.add_argument(
+        "--one-shot",
+        action="store_true",
+        help="Exit automatically after the initial task completes even in --collaborate mode",
     )
     parser.add_argument(
         "--action-delay",

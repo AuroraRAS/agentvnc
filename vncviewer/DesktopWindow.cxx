@@ -1926,6 +1926,9 @@ void DesktopWindow::rebuildAgentHudSurface()
     accentR = 46; accentG = 204; accentB = 113;
     line1 = core::format("[AGENT: %s]",
                          ov.action.empty() ? "acting" : ov.action.c_str());
+  } else if (ov.state == "waiting_user") {
+    accentR = 26; accentG = 188; accentB = 156;
+    line1 = _("[AGENT: waiting]");
   } else if (ov.state == "done") {
     accentR = 26; accentG = 188; accentB = 156;
     line1 = _("[AGENT: done]");
@@ -1957,6 +1960,9 @@ void DesktopWindow::rebuildAgentHudSurface()
     line2 = core::format(_("%sP: Resume agent  |  %sN: Send note  |  Human actions: %llu"),
                          modPrefix, modPrefix,
                          (unsigned long long)cc->getHumanActionCount());
+  } else if (ov.state == "waiting_user") {
+    line2 = core::format(_("%sN: Next instruction  |  Click/type on desktop  |  %sM: Menu"),
+                         modPrefix, modPrefix);
   } else if (agentCollaborate) {
     line2 = core::format(_("Click/type to take over  |  %sP: Pause  |  %sN: Send note"),
                          modPrefix, modPrefix);
