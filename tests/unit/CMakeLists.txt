@@ -43,6 +43,10 @@ add_executable(pixelformat pixelformat.cxx)
 target_link_libraries(pixelformat PRIVATE rfb GTest::gtest_main)
 gtest_discover_tests(pixelformat)
 
+add_executable(scale scale.cxx ../../vncviewer/Scale.cxx)
+target_link_libraries(scale PRIVATE core GTest::gtest_main)
+gtest_discover_tests(scale)
+
 add_executable(shortcuthandler shortcuthandler.cxx ../../vncviewer/ShortcutHandler.cxx)
 target_link_libraries(shortcuthandler PRIVATE core GTest::gtest_main)
 gtest_discover_tests(shortcuthandler)
