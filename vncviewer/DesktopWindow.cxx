@@ -539,8 +539,10 @@ void DesktopWindow::draw()
     }
 
     if (agentMarkerSurface && ov.hasPoint) {
-      int bx = ov.x + viewport->x() - agentMarkerSurface->width() / 2;
-      int by = ov.y + viewport->y() - agentMarkerSurface->height() / 2;
+      core::Point localPt = scaleFromFramebuffer({ov.x, ov.y},
+                                                 viewport->getScaleFactor());
+      int bx = localPt.x + viewport->x() - agentMarkerSurface->width() / 2;
+      int by = localPt.y + viewport->y() - agentMarkerSurface->height() / 2;
       int cx, cy, cw, ch;
       fl_clip_box(bx, by, agentMarkerSurface->width(), agentMarkerSurface->height(),
                   cx, cy, cw, ch);
@@ -1722,6 +1724,8 @@ void DesktopWindow::handleOptions(void *data)
 
     self->repositionWidgets();
     self->remoteResize();
+    if (self->cc->hasAgentBridge() && self->cc->isAgentOverlayEnabled())
+      self->updateAgentOverlay();
     self->redraw();
   }
 }
@@ -2191,15 +2195,20 @@ void DesktopWindow::rebuildAgentDragSurface()
   if (!ov.hasPoint || !ov.hasEndPoint)
     return;
 
+  int scale = viewport->getScaleFactor();
+  core::Point startPt = scaleFromFramebuffer({ov.x, ov.y}, scale);
+  core::Point endPt = scaleFromFramebuffer({ov.endX, ov.endY}, scale);
+
   const int pad = 12;
-  int minX = std::min(ov.x, ov.endX) - pad;
-  int minY = std::min(ov.y, ov.endY) - pad;
-  int maxX = std::max(ov.x, ov.endX) + pad;
-  int maxY = std::max(ov.y, ov.endY) + pad;
+  int minX = std::min(startPt.x, endPt.x) - pad;
+  int minY = std::min(startPt.y, endPt.y) - pad;
+  int maxX = std::max(startPt.x, endPt.x) + pad;
+  int maxY = std::max(startPt.y, endPt.y) + pad;
 
   int dragW = maxX - minX + 1;
   int dragH = maxY - minY + 1;
-  if ((dragW <= 0) || (dragH <= 0) || (dragW > 4096) || (dragH > 4096))
+  if ((dragW <= 0) || (dragH <= 0) || (dragW > 8192) || (dragH > 8192) ||
+      ((size_t)dragW * (size_t)dragH > (size_t)4096 * 4096))
     return;
 
   agentDragOriginX = minX;
@@ -2208,10 +2217,10 @@ void DesktopWindow::rebuildAgentDragSurface()
   unsigned char* buf = new unsigned char[(size_t)dragW * (size_t)dragH * 4];
   memset(buf, 0, (size_t)dragW * (size_t)dragH * 4);
 
-  int x0 = ov.x - minX;
-  int y0 = ov.y - minY;
-  int x1 = ov.endX - minX;
-  int y1 = ov.endY - minY;
+  int x0 = startPt.x - minX;
+  int y0 = startPt.y - minY;
+  int x1 = endPt.x - minX;
+  int y1 = endPt.y - minY;
   int steps = std::max(abs(x1 - x0), abs(y1 - y0));
   if (steps < 1)
     steps = 1;
