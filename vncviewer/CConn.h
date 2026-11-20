@@ -20,6 +20,13 @@
 #ifndef __CCONN_H__
 #define __CCONN_H__
 
+#include <stdint.h>
+
+#include <deque>
+#include <map>
+#include <string>
+#include <vector>
+
 #include <FL/Fl.H>
 
 #include <core/Timer.h>
@@ -28,6 +35,7 @@
 
 namespace network { class Socket; }
 
+class AgentBridge;
 class AudioOutput;
 class DesktopWindow;
 
@@ -44,6 +52,87 @@ public:
   unsigned getUpdateCount();
   unsigned getPixelCount();
   unsigned getPosition();
+
+  void setAgentBridge(AgentBridge* bridge);
+  bool hasAgentBridge() const { return agentBridge != nullptr; }
+
+  bool isSessionReady();
+  bool isConnected() {
+    return sock != nullptr &&
+           state() != RFBSTATE_CLOSING &&
+           state() != RFBSTATE_INVALID;
+  }
+
+  int getSocketFd() const;
+  bool isSocketWatched() const { return socketWatched; }
+  bool wantsSocketWrite() const { return socketWatchWrite; }
+  void onSocketReady();
+  void ensureSocketWriteWatch();
+
+  bool isAgentPaused() const { return agentPaused; }
+  void setAgentPaused(bool paused, const char* reason = nullptr);
+  const std::string& getAgentPauseReason() const { return agentPauseReason; }
+
+  struct AgentOverlayState {
+    std::string state;
+    std::string action;
+    std::string intent;
+    bool hasPoint;
+    int x;
+    int y;
+    bool hasEndPoint;
+    int endX;
+    int endY;
+    uint64_t seq;
+    bool triggerPulse;
+    uint16_t buttonMask;
+
+    AgentOverlayState()
+      : state("idle"), hasPoint(false), x(0), y(0),
+        hasEndPoint(false), endX(0), endY(0),
+        seq(0), triggerPulse(false), buttonMask(0) {}
+  };
+
+  bool isAgentOverlayEnabled() const;
+  void setAgentOverlayState(const std::string& st,
+                            const std::string& action,
+                            const std::string& intent,
+                            bool hasPoint, int x, int y,
+                            bool hasEndPoint, int endX, int endY,
+                            bool triggerPulse,
+                            uint16_t buttonMask = 0);
+  void clearAgentOverlayState();
+  const AgentOverlayState& getAgentOverlayState() const { return overlayState; }
+
+  void notifyHumanInput();
+  uint64_t getHumanActionCount() const { return humanActionCount; }
+  int64_t getLastHumanInputMs() const { return lastHumanInputMs; }
+
+  void pushUserMessage(const std::string& msg);
+  std::vector<std::string> drainUserMessages();
+  size_t getPendingUserMessageCount() const { return userMessages.size(); }
+
+  void refreshAgentOverlayDisplay();
+
+  uint64_t getFrameSeq() const { return frameSeq; }
+  uint64_t getDamageCount() const { return damageCount; }
+  uint64_t getResizeCount() const { return resizeCount; }
+  int64_t getLastUpdateMs() const { return lastUpdateMs; }
+  bool isUpdating() const { return inFramebufferUpdate; }
+
+  bool captureFramebuffer(bool rgba32,
+                          int* outWidth, int* outHeight,
+                          int* outStrideBytes,
+                          int* outFbBpp, int* outFbDepth,
+                          std::vector<uint8_t>* outPixels);
+
+  void injectPointerEvent(int x, int y, uint16_t buttonMask);
+  void injectKeyEvent(uint32_t keysym, uint32_t keycode, bool down);
+  size_t injectText(const std::string& utf8Text);
+  void injectClipboard(const std::string& utf8Text);
+  bool getRemoteClipboard(std::string* outText) const;
+  void releaseAgentKeys();
+  void clearAgentClipboardOwnership();
 
 protected:
 
@@ -120,6 +209,32 @@ private:
   struct timeval updateStartTime;
   size_t updateStartPos;
   unsigned long long bpsEstimate;
+
+  AgentBridge* agentBridge;
+  bool sessionInitialized;
+  bool socketWatched;
+  bool socketWatchWrite;
+  bool agentPaused;
+  bool inFramebufferUpdate;
+  uint64_t frameSeq;
+  uint64_t damageCount;
+  uint64_t resizeCount;
+  int64_t lastUpdateMs;
+
+  std::map<uint32_t, int> agentDownKeys;
+  int nextAgentKeyCode;
+
+  std::string agentClipboardText;
+  bool hasAgentClipboard;
+  std::string remoteClipboardText;
+  bool hasRemoteClipboardData;
+
+  std::string agentPauseReason;
+  AgentOverlayState overlayState;
+  uint64_t humanActionCount;
+  int64_t lastHumanInputMs;
+  uint16_t lastAgentButtonMask;
+  std::deque<std::string> userMessages;
 
   static std::string savedUsername;
   static std::string savedPassword;

@@ -24,6 +24,7 @@
 #include <algorithm>
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 #include <time.h>
@@ -51,6 +52,7 @@
 #include <FL/Fl.H>
 #include <FL/Fl_Image_Surface.H>
 #include <FL/Fl_Scrollbar.H>
+#include <FL/fl_ask.H>
 #include <FL/fl_draw.H>
 
 #if defined(WIN32)
@@ -90,8 +92,12 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
     pendingRemoteResize(false), lastResize({0, 0}),
     keyboardGrabbed(false), mouseGrabbed(false), regrabOnFocus(false),
     statsLastUpdates(0), statsLastPixels(0), statsLastPosition(0),
-    statsGraph(nullptr)
+    statsGraph(nullptr),
+    agentHudSurface(nullptr), agentMarkerSurface(nullptr),
+    agentDragSurface(nullptr), agentDragOriginX(0), agentDragOriginY(0),
+    lastOverlaySeq(0), agentPulseActive(false)
 {
+  memset(&agentPulseStart, 0, sizeof(agentPulseStart));
   Fl_Group* group;
 
   // Dummy group to prevent FLTK from moving our widgets around
@@ -238,9 +244,21 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
   for (core::EnumListEntry key : shortcutModifiers)
     modifierMask |= ShortcutHandler::parseModifier(key.getValueStr().c_str());
 
-  if (modifierMask)
-    addOverlayTip(_("Press %sM to open the context menu"),
-                  ShortcutHandler::modifierPrefix(modifierMask));
+  if (modifierMask) {
+    const char *modPrefix = ShortcutHandler::modifierPrefix(modifierMask);
+    addOverlayTip(_("Press %sM to open the context menu"), modPrefix);
+    if (cc->hasAgentBridge()) {
+      if (agentCollaborate) {
+        addOverlayTip(_("Click or type to take over; press %sP to pause/resume, %sN to send a note"),
+                      modPrefix, modPrefix);
+      } else {
+        addOverlayTip(_("Press %sP to pause or resume agent input"), modPrefix);
+      }
+    }
+  }
+
+  if (cc->hasAgentBridge())
+    updateAgentOverlay();
 
   // By default we get a slight delay when we warp the pointer, something
   // we don't want or we'll get jerky movement
@@ -264,6 +282,7 @@ DesktopWindow::~DesktopWindow()
   Fl::remove_timeout(handleEdgeScroll, this);
   Fl::remove_timeout(handleStatsTimeout, this);
   Fl::remove_timeout(updateOverlay, this);
+  Fl::remove_timeout(animateAgentOverlay, this);
   Fl::remove_idle(checkFocus, this);
 
   OptionsDialog::removeCallback(handleOptions);
@@ -275,6 +294,9 @@ DesktopWindow::~DesktopWindow()
   delete offscreen;
 
   delete statsGraph;
+  delete agentHudSurface;
+  delete agentMarkerSurface;
+  delete agentDragSurface;
 
   instances.erase(this);
 
@@ -331,7 +353,17 @@ void DesktopWindow::updateCaption()
 
 #pragma GCC diagnostic pop
 
+  if (cc->hasAgentBridge() && cc->isAgentPaused())
+    windowName += _(" [agent paused]");
+
   copy_label(windowName.c_str());
+}
+
+
+void DesktopWindow::showNotification(const char* text)
+{
+  if (text && text[0] != '\0')
+    addOverlay(text);
 }
 
 
@@ -481,6 +513,57 @@ void DesktopWindow::draw()
       draw_child(*viewport);
     else
       update_child(*viewport);
+  }
+
+  // Live external agent overlay (HUD banner, reticle, drag vector)
+  if (cc->hasAgentBridge() && cc->isAgentOverlayEnabled()) {
+    const CConn::AgentOverlayState& ov = cc->getAgentOverlayState();
+
+    if (agentDragSurface && ov.hasPoint && ov.hasEndPoint) {
+      int bx = agentDragOriginX + viewport->x();
+      int by = agentDragOriginY + viewport->y();
+      int cx, cy, cw, ch;
+      fl_clip_box(bx, by, agentDragSurface->width(), agentDragSurface->height(),
+                  cx, cy, cw, ch);
+      if ((cw > 0) && (ch > 0)) {
+        if (offscreen)
+          agentDragSurface->blend(offscreen, cx - bx, cy - by, cx, cy, cw, ch, 230);
+        else
+          agentDragSurface->blend(cx - bx, cy - by, cx, cy, cw, ch, 230);
+      }
+    }
+
+    if (agentMarkerSurface && ov.hasPoint) {
+      int bx = ov.x + viewport->x() - agentMarkerSurface->width() / 2;
+      int by = ov.y + viewport->y() - agentMarkerSurface->height() / 2;
+      int cx, cy, cw, ch;
+      fl_clip_box(bx, by, agentMarkerSurface->width(), agentMarkerSurface->height(),
+                  cx, cy, cw, ch);
+      if ((cw > 0) && (ch > 0)) {
+        if (offscreen)
+          agentMarkerSurface->blend(offscreen, cx - bx, cy - by, cx, cy, cw, ch, 255);
+        else
+          agentMarkerSurface->blend(cx - bx, cy - by, cx, cy, cw, ch, 255);
+      }
+    }
+
+    if (agentHudSurface) {
+      int bx = 16;
+      int by = H - agentHudSurface->height() - 16;
+      if (by < 8)
+        by = 8;
+      if (bx + agentHudSurface->width() > W - 8)
+        bx = std::max(8, W - agentHudSurface->width() - 8);
+      int cx, cy, cw, ch;
+      fl_clip_box(bx, by, agentHudSurface->width(), agentHudSurface->height(),
+                  cx, cy, cw, ch);
+      if ((cw > 0) && (ch > 0)) {
+        if (offscreen)
+          agentHudSurface->blend(offscreen, cx - bx, cy - by, cx, cy, cw, ch, 235);
+        else
+          agentHudSurface->blend(cx - bx, cy - by, cx, cy, cw, ch, 235);
+      }
+    }
   }
 
   // Debug graph (if active)
@@ -673,6 +756,9 @@ void DesktopWindow::resize(int x, int y, int w, int h)
     remoteResize();
 
     repositionWidgets();
+
+    if (cc->hasAgentBridge() && cc->isAgentOverlayEnabled())
+      updateAgentOverlay();
   }
 }
 
@@ -1789,4 +1875,365 @@ void DesktopWindow::handleStatsTimeout(void *data)
                statsWidth, statsHeight);
 
   Fl::repeat_timeout(0.5, handleStatsTimeout, data);
+}
+
+static void drawRgbaPixel(unsigned char* buf, int width, int height,
+                          int px, int py,
+                          unsigned char r, unsigned char g,
+                          unsigned char b, unsigned char a)
+{
+  if ((px < 0) || (px >= width) || (py < 0) || (py >= height))
+    return;
+  size_t off = ((size_t)py * (size_t)width + (size_t)px) * 4;
+  if (a > buf[off + 3]) {
+    buf[off + 0] = r;
+    buf[off + 1] = g;
+    buf[off + 2] = b;
+    buf[off + 3] = a;
+  }
+}
+
+void DesktopWindow::rebuildAgentHudSurface()
+{
+  delete agentHudSurface;
+  agentHudSurface = nullptr;
+
+  if (!cc->hasAgentBridge() || !cc->isAgentOverlayEnabled())
+    return;
+
+#if !defined(WIN32) && !defined(__APPLE__)
+  if (!fl_gc)
+    fl_gc = XDefaultGC(fl_display, 0);
+#endif
+
+  const CConn::AgentOverlayState& ov = cc->getAgentOverlayState();
+
+  unsigned char accentR = 149, accentG = 165, accentB = 166;
+  std::string line1;
+  if (cc->isAgentPaused()) {
+    accentR = 243; accentG = 156; accentB = 18;
+    if (cc->getAgentPauseReason() == "human_takeover")
+      line1 = _("[HUMAN CONTROL] Takeover active");
+    else
+      line1 = _("[PAUSED] Agent input paused");
+  } else if (ov.state == "waiting_confirmation") {
+    accentR = 231; accentG = 76; accentB = 60;
+    line1 = _("[CONFIRMATION] Waiting for safety confirmation");
+  } else if (ov.state == "thinking") {
+    accentR = 52; accentG = 152; accentB = 219;
+    line1 = _("[AGENT: thinking]");
+  } else if (ov.state == "acting") {
+    accentR = 46; accentG = 204; accentB = 113;
+    line1 = core::format("[AGENT: %s]",
+                         ov.action.empty() ? "acting" : ov.action.c_str());
+  } else if (ov.state == "done") {
+    accentR = 26; accentG = 188; accentB = 156;
+    line1 = _("[AGENT: done]");
+  } else {
+    line1 = _("[AGENT: idle]");
+  }
+
+  if (!cc->isAgentPaused() && !ov.intent.empty()) {
+    std::string intentCopy = ov.intent;
+    for (size_t idx = 0; idx < intentCopy.size(); idx++) {
+      if ((intentCopy[idx] == '\n') || (intentCopy[idx] == '\r'))
+        intentCopy[idx] = ' ';
+    }
+    if (intentCopy.size() > 74) {
+      intentCopy.resize(71);
+      intentCopy += "...";
+    }
+    line1 += " ";
+    line1 += intentCopy;
+  }
+
+  unsigned modifierMask = 0;
+  for (core::EnumListEntry key : shortcutModifiers)
+    modifierMask |= ShortcutHandler::parseModifier(key.getValueStr().c_str());
+  const char* modPrefix = modifierMask ? ShortcutHandler::modifierPrefix(modifierMask) : "";
+
+  std::string line2;
+  if (cc->isAgentPaused()) {
+    line2 = core::format(_("%sP: Resume agent  |  %sN: Send note  |  Human actions: %llu"),
+                         modPrefix, modPrefix,
+                         (unsigned long long)cc->getHumanActionCount());
+  } else if (agentCollaborate) {
+    line2 = core::format(_("Click/type to take over  |  %sP: Pause  |  %sN: Send note"),
+                         modPrefix, modPrefix);
+  } else {
+    line2 = core::format(_("%sP: Pause/Resume agent  |  %sM: Context menu"),
+                         modPrefix, modPrefix);
+  }
+
+  const Fl_Fontsize font1 = 14;
+  const Fl_Fontsize font2 = 12;
+  int w1 = 0, h1 = 0, w2 = 0, h2 = 0;
+
+  fl_font(FL_HELVETICA_BOLD, font1);
+  fl_measure(line1.c_str(), w1, h1);
+
+  fl_font(FL_HELVETICA, font2);
+  fl_measure(line2.c_str(), w2, h2);
+
+  int maxW = std::max(240, std::min(w() - 32, 640));
+  int cardW = std::min(maxW, std::max(w1, w2) + 28);
+  int cardH = h1 + h2 + 20;
+
+  Fl_Image_Surface* surf = new Fl_Image_Surface(cardW, cardH);
+  surf->set_current();
+
+  // Background & border
+  fl_rectf(0, 0, cardW, cardH, 18, 24, 34);
+  fl_rectf(0, 0, 5, cardH, accentR, accentG, accentB);
+  fl_color(64, 78, 98);
+  fl_rect(0, 0, cardW, cardH);
+
+  fl_font(FL_HELVETICA_BOLD, font1);
+  fl_color(245, 248, 252);
+  fl_draw(line1.c_str(), 12, 6, cardW - 20, h1 + 2, FL_ALIGN_LEFT | FL_ALIGN_CLIP);
+
+  fl_font(FL_HELVETICA, font2);
+  fl_color(178, 192, 212);
+  fl_draw(line2.c_str(), 12, 10 + h1, cardW - 20, h2 + 2, FL_ALIGN_LEFT | FL_ALIGN_CLIP);
+
+  Fl_RGB_Image* rendered = surf->image();
+  delete surf;
+  Fl_Display_Device::display_device()->set_current();
+
+  unsigned char* buf = new unsigned char[(size_t)cardW * (size_t)cardH * 4];
+  const unsigned char* src = (const unsigned char*)rendered->data()[0];
+  int srcD = rendered->d();
+  int srcLd = rendered->ld();
+
+  unsigned char* dst = buf;
+  for (int py = 0; py < cardH; py++) {
+    for (int px = 0; px < cardW; px++) {
+      dst[0] = src[0];
+      dst[1] = (srcD >= 3) ? src[1] : src[0];
+      dst[2] = (srcD >= 3) ? src[2] : src[0];
+      dst[3] = (px < 5) ? 255 : 225;
+      dst += 4;
+      src += srcD;
+    }
+    if (srcLd != 0)
+      src += srcLd - cardW * srcD;
+  }
+
+  delete rendered;
+
+  Fl_RGB_Image* rgbaImg = new Fl_RGB_Image(buf, cardW, cardH, 4);
+  agentHudSurface = new Surface(rgbaImg);
+  delete rgbaImg;
+  delete [] buf;
+}
+
+void DesktopWindow::rebuildAgentMarkerSurface(float rippleProgress)
+{
+  delete agentMarkerSurface;
+  agentMarkerSurface = nullptr;
+
+  if (!cc->hasAgentBridge() || !cc->isAgentOverlayEnabled())
+    return;
+
+  const CConn::AgentOverlayState& ov = cc->getAgentOverlayState();
+  if (!ov.hasPoint)
+    return;
+
+  const int sz = 72;
+  const int cx = sz / 2;
+  const int cy = sz / 2;
+
+  unsigned char colR = 52, colG = 172, colB = 224;
+  if ((ov.buttonMask & 4) || (ov.action == "right_click")) {
+    colR = 243; colG = 156; colB = 18;
+  } else if (ov.action == "drag_and_drop") {
+    colR = 46; colG = 204; colB = 113;
+  } else if ((ov.buttonMask & 1) ||
+             (ov.action == "click") ||
+             (ov.action == "double_click") ||
+             (ov.action == "triple_click")) {
+    colR = 235; colG = 77; colB = 75;
+  }
+
+  unsigned char* buf = new unsigned char[(size_t)sz * (size_t)sz * 4];
+  memset(buf, 0, (size_t)sz * (size_t)sz * 4);
+
+  // Inner dot & crosshair ring
+  for (int py = 0; py < sz; py++) {
+    for (int px = 0; px < sz; px++) {
+      float dx = (float)(px - cx);
+      float dy = (float)(py - cy);
+      float dist = sqrtf(dx * dx + dy * dy);
+
+      if (dist <= 4.0f) {
+        unsigned char a = (dist <= 3.0f) ? 245 : (unsigned char)((4.0f - dist) * 245.0f);
+        drawRgbaPixel(buf, sz, sz, px, py, colR, colG, colB, a);
+      } else if (fabsf(dist - 13.0f) <= 1.25f) {
+        float wgt = 1.0f - fabsf(dist - 13.0f) / 1.25f;
+        drawRgbaPixel(buf, sz, sz, px, py, colR, colG, colB,
+                      (unsigned char)(wgt * 230.0f));
+      }
+
+      if (agentPulseActive) {
+        float rRadius = 10.0f + rippleProgress * 23.0f;
+        float diff = fabsf(dist - rRadius);
+        if (diff <= 1.6f) {
+          float fade = (1.0f - rippleProgress) * (1.0f - diff / 1.6f);
+          drawRgbaPixel(buf, sz, sz, px, py, colR, colG, colB,
+                        (unsigned char)(fade * 220.0f));
+        }
+      }
+    }
+  }
+
+  // Crosshair ticks
+  for (int d = 7; d <= 16; d++) {
+    drawRgbaPixel(buf, sz, sz, cx + d, cy, colR, colG, colB, 220);
+    drawRgbaPixel(buf, sz, sz, cx - d, cy, colR, colG, colB, 220);
+    drawRgbaPixel(buf, sz, sz, cx, cy + d, colR, colG, colB, 220);
+    drawRgbaPixel(buf, sz, sz, cx, cy - d, colR, colG, colB, 220);
+  }
+
+  Fl_RGB_Image* rgbaImg = new Fl_RGB_Image(buf, sz, sz, 4);
+  agentMarkerSurface = new Surface(rgbaImg);
+  delete rgbaImg;
+  delete [] buf;
+}
+
+void DesktopWindow::rebuildAgentDragSurface()
+{
+  delete agentDragSurface;
+  agentDragSurface = nullptr;
+
+  if (!cc->hasAgentBridge() || !cc->isAgentOverlayEnabled())
+    return;
+
+  const CConn::AgentOverlayState& ov = cc->getAgentOverlayState();
+  if (!ov.hasPoint || !ov.hasEndPoint)
+    return;
+
+  const int pad = 12;
+  int minX = std::min(ov.x, ov.endX) - pad;
+  int minY = std::min(ov.y, ov.endY) - pad;
+  int maxX = std::max(ov.x, ov.endX) + pad;
+  int maxY = std::max(ov.y, ov.endY) + pad;
+
+  int dragW = maxX - minX + 1;
+  int dragH = maxY - minY + 1;
+  if ((dragW <= 0) || (dragH <= 0) || (dragW > 4096) || (dragH > 4096))
+    return;
+
+  agentDragOriginX = minX;
+  agentDragOriginY = minY;
+
+  unsigned char* buf = new unsigned char[(size_t)dragW * (size_t)dragH * 4];
+  memset(buf, 0, (size_t)dragW * (size_t)dragH * 4);
+
+  int x0 = ov.x - minX;
+  int y0 = ov.y - minY;
+  int x1 = ov.endX - minX;
+  int y1 = ov.endY - minY;
+  int steps = std::max(abs(x1 - x0), abs(y1 - y0));
+  if (steps < 1)
+    steps = 1;
+
+  for (int stepIdx = 0; stepIdx <= steps; stepIdx++) {
+    float t = (float)stepIdx / (float)steps;
+    int px = (int)roundf((float)x0 + (float)(x1 - x0) * t);
+    int py = (int)roundf((float)y0 + (float)(y1 - y0) * t);
+    for (int oy = -1; oy <= 1; oy++) {
+      for (int ox = -1; ox <= 1; ox++)
+        drawRgbaPixel(buf, dragW, dragH, px + ox, py + oy, 46, 204, 113, 210);
+    }
+  }
+
+  for (int py = 0; py < dragH; py++) {
+    for (int px = 0; px < dragW; px++) {
+      float dEnd = hypotf((float)(px - x1), (float)(py - y1));
+      if (fabsf(dEnd - 6.0f) <= 1.5f)
+        drawRgbaPixel(buf, dragW, dragH, px, py, 46, 204, 113, 240);
+    }
+  }
+
+  Fl_RGB_Image* rgbaImg = new Fl_RGB_Image(buf, dragW, dragH, 4);
+  agentDragSurface = new Surface(rgbaImg);
+  delete rgbaImg;
+  delete [] buf;
+}
+
+void DesktopWindow::animateAgentOverlay(void *data)
+{
+  DesktopWindow* self = (DesktopWindow*)data;
+  if (!self || !self->agentPulseActive)
+    return;
+
+  unsigned elapsed = core::msSince(&self->agentPulseStart);
+  if (elapsed >= 600) {
+    self->agentPulseActive = false;
+    self->rebuildAgentMarkerSurface(0.0f);
+    self->damage(FL_DAMAGE_USER1);
+    return;
+  }
+
+  float progress = (float)elapsed / 600.0f;
+  self->rebuildAgentMarkerSurface(progress);
+  self->damage(FL_DAMAGE_USER1);
+  Fl::repeat_timeout(1.0 / 30.0, animateAgentOverlay, data);
+}
+
+void DesktopWindow::updateAgentOverlay()
+{
+  if (!cc->hasAgentBridge() || !cc->isAgentOverlayEnabled()) {
+    Fl::remove_timeout(animateAgentOverlay, this);
+    agentPulseActive = false;
+    delete agentHudSurface;
+    agentHudSurface = nullptr;
+    delete agentMarkerSurface;
+    agentMarkerSurface = nullptr;
+    delete agentDragSurface;
+    agentDragSurface = nullptr;
+    damage(FL_DAMAGE_USER1);
+    return;
+  }
+
+  CConn::AgentOverlayState ov = cc->getAgentOverlayState();
+  bool newPulse = ov.triggerPulse && (ov.seq != lastOverlaySeq);
+  lastOverlaySeq = ov.seq;
+
+  rebuildAgentHudSurface();
+  rebuildAgentDragSurface();
+
+  if (newPulse && ov.hasPoint) {
+    gettimeofday(&agentPulseStart, nullptr);
+    agentPulseActive = true;
+    rebuildAgentMarkerSurface(0.0f);
+    Fl::remove_timeout(animateAgentOverlay, this);
+    Fl::add_timeout(1.0 / 30.0, animateAgentOverlay, this);
+  } else {
+    float progress = 0.0f;
+    if (agentPulseActive) {
+      unsigned elapsed = core::msSince(&agentPulseStart);
+      if (elapsed >= 600) {
+        agentPulseActive = false;
+        Fl::remove_timeout(animateAgentOverlay, this);
+      } else {
+        progress = (float)elapsed / 600.0f;
+      }
+    }
+    rebuildAgentMarkerSurface(progress);
+  }
+
+  damage(FL_DAMAGE_USER1);
+}
+
+void DesktopWindow::promptAgentNote()
+{
+  if (!cc || !cc->hasAgentBridge())
+    return;
+
+  fl_message_title(_("Send note to agent"));
+  const char* note = fl_input(
+    _("Enter a collaborative note or instruction for the agent:"), "");
+  if (note && (note[0] != '\0'))
+    cc->pushUserMessage(note);
 }

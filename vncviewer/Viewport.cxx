@@ -83,7 +83,9 @@ static core::LogWriter vlog("Viewport");
 
 enum { ID_DISCONNECT, ID_FULLSCREEN, ID_MINIMIZE, ID_RESIZE,
        ID_CTRL, ID_ALT, ID_CTRLALTDEL,
-       ID_REFRESH, ID_OPTIONS, ID_INFO, ID_ABOUT };
+       ID_REFRESH, ID_PAUSE_AGENT, ID_AGENT_OVERLAY,
+       ID_AGENT_COLLABORATE, ID_AGENT_NOTE,
+       ID_OPTIONS, ID_INFO, ID_ABOUT };
 
 // Used for fake key presses from the menu
 static const int FAKE_CTRL_KEY_CODE = 0x10001;
@@ -506,6 +508,11 @@ int Viewport::handle(int event)
                          buttonMask | wheelMask);
     } 
 
+    if (!viewOnly && cc->hasAgentBridge() &&
+        ((event == FL_PUSH) || (event == FL_MOUSEWHEEL))) {
+      cc->notifyHumanInput();
+    }
+
     handlePointerEvent({Fl::event_x() - x(), Fl::event_y() - y()}, buttonMask);
     return 1;
 
@@ -588,6 +595,8 @@ void Viewport::handleClipboardChange(int source, void *data)
   if (!sendPrimary && (source == 0))
     return;
 #endif
+
+  self->cc->clearAgentClipboardOwnership();
 
   if (!self->hasFocus()) {
     vlog.debug("Local clipboard changed whilst not focused, will notify server later");
@@ -736,6 +745,17 @@ void Viewport::handleKeyPress(int systemKeyCode,
           keySym = *iter;
           found = true;
           break;
+        case XK_P:
+        case XK_p:
+        case XK_N:
+        case XK_n:
+          if (cc->hasAgentBridge()) {
+            keySym = *iter;
+            found = true;
+          } else {
+            found = false;
+          }
+          break;
         default:
           found = false;
           break;
@@ -804,6 +824,16 @@ void Viewport::handleKeyPress(int systemKeyCode,
           ((DesktopWindow*)window())->fullscreen_on();
         }
         break;
+      case XK_P:
+      case XK_p:
+        if (cc->hasAgentBridge())
+          cc->setAgentPaused(!cc->isAgentPaused(), "operator_hotkey");
+        break;
+      case XK_N:
+      case XK_n:
+        if (cc->hasAgentBridge())
+          ((DesktopWindow*)window())->promptAgentNote();
+        break;
       default:
         // Unknown/Unused keyboard shortcut
         break;
@@ -814,6 +844,8 @@ void Viewport::handleKeyPress(int systemKeyCode,
   }
 
   // Normal key, so send to server...
+  if (!viewOnly && cc->hasAgentBridge())
+    cc->notifyHumanInput();
 
   sendKeyPress(systemKeyCode, keyCode, keySym);
 }
@@ -956,6 +988,20 @@ void Viewport::initContextMenu()
   fltk_menu_add(contextMenu, C_("ContextMenu|", "&Refresh screen"),
                 0, nullptr, (void*)ID_REFRESH, FL_MENU_DIVIDER);
 
+  if (cc->hasAgentBridge()) {
+    fltk_menu_add(contextMenu, C_("ContextMenu|", "&Pause agent input"),
+                  0, nullptr, (void*)ID_PAUSE_AGENT,
+                  FL_MENU_TOGGLE | (cc->isAgentPaused()?FL_MENU_VALUE:0));
+    fltk_menu_add(contextMenu, C_("ContextMenu|", "Show agent &overlay"),
+                  0, nullptr, (void*)ID_AGENT_OVERLAY,
+                  FL_MENU_TOGGLE | ((bool)agentOverlay?FL_MENU_VALUE:0));
+    fltk_menu_add(contextMenu, C_("ContextMenu|", "&Collaborative takeover"),
+                  0, nullptr, (void*)ID_AGENT_COLLABORATE,
+                  FL_MENU_TOGGLE | ((bool)agentCollaborate?FL_MENU_VALUE:0));
+    fltk_menu_add(contextMenu, C_("ContextMenu|", "Send &note to agent..."),
+                  0, nullptr, (void*)ID_AGENT_NOTE, FL_MENU_DIVIDER);
+  }
+
   fltk_menu_add(contextMenu, C_("ContextMenu|", "&Options..."),
                 0, nullptr, (void*)ID_OPTIONS, 0);
   fltk_menu_add(contextMenu, C_("ContextMenu|", "Connection &info..."),
@@ -1044,6 +1090,20 @@ void Viewport::popupContextMenu()
     break;
   case ID_REFRESH:
     cc->refreshFramebuffer();
+    break;
+  case ID_PAUSE_AGENT:
+    cc->setAgentPaused(!cc->isAgentPaused(), "operator_menu");
+    break;
+  case ID_AGENT_OVERLAY:
+    agentOverlay.setParam(!agentOverlay);
+    cc->refreshAgentOverlayDisplay();
+    break;
+  case ID_AGENT_COLLABORATE:
+    agentCollaborate.setParam(!agentCollaborate);
+    cc->refreshAgentOverlayDisplay();
+    break;
+  case ID_AGENT_NOTE:
+    ((DesktopWindow*)window())->promptAgentNote();
     break;
   case ID_OPTIONS:
     OptionsDialog::showDialog();

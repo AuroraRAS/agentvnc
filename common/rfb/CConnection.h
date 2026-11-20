@@ -314,6 +314,7 @@ namespace rfb {
     void setState(stateEnum s) { state_ = s; }
 
     ModifiablePixelBuffer* getFramebuffer() { return framebuffer; }
+    void flushDecoder() { decoder.flush(); }
 
   protected:
     // Optional capabilities that a subclass is expected to set to true

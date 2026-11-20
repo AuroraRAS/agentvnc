@@ -50,6 +50,15 @@ public:
   // Updated session title
   void updateCaption();
 
+  // Show a transient notification overlay on the viewer window
+  void showNotification(const char* text);
+
+  // Refresh live agent HUD / reticle / drag vector surfaces
+  void updateAgentOverlay();
+
+  // Prompt the user to send a collaborative note to the agent
+  void promptAgentNote();
+
   // Resize the current framebuffer, but retain the contents
   void resizeFramebuffer(int new_w, int new_h);
 
@@ -120,6 +129,11 @@ private:
 
   static void handleStatsTimeout(void *data);
 
+  void rebuildAgentHudSurface();
+  void rebuildAgentMarkerSurface(float rippleProgress);
+  void rebuildAgentDragSurface();
+  static void animateAgentOverlay(void *data);
+
 private:
   CConn* cc;
   Fl_Scrollbar *hscroll, *vscroll;
@@ -162,6 +176,15 @@ private:
   unsigned statsLastPosition;
 
   Surface *statsGraph;
+
+  Surface *agentHudSurface;
+  Surface *agentMarkerSurface;
+  Surface *agentDragSurface;
+  int agentDragOriginX;
+  int agentDragOriginY;
+  uint64_t lastOverlaySeq;
+  struct timeval agentPulseStart;
+  bool agentPulseActive;
 };
 
 #endif
