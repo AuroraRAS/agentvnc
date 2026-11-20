@@ -27,6 +27,7 @@
 
 #include <stdexcept>
 
+#include <core/Configuration.h>
 #include <core/LogWriter.h>
 #include <core/i18n.h>
 #include <core/string.h>
@@ -53,6 +54,7 @@
 #include "CConn.h"
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
+#include "Scale.h"
 #include "parameters.h"
 #include "vncviewer.h"
 
@@ -94,7 +96,8 @@ static const int FAKE_DEL_KEY_CODE = 0x10003;
 static const int FAKE_KEY_CODE = 0xffff;
 
 Viewport::Viewport(int w, int h, CConn* cc_)
-  : Fl_Widget(0, 0, w, h), cc(cc_), frameBuffer(nullptr),
+  : Fl_Widget(0, 0, w * (int)scaleFactor, h * (int)scaleFactor),
+    cc(cc_), frameBuffer(nullptr), scale((int)scaleFactor),
     lastPointerPos(0, 0), lastButtonMask(0),
     keyboard(nullptr), shortcutBypass(false), shortcutActive(false),
     firstLEDState(true), pendingClientClipboard(false),
@@ -181,8 +184,46 @@ void Viewport::updateWindow()
 {
   core::Rect r;
 
-  r = frameBuffer->getDamage();
+  r = scaleRectFromFramebuffer(frameBuffer->getDamage(), scale);
   damage(FL_DAMAGE_USER1, r.tl.x + x(), r.tl.y + y(), r.width(), r.height());
+}
+
+void Viewport::resizeFramebuffer(int fb_w, int fb_h)
+{
+  if ((fb_w != frameBuffer->width()) || (fb_h != frameBuffer->height())) {
+    vlog.debug("Resizing framebuffer from %dx%d to %dx%d",
+               frameBuffer->width(), frameBuffer->height(), fb_w, fb_h);
+
+    frameBuffer = new PlatformPixelBuffer(fb_w, fb_h);
+    assert(frameBuffer);
+    cc->setFramebuffer(frameBuffer);
+  }
+
+  Fl_Widget::size(fb_w * scale, fb_h * scale);
+}
+
+void Viewport::setScaleFactor(int factor)
+{
+  assert(factor >= MIN_SCALE_FACTOR);
+  assert(factor <= MAX_SCALE_FACTOR);
+
+  if (factor == scale)
+    return;
+
+  scale = factor;
+  Fl_Widget::size(frameBuffer->width() * scale, frameBuffer->height() * scale);
+  setCursor();
+  redraw();
+}
+
+int Viewport::framebufferWidth() const
+{
+  return frameBuffer->width();
+}
+
+int Viewport::framebufferHeight() const
+{
+  return frameBuffer->height();
 }
 
 static const char * dotcursor_xpm[] = {
@@ -226,8 +267,21 @@ void Viewport::setCursor()
     vlog.debug("Cursor is empty, using dot");
 
     Fl_Pixmap pxm(dotcursor_xpm);
-    cursor = new Fl_RGB_Image(&pxm);
-    cursorHotspot.x = cursorHotspot.y = 2;
+    if (scale == 1) {
+      cursor = new Fl_RGB_Image(&pxm);
+      cursorHotspot.x = cursorHotspot.y = 2;
+    } else {
+      Fl_RGB_Image dotImg(&pxm);
+      int cScale = computeCursorScale(dotImg.w(), dotImg.h(), scale);
+      int scaledW = dotImg.w() * cScale;
+      int scaledH = dotImg.h() * cScale;
+      uint8_t *buffer = new uint8_t[scaledW * scaledH * dotImg.d()];
+      scalePixelBuffer((const uint8_t*)dotImg.data()[0],
+                       dotImg.w(), dotImg.h(), dotImg.d(), dotImg.ld(),
+                       cScale, buffer);
+      cursor = new Fl_RGB_Image(buffer, scaledW, scaledH, dotImg.d());
+      cursorHotspot = scaleCursorHotspot({2, 2}, dotImg.w(), dotImg.h(), cScale);
+    }
   } else {
     if ((width == 0) || (height == 0)) {
       uint8_t *buffer = new uint8_t[4];
@@ -235,10 +289,13 @@ void Viewport::setCursor()
       cursor = new Fl_RGB_Image(buffer, 1, 1, 4);
       cursorHotspot.x = cursorHotspot.y = 0;
     } else {
-      uint8_t *buffer = new uint8_t[width * height * 4];
-      memcpy(buffer, data, width * height * 4);
-      cursor = new Fl_RGB_Image(buffer, width, height, 4);
-      cursorHotspot = hotspot;
+      int cScale = computeCursorScale(width, height, scale);
+      int scaledW = width * cScale;
+      int scaledH = height * cScale;
+      uint8_t *buffer = new uint8_t[scaledW * scaledH * 4];
+      scalePixelBuffer(data, width, height, 4, 0, cScale, buffer);
+      cursor = new Fl_RGB_Image(buffer, scaledW, scaledH, 4);
+      cursorHotspot = scaleCursorHotspot(hotspot, width, height, cScale);
     }
   }
 
@@ -386,7 +443,7 @@ void Viewport::draw(Surface* dst)
   if ((W == 0) || (H == 0))
     return;
 
-  frameBuffer->draw(dst, X - x(), Y - y(), X, Y, W, H);
+  frameBuffer->draw(dst, X - x(), Y - y(), X, Y, W, H, scale);
 }
 
 
@@ -399,22 +456,7 @@ void Viewport::draw()
   if ((W == 0) || (H == 0))
     return;
 
-  frameBuffer->draw(X - x(), Y - y(), X, Y, W, H);
-}
-
-
-void Viewport::resize(int x, int y, int w, int h)
-{
-  if ((w != frameBuffer->width()) || (h != frameBuffer->height())) {
-    vlog.debug("Resizing framebuffer from %dx%d to %dx%d",
-               frameBuffer->width(), frameBuffer->height(), w, h);
-
-    frameBuffer = new PlatformPixelBuffer(w, h);
-    assert(frameBuffer);
-    cc->setFramebuffer(frameBuffer);
-  }
-
-  Fl_Widget::resize(x, y, w, h);
+  frameBuffer->draw(X - x(), Y - y(), X, Y, W, H, scale);
 }
 
 
@@ -655,7 +697,7 @@ void Viewport::flushPendingClipboard()
 void Viewport::handlePointerEvent(const core::Point& pos,
                                   uint16_t buttonMask)
 {
-  filterPointerEvent(pos, buttonMask);
+  filterPointerEvent(scaleToFramebuffer(pos, scale), buttonMask);
 }
 
 

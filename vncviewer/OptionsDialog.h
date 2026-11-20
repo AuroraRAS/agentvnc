@@ -162,6 +162,8 @@ protected:
   Fl_Round_Button *allMonitorsButton;
   Fl_Round_Button *selectedMonitorsButton;
   Fl_Monitor_Arrangement *monitorArrangement;
+  Fl_Group *scalingGroup;
+  Fl_Choice *scaleFactorChoice;
 
   /* Misc. */
   Fl_Check_Button *sharedCheckbox;

@@ -46,6 +46,15 @@ public:
   // Flush updates to screen
   void updateWindow();
 
+  // Resize the remote framebuffer without changing the scale factor
+  void resizeFramebuffer(int fb_w, int fb_h);
+
+  int getScaleFactor() const { return scale; }
+  void setScaleFactor(int factor);
+
+  int framebufferWidth() const;
+  int framebufferHeight() const;
+
   // New image for the locally rendered cursor
   void setCursor();
 
@@ -62,8 +71,6 @@ public:
   // Fl_Widget callback methods
 
   void draw() override;
-
-  void resize(int x, int y, int w, int h) override;
 
   int handle(int event) override;
 
@@ -106,6 +113,7 @@ private:
   CConn* cc;
 
   PlatformPixelBuffer* frameBuffer;
+  int scale;
 
   core::Point lastPointerPos;
   uint16_t lastButtonMask;

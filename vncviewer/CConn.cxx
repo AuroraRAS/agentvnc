@@ -31,6 +31,7 @@
 #include <gnutls/x509.h>
 #endif
 
+#include <core/Configuration.h>
 #include <core/Exception.h>
 #include <core/LogWriter.h>
 #include <core/Timer.h>
@@ -221,6 +222,9 @@ std::string CConn::connectionInfo()
 
   infoText += core::format(_("Size: %d x %d"),
                            server.width(), server.height());
+  infoText += "\n";
+
+  infoText += core::format(_("Scale factor: %dx"), (int)scaleFactor);
   infoText += "\n";
 
   // TRANSLATORS: Will be filled in with a string describing the

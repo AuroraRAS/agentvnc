@@ -43,6 +43,7 @@
 #include "parameters.h"
 #include "vncviewer.h"
 #include "CConn.h"
+#include "Scale.h"
 #include "Surface.h"
 #include "Viewport.h"
 #include "touch.h"
@@ -84,7 +85,7 @@ static core::LogWriter vlog("DesktopWindow");
 static std::set<DesktopWindow *> instances;
 
 DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
-  : Fl_Window(w, h), cc(cc_), offscreen(nullptr),
+  : Fl_Window(w * (int)scaleFactor, h * (int)scaleFactor), cc(cc_), offscreen(nullptr),
     firstUpdate(true),
     delayedFullscreen(false), sentDesktopSize(false),
     pendingRemoteResize(false), lastResize({0, 0}),
@@ -93,9 +94,11 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
     statsGraph(nullptr)
 {
   Fl_Group* group;
+  int win_w = w * (int)scaleFactor;
+  int win_h = h * (int)scaleFactor;
 
   // Dummy group to prevent FLTK from moving our widgets around
-  group = new Fl_Group(0, 0, w, h);
+  group = new Fl_Group(0, 0, win_w, win_h);
   group->resizable(nullptr);
   resizable(group);
 
@@ -142,8 +145,8 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
         force_position(1);
         /* fall through */
       case 2:
-        w = geom_w;
-        h = geom_h;
+        win_w = geom_w;
+        win_h = geom_h;
         break;
       default:
         geom_x = geom_y = 0;
@@ -167,12 +170,12 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
     Fl::get_mouse(mx, my);
     Fl::screen_work_area(sx, sy, sw, sh, mx, my);
   }
-  if ((w > sw) || (h > sh)) {
+  if ((win_w > sw) || (win_h > sh)) {
     vlog.info(_("Reducing window size to fit on current monitor"));
-    if (w > sw)
-      w = sw;
-    if (h > sh)
-      h = sh;
+    if (win_w > sw)
+      win_w = sw;
+    if (win_h > sh)
+      win_h = sh;
   }
 
 #ifdef __APPLE__
@@ -180,14 +183,14 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
   // window is showned. Other platforms handled further down...
   if (::maximize) {
     int dummy;
-    Fl::screen_work_area(dummy, dummy, w, h, geom_x, geom_y);
+    Fl::screen_work_area(dummy, dummy, win_w, win_h, geom_x, geom_y);
   }
 #endif
 
   if (force_position()) {
-    resize(geom_x, geom_y, w, h);
+    resize(geom_x, geom_y, win_w, win_h);
   } else {
-    size(w, h);
+    size(win_w, win_h);
   }
 
   if (fullScreen) {
@@ -351,34 +354,31 @@ void DesktopWindow::updateWindow()
 
 void DesktopWindow::resizeFramebuffer(int new_w, int new_h)
 {
-  bool maximized;
+  int factor = viewport->getScaleFactor();
+  int scaled_w = new_w * factor;
+  int scaled_h = new_h * factor;
 
-  if ((new_w == viewport->w()) && (new_h == viewport->h()))
+  if ((new_w == viewport->framebufferWidth()) &&
+      (new_h == viewport->framebufferHeight()) &&
+      (scaled_w == viewport->w()) &&
+      (scaled_h == viewport->h()))
     return;
-
-  maximized = false;
-
-#ifdef WIN32
-  if (win32_win_is_maximized(this))
-    maximized = true;
-#elif defined(__APPLE__)
-  if (cocoa_win_is_zoomed(this))
-    maximized = true;
-#else
-  if (x11_win_is_maximized(this))
-    maximized = true;
-#endif
 
   // If we're letting the viewport match the window perfectly, then
   // keep things that way for the new size, otherwise just keep things
   // like they are.
-  if (!fullscreen_active() && !maximized && !pendingRemoteResize &&
+  if (!fullscreen_active() && !isMaximized() && !pendingRemoteResize &&
       !Fl::has_timeout(handleResizeTimeout, this)) {
-    if ((w() == viewport->w()) && (h() == viewport->h()))
-      size(new_w, new_h);
+    if ((w() == viewport->w()) && (h() == viewport->h())) {
+      int sx, sy, sw, sh;
+      Fl::screen_work_area(sx, sy, sw, sh, Fl::screen_num(x(), y(), w(), h()));
+      int win_w = std::min(scaled_w, sw);
+      int win_h = std::min(scaled_h, sh);
+      size(win_w, win_h);
+    }
   }
 
-  viewport->size(new_w, new_h);
+  viewport->resizeFramebuffer(new_w, new_h);
 
   repositionWidgets();
 }
@@ -406,15 +406,18 @@ void DesktopWindow::setCursorPos(const core::Point& pos)
     // Do nothing if we do not have the mouse captured.
     return;
   }
+
+  core::Point localPos = scaleFromFramebuffer(pos, viewport->getScaleFactor());
+
 #if defined(WIN32)
-  SetCursorPos(pos.x + x_root() + viewport->x(),
-               pos.y + y_root() + viewport->y());
+  SetCursorPos(localPos.x + x_root() + viewport->x(),
+               localPos.y + y_root() + viewport->y());
 #elif defined(__APPLE__)
-  cocoa_set_cursor_pos(pos.x + x_root() + viewport->x(),
-                       pos.y + y_root() + viewport->y());
+  cocoa_set_cursor_pos(localPos.x + x_root() + viewport->x(),
+                       localPos.y + y_root() + viewport->y());
 #else // Assume this is Xlib
-  x11_warp_pointer(pos.x + x_root() + viewport->x(),
-                   pos.y + y_root() + viewport->y());
+  x11_warp_pointer(localPos.x + x_root() + viewport->x(),
+                   localPos.y + y_root() + viewport->y());
 #endif
 }
 
@@ -1249,6 +1252,18 @@ void DesktopWindow::maximizeWindow()
 }
 
 
+bool DesktopWindow::isMaximized()
+{
+#ifdef WIN32
+  return win32_win_is_maximized(this);
+#elif defined(__APPLE__)
+  return cocoa_win_is_zoomed(this);
+#else
+  return x11_win_is_maximized(this);
+#endif
+}
+
+
 void DesktopWindow::handleResizeTimeout(void *data)
 {
   DesktopWindow *self = (DesktopWindow *)data;
@@ -1303,19 +1318,24 @@ void DesktopWindow::remoteResize()
     return;
   }
 
-  width = w();
-  height = h();
+  int factor = viewport->getScaleFactor();
+  core::Point remoteSize = computeRemoteDesktopSize(w(), h(), factor);
+  width = remoteSize.x;
+  height = remoteSize.y;
 
+  bool explicitDesktopSize = false;
   if (!sentDesktopSize && (strcmp(desktopSize, "") != 0)) {
     // An explicit size has been requested
 
-    if (sscanf(desktopSize, "%dx%d", &width, &height) != 2)
+    if ((sscanf(desktopSize, "%dx%d", &width, &height) != 2) ||
+        (width <= 0) || (height <= 0))
       return;
 
     sentDesktopSize = true;
+    explicitDesktopSize = true;
   }
 
-  if (!fullscreen_active() || (width > w()) || (height > h())) {
+  if (!fullscreen_active() || (width * factor > w()) || (height * factor > h())) {
     // In windowed mode (or the framebuffer is so large that we need
     // to scroll) we just report a single virtual screen that covers
     // the entire framebuffer.
@@ -1349,12 +1369,17 @@ void DesktopWindow::remoteResize()
   } else {
     uint32_t id;
     int sx, sy, sw, sh;
-    core::Rect viewport_rect, screen_rect;
+    core::Rect ref_rect, screen_rect;
 
     // In full screen we report all screens that are fully covered.
 
-    viewport_rect.setXYWH(x() + (w() - width)/2, y() + (h() - height)/2,
-                          width, height);
+    if (!explicitDesktopSize) {
+      ref_rect.setXYWH(x(), y(), w(), h());
+    } else {
+      ref_rect.setXYWH(x() + (w() - width * factor) / 2,
+                       y() + (h() - height * factor) / 2,
+                       width * factor, height * factor);
+    }
 
     // If we can find a matching screen in the existing set, we use
     // that, otherwise we create a brand new screen.
@@ -1367,21 +1392,22 @@ void DesktopWindow::remoteResize()
 
       // Check that the screen is fully inside the framebuffer
       screen_rect.setXYWH(sx, sy, sw, sh);
-      if (!screen_rect.enclosed_by(viewport_rect))
+      if (!screen_rect.enclosed_by(ref_rect))
         continue;
 
-      // Adjust the coordinates so they are relative to our viewport
-      sx -= viewport_rect.tl.x;
-      sy -= viewport_rect.tl.y;
+      core::Rect r = scaleScreenRectToRemote(screen_rect, ref_rect,
+                                             width, height, factor);
+      if (r.is_empty())
+        continue;
 
       // Look for perfectly matching existing screen that is not yet present in
       // in the screen layout...
       for (iter = cc->server.screenLayout().begin();
            iter != cc->server.screenLayout().end(); ++iter) {
-        if ((iter->dimensions.tl.x == sx) &&
-            (iter->dimensions.tl.y == sy) &&
-            (iter->dimensions.width() == sw) &&
-            (iter->dimensions.height() == sh) &&
+        if ((iter->dimensions.tl.x == r.tl.x) &&
+            (iter->dimensions.tl.y == r.tl.y) &&
+            (iter->dimensions.width() == r.width()) &&
+            (iter->dimensions.height() == r.height()) &&
             (std::find(layout.begin(), layout.end(), *iter) == layout.end()))
           break;
       }
@@ -1405,7 +1431,8 @@ void DesktopWindow::remoteResize()
           break;
       }
 
-      layout.add_screen(rfb::Screen(id, sx, sy, sw, sh, 0));
+      layout.add_screen(rfb::Screen(id, r.tl.x, r.tl.y,
+                                    r.width(), r.height(), 0));
     }
 
     // If the viewport doesn't match a physical screen, then we might
@@ -1568,6 +1595,14 @@ void DesktopWindow::handleClose(Fl_Widget* /*wnd*/, void* /*data*/)
 void DesktopWindow::handleOptions(void *data)
 {
   DesktopWindow *self = (DesktopWindow*)data;
+  int newScale = scaleFactor;
+  bool scaleChanged = (newScale != self->viewport->getScaleFactor());
+  bool wasFullscreen = self->fullscreen_active();
+  bool matchedViewport = (self->w() == self->viewport->w()) &&
+                         (self->h() == self->viewport->h());
+
+  if (scaleChanged)
+    self->viewport->setScaleFactor(newScale);
 
   // Call fullscreen_on even if active since it handles
   // fullScreenMode
@@ -1575,6 +1610,23 @@ void DesktopWindow::handleOptions(void *data)
     self->fullscreen_on();
   else if (!fullScreen && self->fullscreen_active())
     self->fullscreen_off();
+
+  if (scaleChanged) {
+    if (!fullScreen && !wasFullscreen && !self->isMaximized() &&
+        matchedViewport) {
+      int sx, sy, sw, sh;
+      Fl::screen_work_area(sx, sy, sw, sh,
+                           Fl::screen_num(self->x(), self->y(),
+                                          self->w(), self->h()));
+      int win_w = std::min(self->viewport->w(), sw);
+      int win_h = std::min(self->viewport->h(), sh);
+      self->size(win_w, win_h);
+    }
+
+    self->repositionWidgets();
+    self->remoteResize();
+    self->redraw();
+  }
 }
 
 void DesktopWindow::handleFullscreenTimeout(void *data)
