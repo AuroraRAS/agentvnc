@@ -101,6 +101,7 @@ FileTransferClient::FileTransferClient(ServerParams* server)
     tight2Available_(false),
     tight2CompressionProbeCap_(false),
     tight2ReplyPending_(false),
+    tight2CancelAction_(Tight2CancelAction::NoCancel),
     tight13Available_(false),
     tight13SyncPending_(false),
     downloadStarted_(false),
@@ -125,6 +126,7 @@ void FileTransferClient::reset()
   tight2Available_ = false;
   tight2CompressionProbeCap_ = false;
   tight2ReplyPending_ = false;
+  tight2CancelAction_ = Tight2CancelAction::NoCancel;
   tight13Available_ = false;
   tight13SyncPending_ = false;
   downloadStarted_ = false;
@@ -574,8 +576,16 @@ void FileTransferClient::cancelDownload()
   case FileTransferProtocol::Tight2:
     if (tight2ReplyPending_) {
       opState_ = OpState::DrainingCancel;
+      tight2CancelAction_ = Tight2CancelAction::CloseDownload;
+    } else if (downloadStarted_ && writer_ != nullptr) {
+      opState_ = OpState::DrainingCancel;
+      tight2CancelAction_ = Tight2CancelAction::NoCancel;
+      tight2ReplyPending_ = true;
+      writer_->writeTight2DownloadStartRequest("", 0);
     } else {
+      tight2CancelAction_ = Tight2CancelAction::NoCancel;
       opState_ = OpState::Idle;
+      downloadStarted_ = false;
       if (handler_ != nullptr)
         handler_->onCancelComplete();
     }
@@ -613,7 +623,7 @@ void FileTransferClient::startUpload(const std::string& path,
   case FileTransferProtocol::Tight2:
     tight2ReplyPending_ = true;
     writer_->writeTight2UploadStartRequest(toTight2Path(path),
-                                           overwrite, offset);
+                                           overwrite && (offset == 0), offset);
     break;
 
   case FileTransferProtocol::Tight13:
@@ -733,8 +743,16 @@ void FileTransferClient::cancelUpload()
   case FileTransferProtocol::Tight2:
     if (tight2ReplyPending_) {
       opState_ = OpState::DrainingCancel;
+      tight2CancelAction_ = Tight2CancelAction::CloseUpload;
+    } else if (uploadReady_ && writer_ != nullptr) {
+      opState_ = OpState::DrainingCancel;
+      tight2CancelAction_ = Tight2CancelAction::NoCancel;
+      tight2ReplyPending_ = true;
+      writer_->writeTight2UploadEndRequest(0, 0);
     } else {
+      tight2CancelAction_ = Tight2CancelAction::NoCancel;
       opState_ = OpState::Idle;
+      uploadReady_ = false;
       if (handler_ != nullptr)
         handler_->onCancelComplete();
     }
@@ -777,6 +795,7 @@ void FileTransferClient::abortPendingOp()
   opState_ = OpState::Idle;
   commandKind_ = CommandKind::NoneOp;
   tight2ReplyPending_ = false;
+  tight2CancelAction_ = Tight2CancelAction::NoCancel;
   tight13SyncPending_ = false;
   downloadStarted_ = false;
   uploadReady_ = false;
@@ -1039,6 +1058,31 @@ void FileTransferClient::onTight13FileDownloadFailed(const std::string& reason)
   }
 }
 
+void FileTransferClient::finishTight2DrainingCancel(bool remoteClosedHandle)
+{
+  if (!remoteClosedHandle && writer_ != nullptr) {
+    if (tight2CancelAction_ == Tight2CancelAction::CloseDownload) {
+      tight2CancelAction_ = Tight2CancelAction::NoCancel;
+      tight2ReplyPending_ = true;
+      writer_->writeTight2DownloadStartRequest("", 0);
+      return;
+    }
+    if (tight2CancelAction_ == Tight2CancelAction::CloseUpload) {
+      tight2CancelAction_ = Tight2CancelAction::NoCancel;
+      tight2ReplyPending_ = true;
+      writer_->writeTight2UploadEndRequest(0, 0);
+      return;
+    }
+  }
+
+  tight2CancelAction_ = Tight2CancelAction::NoCancel;
+  opState_ = OpState::Idle;
+  downloadStarted_ = false;
+  uploadReady_ = false;
+  if (handler_ != nullptr)
+    handler_->onCancelComplete();
+}
+
 void FileTransferClient::onTight2CompressionSupportReply(bool supported)
 {
   tight2ReplyPending_ = false;
@@ -1062,9 +1106,7 @@ void FileTransferClient::onTight2FileListReply(
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(true);
     return;
   }
   if (opState_ != OpState::Listing)
@@ -1086,9 +1128,7 @@ void FileTransferClient::onTight2Md5Reply(const uint8_t /*digest*/[16])
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(true);
   }
 }
 
@@ -1096,9 +1136,7 @@ void FileTransferClient::onTight2UploadStartReply()
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(false);
     return;
   }
   if (opState_ != OpState::Uploading)
@@ -1113,9 +1151,7 @@ void FileTransferClient::onTight2UploadDataReply()
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(false);
     return;
   }
   if (opState_ != OpState::Uploading)
@@ -1129,9 +1165,7 @@ void FileTransferClient::onTight2UploadEndReply()
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(true);
     return;
   }
   if (opState_ != OpState::Uploading)
@@ -1146,9 +1180,7 @@ void FileTransferClient::onTight2DownloadStartReply()
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(false);
     return;
   }
   if (opState_ != OpState::Downloading)
@@ -1164,9 +1196,7 @@ void FileTransferClient::onTight2DownloadDataReply(const uint8_t* data,
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(false);
     return;
   }
   if (opState_ != OpState::Downloading)
@@ -1181,9 +1211,7 @@ void FileTransferClient::onTight2DownloadEndReply(uint8_t /*flags*/,
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(true);
     return;
   }
   if (opState_ != OpState::Downloading)
@@ -1198,9 +1226,7 @@ void FileTransferClient::onTight2MkdirReply()
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(true);
     return;
   }
   if (opState_ != OpState::Command)
@@ -1226,9 +1252,7 @@ void FileTransferClient::onTight2DirSizeReply(uint64_t /*size*/)
 {
   tight2ReplyPending_ = false;
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(true);
   }
 }
 
@@ -1246,9 +1270,7 @@ void FileTransferClient::onTight2LastRequestFailedReply(
   }
 
   if (opState_ == OpState::DrainingCancel) {
-    opState_ = OpState::Idle;
-    if (handler_ != nullptr)
-      handler_->onCancelComplete();
+    finishTight2DrainingCancel(true);
     return;
   }
 

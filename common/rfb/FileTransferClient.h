@@ -141,8 +141,15 @@ namespace rfb {
       Rename
     };
 
+    enum class Tight2CancelAction {
+      NoCancel,
+      CloseDownload,
+      CloseUpload
+    };
+
     void ensureReadyForOp();
     void failActiveOp(const std::string& error);
+    void finishTight2DrainingCancel(bool remoteClosedHandle);
     void handleUltraDirPacket(uint16_t contentParam,
                               const uint8_t* payload, size_t length);
     void handleUltraFilePacket(uint32_t size,
@@ -172,6 +179,7 @@ namespace rfb {
     bool tight2Available_;
     bool tight2CompressionProbeCap_;
     bool tight2ReplyPending_;
+    Tight2CancelAction tight2CancelAction_;
 
     // Tight 1.3 / common transfer tracking
     bool tight13Available_;

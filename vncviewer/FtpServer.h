@@ -161,6 +161,7 @@ private:
     bool uploadAckPending;
     bool uploadCongestedPaused;
     bool uploadReadEof;
+    bool abortReplyPending;
 
     ClientSession()
       : id(0), ctrlFd(-1), outOff(0), closeAfterFlush(false),
@@ -171,7 +172,7 @@ private:
         dataState(DataTransferState::Idle), dataOutOff(0),
         dataOutEof(false), downloadPullDeferred(false),
         uploadAckPending(false), uploadCongestedPaused(false),
-        uploadReadEof(false) {}
+        uploadReadEof(false), abortReplyPending(false) {}
   };
 
   struct QueuedOp {

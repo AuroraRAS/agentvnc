@@ -674,6 +674,7 @@ void FtpServer::closeDataChannel(ClientSession* s)
   s->uploadAckPending = false;
   s->uploadCongestedPaused = false;
   s->uploadReadEof = false;
+  s->abortReplyPending = false;
 }
 
 bool FtpServer::startPassiveListener(ClientSession* s, bool ipv4Only)
@@ -994,6 +995,8 @@ void FtpServer::handleDataEvent(ClientSession* s,
       closeDataChannel(s);
       if (ft->isBusy()) {
         s->dataState = ClientSession::DataTransferState::Canceling;
+        s->abortReplyPending = false;
+        sendReply(s, "426 Data connection error.");
         ft->cancelUpload();
         backend_->flushOutput();
       } else {
@@ -1029,6 +1032,8 @@ void FtpServer::handleDataEvent(ClientSession* s,
         rfb::FileTransferClient* ft = backend_->fileTransfer();
         if (ft != nullptr && ft->isBusy()) {
           s->dataState = ClientSession::DataTransferState::Canceling;
+          s->abortReplyPending = false;
+          sendReply(s, "426 Connection closed; transfer aborted.");
           ft->cancelDownload();
           backend_->flushOutput();
           return;
@@ -1056,8 +1061,11 @@ void FtpServer::handleDataEvent(ClientSession* s,
     if (unread < kLowWaterMark) {
       s->downloadPullDeferred = false;
       rfb::FileTransferClient* ft = backend_->fileTransfer();
-      if (ft != nullptr)
+      if (ft != nullptr) {
         ft->requestMoreDownloadData();
+        if (backend_ != nullptr)
+          backend_->flushOutput();
+      }
     }
   }
 
@@ -1336,6 +1344,10 @@ void FtpServer::processControlLine(ClientSession* s, const std::string& rawLine)
 
     if (activeOp_.sessionId == s->id &&
         (activeOp_.kind == OpKind::Retr || activeOp_.kind == OpKind::Stor)) {
+      if (s->dataState == ClientSession::DataTransferState::Canceling) {
+        s->abortReplyPending = true;
+        return;
+      }
       bool hadSent150 =
         (s->dataState == ClientSession::DataTransferState::Transferring);
       closeDataChannel(s);
@@ -1343,6 +1355,7 @@ void FtpServer::processControlLine(ClientSession* s, const std::string& rawLine)
         backend_ != nullptr ? backend_->fileTransfer() : nullptr;
       if (ft != nullptr && ft->isBusy()) {
         s->dataState = ClientSession::DataTransferState::Canceling;
+        s->abortReplyPending = true;
         if (hadSent150)
           sendReply(s, "426 Transfer aborted.");
         if (activeOp_.kind == OpKind::Retr)
@@ -1602,12 +1615,14 @@ void FtpServer::processControlLine(ClientSession* s, const std::string& rawLine)
           return;
         }
         op.kind = OpKind::Stor;
+        op.overwrite = (existingSize == 0);
         op.offset = existingSize;
       } else {
         op.kind = OpKind::AppeStat;
       }
     } else {
       op.kind = OpKind::Stor;
+      op.overwrite = (off == 0);
       op.offset = off;
     }
 
@@ -1907,7 +1922,7 @@ void FtpServer::handleStatResult(ClientSession* s, const QueuedOp& op,
     uploadOp.sessionId = op.sessionId;
     uploadOp.kind = OpKind::Stor;
     uploadOp.path = op.path;
-    uploadOp.overwrite = true;
+    uploadOp.overwrite = (off == 0);
     uploadOp.offset = off;
     enqueueOp(uploadOp);
     return;
@@ -2306,9 +2321,11 @@ void FtpServer::onCancelComplete()
   ClientSession* s = findSession(activeOp_.sessionId);
   if (s != nullptr &&
       s->dataState == ClientSession::DataTransferState::Canceling) {
+    bool send226 = s->abortReplyPending;
     closeDataChannel(s);
     s->dataState = ClientSession::DataTransferState::Idle;
-    sendReply(s, "226 Abort successful.");
+    if (send226)
+      sendReply(s, "226 Abort successful.");
   }
   finishActiveOp();
 }

@@ -879,3 +879,286 @@ TEST(FileTransferUnit, UltraVNCWireRoundTrip)
   EXPECT_TRUE(ftHandler.lastEntries[0].isDir);
   EXPECT_EQ(ftHandler.lastEntries[0].mtime, 1700000000LL);
 }
+
+TEST(FileTransferUnit, Tight2PersistentZlibStreamAndFlags)
+{
+  TestCConnection conn;
+  RecordingFTHandler ftHandler;
+  conn.fileTransferClient().setHandler(&ftHandler);
+  conn.server.tightEnabled = true;
+
+  rdr::MemOutStream clientOut;
+  rfb::CMsgWriter clientWriter(&conn.server, &clientOut);
+  conn.fileTransferClient().setWriter(&clientWriter);
+
+  std::vector<rfb::TightCapability> sCaps;
+  auto pushS = [&](uint32_t code, const char* sig) {
+    rfb::TightCapability c;
+    c.code = static_cast<int32_t>(code);
+    memcpy(c.vendor, rfb::tightVendorTight, 4);
+    memcpy(c.signature, sig, 8);
+    sCaps.push_back(c);
+  };
+  pushS(rfb::tight2CompressionSupportReply, rfb::sigTight2CompressionSupportReply);
+  pushS(rfb::tight2FileListReply, rfb::sigTight2FileListReply);
+  pushS(rfb::tight2UploadStartReply, rfb::sigTight2UploadStartReply);
+  pushS(rfb::tight2UploadDataReply, rfb::sigTight2UploadDataReply);
+  pushS(rfb::tight2UploadEndReply, rfb::sigTight2UploadEndReply);
+  pushS(rfb::tight2DownloadStartReply, rfb::sigTight2DownloadStartReply);
+  pushS(rfb::tight2DownloadDataReply, rfb::sigTight2DownloadDataReply);
+  pushS(rfb::tight2DownloadEndReply, rfb::sigTight2DownloadEndReply);
+  pushS(rfb::tight2LastRequestFailedReply, rfb::sigTight2LastRequestFailedReply);
+
+  std::vector<rfb::TightCapability> cCaps;
+  auto pushC = [&](uint32_t code, const char* sig) {
+    rfb::TightCapability c;
+    c.code = static_cast<int32_t>(code);
+    memcpy(c.vendor, rfb::tightVendorTight, 4);
+    memcpy(c.signature, sig, 8);
+    cCaps.push_back(c);
+  };
+  pushC(rfb::tight2CompressionSupportReq, rfb::sigTight2CompressionSupportReq);
+  pushC(rfb::tight2FileListReq, rfb::sigTight2FileListReq);
+  pushC(rfb::tight2UploadStartReq, rfb::sigTight2UploadStartReq);
+  pushC(rfb::tight2UploadDataReq, rfb::sigTight2UploadDataReq);
+  pushC(rfb::tight2UploadEndReq, rfb::sigTight2UploadEndReq);
+  pushC(rfb::tight2DownloadStartReq, rfb::sigTight2DownloadStartReq);
+  pushC(rfb::tight2DownloadDataReq, rfb::sigTight2DownloadDataReq);
+
+  conn.fileTransferClient().onServerTightCaps(sCaps, cCaps, {});
+  conn.fileTransferClient().onServerInit();
+  conn.fileTransferClient().onTight2CompressionSupportReply(true);
+  ASSERT_EQ(ftHandler.readyCount, 1);
+
+  auto makeListPayload = [](const char* fname, uint64_t sz) {
+    std::vector<uint8_t> raw;
+    appendU32BE(&raw, 1);
+    appendU64BE(&raw, sz);
+    appendU64BE(&raw, 1700000000000ULL);
+    appendU16BE(&raw, 0);
+    uint32_t nlen = static_cast<uint32_t>(strlen(fname));
+    appendU32BE(&raw, nlen);
+    raw.insert(raw.end(), fname, fname + nlen);
+    return raw;
+  };
+
+  z_stream def;
+  memset(&def, 0, sizeof(def));
+  ASSERT_EQ(deflateInit2(&def, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                         15, 8, Z_DEFAULT_STRATEGY), Z_OK);
+  auto compressPersistent = [&](const uint8_t* data, size_t len) {
+    std::vector<uint8_t> out(deflateBound(&def, static_cast<uLong>(len)) + 32);
+    def.next_in = const_cast<Bytef*>(data);
+    def.avail_in = static_cast<uInt>(len);
+    def.next_out = out.data();
+    def.avail_out = static_cast<uInt>(out.size());
+    size_t prevOut = def.total_out;
+    EXPECT_EQ(deflate(&def, Z_SYNC_FLUSH), Z_OK);
+    EXPECT_EQ(def.avail_in, 0U);
+    out.resize(def.total_out - prevOut);
+    return out;
+  };
+
+  std::vector<uint8_t> list1 = makeListPayload("alpha.txt", 123);
+  std::vector<uint8_t> list2 = makeListPayload("beta.txt", 456);
+  std::vector<uint8_t> c1 = compressPersistent(list1.data(), list1.size());
+  std::vector<uint8_t> c2 = compressPersistent(list2.data(), list2.size());
+  ASSERT_FALSE(c1.empty());
+  EXPECT_EQ(c1[0], 0x78U);
+  ASSERT_FALSE(c2.empty());
+  EXPECT_NE(c2[0], 0x78U); // Dictionary continuation without fresh zlib header
+
+  // Chunk A (compressible), Chunk B (incompressible csize > usize),
+  // Chunk C (crafted so compressed continuation length == usize)
+  std::vector<uint8_t> chunkA(256, 'A');
+  std::vector<uint8_t> compA = compressPersistent(chunkA.data(), chunkA.size());
+
+  std::vector<uint8_t> chunkB(64);
+  uint32_t rng = 0x9E3779B9U;
+  for (size_t i = 0; i < chunkB.size(); i++) {
+    rng = rng * 1664525U + 1013904223U;
+    chunkB[i] = static_cast<uint8_t>(rng >> 24);
+  }
+  std::vector<uint8_t> compB = compressPersistent(chunkB.data(), chunkB.size());
+  EXPECT_GE(compB.size(), chunkB.size());
+
+  // Construct an input block where a random incompressible head + compressible
+  // tail yields csize == usize through the persistent deflater.
+  std::vector<uint8_t> chunkC(12);
+  for (size_t i = 0; i < 8; i++) {
+    rng = rng * 1664525U + 1013904223U;
+    chunkC[i] = static_cast<uint8_t>(rng >> 24);
+  }
+  // Probe a small trailing run until compressed size >= chunkC.size() matches exact size
+  // by appending repeated 'Z' bytes.
+  z_stream probeDef;
+  memset(&probeDef, 0, sizeof(probeDef));
+  ASSERT_EQ(deflateCopy(&probeDef, &def), Z_OK);
+  size_t matchLen = 0;
+  for (size_t extra = 0; extra < 128; extra++) {
+    std::vector<uint8_t> cand = chunkC;
+    cand.insert(cand.end(), extra, 'Z');
+    z_stream trial;
+    memset(&trial, 0, sizeof(trial));
+    ASSERT_EQ(deflateCopy(&trial, &probeDef), Z_OK);
+    std::vector<uint8_t> pout(deflateBound(&trial, static_cast<uLong>(cand.size())) + 32);
+    trial.next_in = cand.data();
+    trial.avail_in = static_cast<uInt>(cand.size());
+    trial.next_out = pout.data();
+    trial.avail_out = static_cast<uInt>(pout.size());
+    size_t prev = trial.total_out;
+    EXPECT_EQ(deflate(&trial, Z_SYNC_FLUSH), Z_OK);
+    size_t clen = trial.total_out - prev;
+    deflateEnd(&trial);
+    if (clen == cand.size()) {
+      chunkC.swap(cand);
+      matchLen = clen;
+      break;
+    }
+  }
+  deflateEnd(&probeDef);
+  ASSERT_GT(matchLen, 0U);
+  std::vector<uint8_t> compC = compressPersistent(chunkC.data(), chunkC.size());
+  ASSERT_EQ(compC.size(), chunkC.size());
+
+  std::vector<uint8_t> list3 = makeListPayload("gamma.txt", 789);
+  std::vector<uint8_t> c3 = compressPersistent(list3.data(), list3.size());
+  deflateEnd(&def);
+
+  std::vector<uint8_t> wire;
+  auto pushTight2Compressed = [&](uint32_t msgId,
+                                  const std::vector<uint8_t>& comp,
+                                  size_t usize) {
+    appendU32BE(&wire, msgId);
+    appendU8(&wire, 1);
+    appendU32BE(&wire, static_cast<uint32_t>(comp.size()));
+    appendU32BE(&wire, static_cast<uint32_t>(usize));
+    wire.insert(wire.end(), comp.begin(), comp.end());
+  };
+
+  pushTight2Compressed(rfb::tight2FileListReply, c1, list1.size());
+  pushTight2Compressed(rfb::tight2FileListReply, c2, list2.size());
+  appendU32BE(&wire, rfb::tight2DownloadStartReply);
+  pushTight2Compressed(rfb::tight2DownloadDataReply, compA, chunkA.size());
+  pushTight2Compressed(rfb::tight2DownloadDataReply, compB, chunkB.size());
+  pushTight2Compressed(rfb::tight2DownloadDataReply, compC, chunkC.size());
+  appendU32BE(&wire, rfb::tight2DownloadEndReply);
+  appendU8(&wire, 0);
+  appendU64BE(&wire, 1700000000000ULL);
+  pushTight2Compressed(rfb::tight2FileListReply, c3, list3.size());
+
+  rdr::MemInStream in(wire.data(), wire.size());
+  rfb::CMsgReader persistentReader(&conn, &in);
+
+  conn.fileTransferClient().listDirectory("/");
+  EXPECT_TRUE(persistentReader.readMsg());
+  ASSERT_EQ(ftHandler.listCount, 1);
+  EXPECT_EQ(ftHandler.lastEntries[0].name, "alpha.txt");
+
+  conn.fileTransferClient().listDirectory("/");
+  EXPECT_TRUE(persistentReader.readMsg());
+  ASSERT_EQ(ftHandler.listCount, 2);
+  EXPECT_EQ(ftHandler.lastEntries[0].name, "beta.txt");
+
+  conn.fileTransferClient().startDownload("/all_chunks.bin", 0);
+  EXPECT_TRUE(persistentReader.readMsg()); // StartReply
+  conn.fileTransferClient().requestMoreDownloadData();
+  EXPECT_TRUE(persistentReader.readMsg()); // Chunk A
+  conn.fileTransferClient().requestMoreDownloadData();
+  EXPECT_TRUE(persistentReader.readMsg()); // Chunk B (csize > usize)
+  conn.fileTransferClient().requestMoreDownloadData();
+  EXPECT_TRUE(persistentReader.readMsg()); // Chunk C (csize == usize!)
+  conn.fileTransferClient().requestMoreDownloadData();
+  EXPECT_TRUE(persistentReader.readMsg()); // EndReply
+
+  std::vector<uint8_t> expectedDl;
+  expectedDl.insert(expectedDl.end(), chunkA.begin(), chunkA.end());
+  expectedDl.insert(expectedDl.end(), chunkB.begin(), chunkB.end());
+  expectedDl.insert(expectedDl.end(), chunkC.begin(), chunkC.end());
+  EXPECT_EQ(ftHandler.downloadedBytes, expectedDl);
+  EXPECT_EQ(ftHandler.downloadCompleteCount, 1);
+  EXPECT_TRUE(ftHandler.lastDownloadCompleteOk);
+
+  conn.fileTransferClient().listDirectory("/");
+  EXPECT_TRUE(persistentReader.readMsg());
+  ASSERT_EQ(ftHandler.listCount, 3);
+  EXPECT_EQ(ftHandler.lastEntries[0].name, "gamma.txt");
+
+  // Standalone Z_FINISH blocks must reset and decompress cleanly on a reader
+  auto compressFinish = [](const uint8_t* data, size_t len) {
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    EXPECT_EQ(deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                           15, 8, Z_DEFAULT_STRATEGY), Z_OK);
+    std::vector<uint8_t> out(deflateBound(&zs, static_cast<uLong>(len)) + 32);
+    zs.next_in = const_cast<Bytef*>(data);
+    zs.avail_in = static_cast<uInt>(len);
+    zs.next_out = out.data();
+    zs.avail_out = static_cast<uInt>(out.size());
+    EXPECT_EQ(deflate(&zs, Z_FINISH), Z_STREAM_END);
+    size_t n = zs.total_out;
+    deflateEnd(&zs);
+    out.resize(n);
+    return out;
+  };
+  std::vector<uint8_t> f1 = compressFinish(list1.data(), list1.size());
+  std::vector<uint8_t> f2 = compressFinish(list2.data(), list2.size());
+  std::vector<uint8_t> finWire;
+  finWire.reserve(f1.size() + f2.size() + 32);
+  auto pushFin = [&](const std::vector<uint8_t>& comp, size_t usize) {
+    appendU32BE(&finWire, rfb::tight2FileListReply);
+    appendU8(&finWire, 1);
+    appendU32BE(&finWire, static_cast<uint32_t>(comp.size()));
+    appendU32BE(&finWire, static_cast<uint32_t>(usize));
+    finWire.insert(finWire.end(), comp.begin(), comp.end());
+  };
+  pushFin(f1, list1.size());
+  pushFin(f2, list2.size());
+  rdr::MemInStream finIn(finWire.data(), finWire.size());
+  rfb::CMsgReader finReader(&conn, &finIn);
+  conn.fileTransferClient().listDirectory("/");
+  EXPECT_TRUE(finReader.readMsg());
+  EXPECT_EQ(ftHandler.lastEntries[0].name, "alpha.txt");
+  conn.fileTransferClient().listDirectory("/");
+  EXPECT_TRUE(finReader.readMsg());
+  EXPECT_EQ(ftHandler.lastEntries[0].name, "beta.txt");
+
+  // Wire verification of UPLOAD_START_REQUEST overwrite flag when offset > 0 vs == 0,
+  // plus cancelDownload() and cancelUpload() handle-release wire messages
+  clientOut.clear();
+  conn.fileTransferClient().startUpload("/f.bin", true, 10);
+  // 4(msgId) + 4(strLen=6) + 6("/f.bin") + 1(flags) + 8(offset) = 23 bytes
+  ASSERT_EQ(clientOut.length(), 23U);
+  EXPECT_EQ(clientOut.data()[14], 0U); // overwrite cleared when offset > 0
+  conn.fileTransferClient().onTight2UploadStartReply();
+  clientOut.clear();
+  conn.fileTransferClient().cancelUpload();
+  // Emits UPLOAD_END_REQUEST (14 bytes: 4 msgId + 2 flags + 8 mtime)
+  ASSERT_EQ(clientOut.length(), 14U);
+  EXPECT_EQ(clientOut.data()[3], 0x0AU); // tight2UploadEndReq (0xFC00010A)
+  EXPECT_TRUE(conn.fileTransferClient().isBusy());
+  int cancelBefore = ftHandler.cancelCompleteCount;
+  conn.fileTransferClient().onTight2UploadEndReply();
+  EXPECT_EQ(ftHandler.cancelCompleteCount, cancelBefore + 1);
+  EXPECT_FALSE(conn.fileTransferClient().isBusy());
+
+  clientOut.clear();
+  conn.fileTransferClient().startUpload("/f.bin", true, 0);
+  ASSERT_EQ(clientOut.length(), 23U);
+  EXPECT_EQ(clientOut.data()[14], 1U); // overwrite preserved when offset == 0
+  conn.fileTransferClient().onTight2LastRequestFailedReply("Aborted reset");
+
+  clientOut.clear();
+  conn.fileTransferClient().startDownload("/f.bin", 0);
+  conn.fileTransferClient().onTight2DownloadStartReply();
+  clientOut.clear();
+  conn.fileTransferClient().cancelDownload();
+  // Emits DOWNLOAD_START_REQUEST("", 0): 4 msgId + 4 strLen(0) + 8 offset(0) = 16 bytes
+  ASSERT_EQ(clientOut.length(), 16U);
+  EXPECT_EQ(clientOut.data()[3], 0x0CU); // tight2DownloadStartReq (0xFC00010C)
+  EXPECT_EQ(clientOut.data()[7], 0U);    // strLen == 0
+  EXPECT_TRUE(conn.fileTransferClient().isBusy());
+  conn.fileTransferClient().onTight2LastRequestFailedReply("No such file");
+  EXPECT_EQ(ftHandler.cancelCompleteCount, cancelBefore + 2);
+  EXPECT_FALSE(conn.fileTransferClient().isBusy());
+}

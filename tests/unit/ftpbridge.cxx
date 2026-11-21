@@ -125,26 +125,6 @@ static void writeCap(std::vector<uint8_t>* out, int32_t code,
   out->insert(out->end(), sig, sig + 8);
 }
 
-static std::vector<uint8_t> compressSync(const uint8_t* data, size_t len)
-{
-  if (len == 0)
-    return {};
-  z_stream zs;
-  memset(&zs, 0, sizeof(zs));
-  deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED, 15, 8,
-               Z_DEFAULT_STRATEGY);
-  std::vector<uint8_t> out(deflateBound(&zs, static_cast<uLong>(len)) + 32);
-  zs.next_in = const_cast<Bytef*>(data);
-  zs.avail_in = static_cast<uInt>(len);
-  zs.next_out = out.data();
-  zs.avail_out = static_cast<uInt>(out.size());
-  deflate(&zs, Z_SYNC_FLUSH);
-  size_t total = zs.total_out;
-  deflateEnd(&zs);
-  out.resize(total);
-  return out;
-}
-
 static std::vector<uint8_t> decompressSync(const uint8_t* data, size_t len,
                                            size_t outLen)
 {
@@ -190,8 +170,9 @@ public:
 
   explicit MockVncFileServer(MockServerMode mode)
     : mode_(mode), listenFd_(-1), clientFd_(-1), listenPort_(0),
-      state_(State::Version)
+      state_(State::Version), t2DeflateInit_(false)
   {
+    memset(&t2Deflate_, 0, sizeof(t2Deflate_));
     nodes_["/"] = {true, {}, 1700000000LL};
     if (mode_ == MockServerMode::Ultra) {
       nodes_["/C:"] = {true, {}, 1700000000LL};
@@ -220,6 +201,8 @@ public:
 
   ~MockVncFileServer()
   {
+    if (t2DeflateInit_)
+      deflateEnd(&t2Deflate_);
     if (clientFd_ >= 0)
       ::close(clientFd_);
     if (listenFd_ >= 0)
@@ -274,6 +257,8 @@ public:
     const char ver[] = "RFB 003.008\n";
     outBuf_.insert(outBuf_.end(), ver, ver + 12);
     state_ = State::Version;
+    if (mode_ == MockServerMode::Tight2)
+      initTight2Deflate();
   }
 
   void handleIo(bool canRead, bool canWrite)
@@ -783,7 +768,8 @@ private:
         writeBE32(&raw, static_cast<uint32_t>(ch.first.size()));
         raw.insert(raw.end(), ch.first.begin(), ch.first.end());
       }
-      std::vector<uint8_t> packed = compLevel ? compressSync(raw.data(), raw.size()) : raw;
+      std::vector<uint8_t> packed = compLevel
+        ? compressTight2Persistent(raw.data(), raw.size()) : raw;
       writeBE32(&outBuf_, rfb::tight2FileListReply);
       outBuf_.push_back(compLevel ? 1 : 0);
       writeBE32(&outBuf_, static_cast<uint32_t>(packed.size()));
@@ -796,19 +782,30 @@ private:
       if (inBuf_.size() < 16)
         return false;
       size_t consumed = 0;
-      std::string path = parseTight2Str(inBuf_.data() + 4, inBuf_.size() - 4, &consumed);
+      std::string rawPath = parseTight2Str(inBuf_.data() + 4, inBuf_.size() - 4, &consumed);
       if (consumed == 0 || inBuf_.size() < 4 + consumed + 8)
         return false;
       uint64_t offset = readBE64(inBuf_.data() + 4 + consumed);
       inBuf_.erase(inBuf_.begin(), inBuf_.begin() + 4 + consumed + 8);
-      path = normPath(path);
+      // Match real TightVNC 2.x: close any previously open download handle first
+      t2DlPath_.clear();
+      t2DlOffset_ = 0;
+      if (rawPath.empty()) {
+        sendTight2Failed("The system cannot find the path specified (error code 3)");
+        return true;
+      }
+      std::string path = normPath(rawPath);
       auto it = nodes_.find(path);
       if (it == nodes_.end() || it->second.isDir) {
         sendTight2Failed("File not found");
         return true;
       }
+      if (offset > it->second.data.size()) {
+        sendTight2Failed("Specified file pointer position is more than file length");
+        return true;
+      }
       t2DlPath_ = path;
-      t2DlOffset_ = static_cast<size_t>(std::min<uint64_t>(offset, it->second.data.size()));
+      t2DlOffset_ = static_cast<size_t>(offset);
       writeBE32(&outBuf_, rfb::tight2DownloadStartReply);
       return true;
     }
@@ -826,6 +823,8 @@ private:
       }
       const std::vector<uint8_t>& d = it->second.data;
       if (t2DlOffset_ >= d.size()) {
+        t2DlPath_.clear();
+        t2DlOffset_ = 0;
         writeBE32(&outBuf_, rfb::tight2DownloadEndReply);
         outBuf_.push_back(0);
         writeBE64(&outBuf_, static_cast<uint64_t>(it->second.mtime) * 1000ULL);
@@ -834,7 +833,8 @@ private:
       size_t chunk = std::min<size_t>(reqSize, d.size() - t2DlOffset_);
       std::vector<uint8_t> raw(d.data() + t2DlOffset_, d.data() + t2DlOffset_ + chunk);
       t2DlOffset_ += chunk;
-      std::vector<uint8_t> packed = compLevel ? compressSync(raw.data(), raw.size()) : raw;
+      std::vector<uint8_t> packed = compLevel
+        ? compressTight2Persistent(raw.data(), raw.size()) : raw;
       writeBE32(&outBuf_, rfb::tight2DownloadDataReply);
       outBuf_.push_back(compLevel ? 1 : 0);
       writeBE32(&outBuf_, static_cast<uint32_t>(packed.size()));
@@ -850,14 +850,31 @@ private:
       std::string path = parseTight2Str(inBuf_.data() + 4, inBuf_.size() - 4, &consumed);
       if (consumed == 0 || inBuf_.size() < 4 + consumed + 9)
         return false;
+      uint8_t flags = inBuf_[4 + consumed];
       uint64_t offset = readBE64(inBuf_.data() + 4 + consumed + 1);
       inBuf_.erase(inBuf_.begin(), inBuf_.begin() + 4 + consumed + 9);
       path = normPath(path);
-      t2UpPath_ = path;
+      t2UpPath_.clear();
       t2UpBuf_.clear();
       auto it = nodes_.find(path);
-      if (offset > 0 && it != nodes_.end() && !it->second.isDir &&
-          offset <= it->second.data.size()) {
+      if ((flags & 0x01) != 0) {
+        if (it != nodes_.end() && !it->second.isDir)
+          it->second.data.clear();
+        if (offset > 0) {
+          sendTight2Failed("Specified file pointer position is more than file length");
+          return true;
+        }
+        t2UpPath_ = path;
+      } else {
+        if (it == nodes_.end() || it->second.isDir) {
+          sendTight2Failed("The system cannot find the file specified (error code 2)");
+          return true;
+        }
+        if (offset > it->second.data.size()) {
+          sendTight2Failed("Specified file pointer position is more than file length");
+          return true;
+        }
+        t2UpPath_ = path;
         t2UpBuf_.assign(it->second.data.begin(),
                         it->second.data.begin() + static_cast<size_t>(offset));
       }
@@ -888,9 +905,11 @@ private:
       if (inBuf_.size() < 14)
         return false;
       inBuf_.erase(inBuf_.begin(), inBuf_.begin() + 14);
-      nodes_[t2UpPath_] = {false, t2UpBuf_, 1700001000LL};
-      t2UpPath_.clear();
-      t2UpBuf_.clear();
+      if (!t2UpPath_.empty()) {
+        nodes_[t2UpPath_] = {false, t2UpBuf_, 1700001000LL};
+        t2UpPath_.clear();
+        t2UpBuf_.clear();
+      }
       writeBE32(&outBuf_, rfb::tight2UploadEndReply);
       return true;
 
@@ -921,10 +940,13 @@ private:
         return false;
       inBuf_.erase(inBuf_.begin(), inBuf_.begin() + 4 + consumed);
       path = normPath(path);
-      if (nodes_.erase(path) == 0)
+      if (path == t2DlPath_ || path == t2UpPath_) {
+        sendTight2Failed("The process cannot access the file because it is being used by another process (error code 32)");
+      } else if (nodes_.erase(path) == 0) {
         sendTight2Failed("Not found");
-      else
+      } else {
         writeBE32(&outBuf_, rfb::tight2RemoveReply);
+      }
       return true;
     }
 
@@ -1146,10 +1168,43 @@ private:
   std::vector<uint8_t> outBuf_;
   std::map<std::string, Node> nodes_;
 
+  void initTight2Deflate()
+  {
+    if (t2DeflateInit_) {
+      deflateEnd(&t2Deflate_);
+      t2DeflateInit_ = false;
+    }
+    memset(&t2Deflate_, 0, sizeof(t2Deflate_));
+    EXPECT_EQ(deflateInit2(&t2Deflate_, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                           15, 8, Z_DEFAULT_STRATEGY), Z_OK);
+    t2DeflateInit_ = true;
+  }
+
+  std::vector<uint8_t> compressTight2Persistent(const uint8_t* data, size_t len)
+  {
+    if (!t2DeflateInit_)
+      initTight2Deflate();
+    if (len == 0)
+      return {};
+    std::vector<uint8_t> out(deflateBound(&t2Deflate_, static_cast<uLong>(len)) + 32);
+    t2Deflate_.next_in = const_cast<Bytef*>(data);
+    t2Deflate_.avail_in = static_cast<uInt>(len);
+    t2Deflate_.next_out = out.data();
+    t2Deflate_.avail_out = static_cast<uInt>(out.size());
+    size_t before = t2Deflate_.total_out;
+    int rc = deflate(&t2Deflate_, Z_SYNC_FLUSH);
+    EXPECT_EQ(rc, Z_OK);
+    EXPECT_EQ(t2Deflate_.avail_in, 0U);
+    out.resize(t2Deflate_.total_out - before);
+    return out;
+  }
+
   std::string t2DlPath_;
   size_t t2DlOffset_ = 0;
   std::string t2UpPath_;
   std::vector<uint8_t> t2UpBuf_;
+  z_stream t2Deflate_;
+  bool t2DeflateInit_;
 
   std::string t13UploadPath_;
   std::vector<uint8_t> t13UploadBuf_;
@@ -1833,7 +1888,7 @@ TEST(FtpBridgeIntegration, Tight2_FullWorkflowAndConcurrency)
     EXPECT_EQ(tail, expected);
   }
 
-  // APPE append
+  // APPE append (existing & new), REST+STOR resume, incompressible payload
   {
     const std::string extra = "APPENDED";
     int dfd = cli.openPasv();
@@ -1847,6 +1902,54 @@ TEST(FtpBridgeIntegration, Tight2_FullWorkflowAndConcurrency)
     ASSERT_TRUE(h.getMockFile("/sub/nested.txt", &updated));
     EXPECT_EQ(std::string(updated.begin(), updated.end()),
               "Nested content 1234567890APPENDED");
+
+    // APPE creating a new file
+    const std::string newBody = "NEW_APPE_FILE";
+    int dfd2 = cli.openPasv();
+    ASSERT_GE(dfd2, 0);
+    EXPECT_EQ(cli.cmd("APPE /work/appe_new.txt").first, 150);
+    FtpClientHelper::sendAllData(dfd2,
+                                 reinterpret_cast<const uint8_t*>(newBody.data()),
+                                 newBody.size());
+    EXPECT_EQ(cli.readReply().first, 226);
+    std::vector<uint8_t> gotNew;
+    ASSERT_TRUE(h.getMockFile("/work/appe_new.txt", &gotNew));
+    EXPECT_EQ(std::string(gotNew.begin(), gotNew.end()), newBody);
+    EXPECT_EQ(cli.cmd("DELE /work/appe_new.txt").first, 250);
+
+    // REST + STOR overwrite tail without truncating prefix
+    EXPECT_EQ(cli.cmd("REST 6").first, 350);
+    const std::string tailPatch = "XX_TAIL";
+    int dfd3 = cli.openPasv();
+    ASSERT_GE(dfd3, 0);
+    EXPECT_EQ(cli.cmd("STOR /sub/nested.txt").first, 150);
+    FtpClientHelper::sendAllData(dfd3,
+                                 reinterpret_cast<const uint8_t*>(tailPatch.data()),
+                                 tailPatch.size());
+    EXPECT_EQ(cli.readReply().first, 226);
+    ASSERT_TRUE(h.getMockFile("/sub/nested.txt", &updated));
+    EXPECT_EQ(std::string(updated.begin(), updated.end()), "NestedXX_TAIL");
+
+    // Incompressible deterministic PRNG payload under persistent zlib
+    std::vector<uint8_t> incomp(4096);
+    uint32_t seed = 0x12345678U;
+    for (size_t i = 0; i < incomp.size(); i++) {
+      seed = seed * 1664525U + 1013904223U;
+      incomp[i] = static_cast<uint8_t>(seed >> 24);
+    }
+    int dfd4 = cli.openPasv();
+    ASSERT_GE(dfd4, 0);
+    EXPECT_EQ(cli.cmd("STOR /work/incomp.bin").first, 150);
+    FtpClientHelper::sendAllData(dfd4, incomp.data(), incomp.size());
+    EXPECT_EQ(cli.readReply().first, 226);
+
+    int dfd5 = cli.openPasv();
+    ASSERT_GE(dfd5, 0);
+    EXPECT_EQ(cli.cmd("RETR /work/incomp.bin").first, 150);
+    auto dlIncomp = FtpClientHelper::readAllData(dfd5);
+    EXPECT_EQ(cli.readReply().first, 226);
+    EXPECT_EQ(dlIncomp, incomp);
+    EXPECT_EQ(cli.cmd("DELE /work/incomp.bin").first, 250);
   }
 
   // Zero-byte STOR & RETR
@@ -1903,11 +2006,18 @@ TEST(FtpBridgeIntegration, Tight2_FullWorkflowAndConcurrency)
     EXPECT_NE(s2.find("big.bin"), std::string::npos);
   }
 
-  // ABOR mid-download then clean reuse
+  // ABOR mid-download & mid-upload handle release + immediate DELE + clean reuse
   {
+    std::vector<uint8_t> tmpBig(160000, 0x5A);
+    int dUp = cli.openPasv();
+    ASSERT_GE(dUp, 0);
+    EXPECT_EQ(cli.cmd("STOR /abort_dl.bin").first, 150);
+    FtpClientHelper::sendAllData(dUp, tmpBig.data(), tmpBig.size());
+    EXPECT_EQ(cli.readReply().first, 226);
+
     int dfd = cli.openPasv();
     ASSERT_GE(dfd, 0);
-    EXPECT_EQ(cli.cmd("RETR /big.bin").first, 150);
+    EXPECT_EQ(cli.cmd("RETR /abort_dl.bin").first, 150);
     char firstChunk[1024];
     EXPECT_GT(::recv(dfd, firstChunk, sizeof(firstChunk), 0), 0);
     cli.sendRaw("ABOR\r\n");
@@ -1918,6 +2028,24 @@ TEST(FtpBridgeIntegration, Tight2_FullWorkflowAndConcurrency)
       EXPECT_EQ(r2.first, 226);
     }
     ::close(dfd);
+    EXPECT_EQ(cli.cmd("DELE /abort_dl.bin").first, 250);
+
+    int dUl = cli.openPasv();
+    ASSERT_GE(dUl, 0);
+    EXPECT_EQ(cli.cmd("STOR /abort_ul.bin").first, 150);
+    std::vector<uint8_t> part(16384, 0x4B);
+    ssize_t sent = ::send(dUl, part.data(), part.size(), 0);
+    EXPECT_GT(sent, 0);
+    std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    cli.sendRaw("ABOR\r\n");
+    auto u1 = cli.readReply();
+    EXPECT_TRUE(u1.first == 426 || u1.first == 226);
+    if (u1.first == 426) {
+      auto u2 = cli.readReply();
+      EXPECT_EQ(u2.first, 226);
+    }
+    ::close(dUl);
+    EXPECT_EQ(cli.cmd("DELE /abort_ul.bin").first, 250);
     EXPECT_EQ(cli.cmd("PWD").first, 257);
   }
 

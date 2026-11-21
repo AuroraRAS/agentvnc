@@ -89,6 +89,75 @@ static uint16_t readBE16FromBuf(const uint8_t* p)
   return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
 }
 
+struct rfb::Tight2InflateState {
+  z_stream zs;
+  bool initialized;
+  int windowBits;
+
+  Tight2InflateState() : initialized(false), windowBits(15)
+  {
+    memset(&zs, 0, sizeof(zs));
+  }
+
+  ~Tight2InflateState()
+  {
+    if (initialized)
+      inflateEnd(&zs);
+  }
+};
+
+static bool runTight2InflateBlock(z_stream* zs,
+                                  const uint8_t* in, size_t inLen,
+                                  uint8_t* outBuf, size_t outLen,
+                                  bool* hitStreamEnd)
+{
+  *hitStreamEnd = false;
+  uint8_t dummy = 0;
+  zs->next_in = (inLen > 0 && in != nullptr)
+    ? const_cast<Bytef*>(in) : &dummy;
+  zs->avail_in = static_cast<uInt>(inLen);
+  zs->next_out = (outLen > 0 && outBuf != nullptr) ? outBuf : &dummy;
+  zs->avail_out = static_cast<uInt>(outLen);
+
+  int rc = Z_OK;
+  int guard = 0;
+  while (zs->avail_out > 0 && (rc == Z_OK || rc == Z_BUF_ERROR) &&
+         guard++ < 64) {
+    uInt prevIn = zs->avail_in;
+    uInt prevOut = zs->avail_out;
+    rc = inflate(zs, Z_SYNC_FLUSH);
+    if (rc == Z_STREAM_END)
+      break;
+    if (rc == Z_BUF_ERROR && zs->avail_in == prevIn && zs->avail_out == prevOut)
+      break;
+  }
+
+  if (zs->avail_out != 0)
+    return false;
+
+  // Drain any trailing Z_SYNC_FLUSH marker (00 00 ff ff) or Z_FINISH trailer
+  guard = 0;
+  while (rc != Z_STREAM_END && zs->avail_in > 0 && guard++ < 64) {
+    uint8_t extra[16];
+    zs->next_out = extra;
+    zs->avail_out = sizeof(extra);
+    uInt prevIn = zs->avail_in;
+    rc = inflate(zs, Z_SYNC_FLUSH);
+    if (zs->avail_out != sizeof(extra))
+      return false;
+    if (rc == Z_STREAM_END)
+      break;
+    if (rc == Z_BUF_ERROR && zs->avail_in == prevIn)
+      break;
+    if (rc != Z_OK && rc != Z_BUF_ERROR)
+      return false;
+  }
+
+  *hitStreamEnd = (rc == Z_STREAM_END);
+  return zs->avail_in == 0 &&
+         (rc == Z_OK || rc == Z_BUF_ERROR || rc == Z_STREAM_END);
+}
+
 static std::vector<uint8_t> inflateTightBlock(const uint8_t* compressed,
                                               size_t compressedSize,
                                               size_t uncompressedSize)
@@ -130,12 +199,57 @@ static std::vector<uint8_t> inflateTightBlock(const uint8_t* compressed,
 
 CMsgReader::CMsgReader(CMsgHandler* handler_, rdr::InStream* is_)
   : handler(handler_), is(is_),
-    state(MSGSTATE_IDLE), cursorEncoding(-1)
+    state(MSGSTATE_IDLE), cursorEncoding(-1), tight2Inflate(nullptr)
 {
 }
 
 CMsgReader::~CMsgReader()
 {
+  delete tight2Inflate;
+}
+
+std::vector<uint8_t> CMsgReader::inflateTight2Block(const uint8_t* compressed,
+                                                      size_t compressedSize,
+                                                      size_t uncompressedSize)
+{
+  if (compressedSize == 0 && uncompressedSize == 0)
+    return std::vector<uint8_t>();
+
+  if (tight2Inflate == nullptr)
+    tight2Inflate = new Tight2InflateState();
+
+  std::vector<uint8_t> out(uncompressedSize);
+  uint8_t* outPtr = out.empty() ? nullptr : out.data();
+
+  if (!tight2Inflate->initialized) {
+    const int windowModes[2] = { 15, -15 };
+    for (int i = 0; i < 2; i++) {
+      memset(&tight2Inflate->zs, 0, sizeof(tight2Inflate->zs));
+      if (inflateInit2(&tight2Inflate->zs, windowModes[i]) != Z_OK)
+        continue;
+      bool hitStreamEnd = false;
+      if (runTight2InflateBlock(&tight2Inflate->zs, compressed, compressedSize,
+                                outPtr, uncompressedSize, &hitStreamEnd)) {
+        tight2Inflate->initialized = true;
+        tight2Inflate->windowBits = windowModes[i];
+        if (hitStreamEnd)
+          inflateReset(&tight2Inflate->zs);
+        return out;
+      }
+      inflateEnd(&tight2Inflate->zs);
+    }
+    throw protocol_error(_("Failed to decompress file transfer data"));
+  }
+
+  bool hitStreamEnd = false;
+  if (runTight2InflateBlock(&tight2Inflate->zs, compressed, compressedSize,
+                            outPtr, uncompressedSize, &hitStreamEnd)) {
+    if (hitStreamEnd)
+      inflateReset(&tight2Inflate->zs);
+    return out;
+  }
+
+  throw protocol_error(_("Failed to decompress file transfer data"));
 }
 
 bool CMsgReader::readServerInit()
@@ -1309,8 +1423,8 @@ bool CMsgReader::readTight2Message()
     is->clearRestorePoint();
 
     std::vector<uint8_t> block;
-    if (level != 0 && csize != usize)
-      block = inflateTightBlock(raw.data(), raw.size(), usize);
+    if (level != 0 && (csize > 0 || usize > 0))
+      block = inflateTight2Block(raw.data(), raw.size(), usize);
     else
       block.swap(raw);
 
