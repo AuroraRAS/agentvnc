@@ -1,12 +1,15 @@
 #!/usr/bin/env python3
 """Gemini Computer Use desktop agent over TigerVNC's -AgentSocket IPC bridge.
 
-Follows the Gemini API Computer Use guidelines:
+Implements official Gemini Computer Use & Interactions API best practices:
   https://aistudio.google.com/docs/computer-use
+  https://aistudio.google.com/docs/interactions-overview
+  https://aistudio.google.com/docs/tools
 """
 
 import argparse
 import base64
+import copy
 import io
 import json
 import os
@@ -35,6 +38,139 @@ INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interaction
 DEFAULT_MODEL = "gemini-4-hydrogen"
 DEFAULT_VNCVIEWER = os.path.join(REPO_ROOT, "build", "vncviewer", "vncviewer")
 
+THINKING_LEVELS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "default")
+RECOVERY_THINKING_LEVELS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "off")
+
+PREDEFINED_DESKTOP_FUNCTIONS: Tuple[str, ...] = (
+    "click",
+    "double_click",
+    "triple_click",
+    "middle_click",
+    "right_click",
+    "mouse_down",
+    "mouse_up",
+    "move",
+    "drag_and_drop",
+    "scroll",
+    "type",
+    "press_key",
+    "key_down",
+    "key_up",
+    "hotkey",
+    "wait",
+    "take_screenshot",
+)
+
+CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "clipboard_get",
+        "description": (
+            "Read the current remote VNC clipboard text via ClientCutText without clicking or taking a screenshot. "
+            "Returns text-only JSON."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string", "description": "Short reason for reading the clipboard."},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "clipboard_set",
+        "description": (
+            "Write UTF-8 text to the remote VNC clipboard via ClientCutText without typing character by character. "
+            "Optionally sends Ctrl+V afterward if paste=true. Returns text-only JSON."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "text": {"type": "string", "description": "UTF-8 text to copy into the remote clipboard."},
+                "paste": {"type": "boolean", "description": "If true, also press Ctrl+V after setting clipboard."},
+                "intent": {"type": "string", "description": "Short reason for setting clipboard contents."},
+            },
+            "required": ["text"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "paste_text_at",
+        "description": (
+            "Deterministic multi-step text macro: click at normalized (x, y), optionally clear existing field (Ctrl+A + BackSpace), "
+            "copy UTF-8 text (including non-ASCII/multiline) into VNC clipboard, paste with Ctrl+V, and optionally press Enter. "
+            "Preferred over click+type for reliable text entry. Returns text-only JSON on success."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "Normalized X coordinate (0-1000)."},
+                "y": {"type": "integer", "description": "Normalized Y coordinate (0-1000)."},
+                "text": {"type": "string", "description": "UTF-8 text to paste into the target input."},
+                "clear_existing": {"type": "boolean", "description": "If true, select all (Ctrl+A) and delete before pasting."},
+                "press_enter": {"type": "boolean", "description": "If true, press Enter after pasting."},
+                "intent": {"type": "string", "description": "Short description of why you are pasting here."},
+            },
+            "required": ["x", "y", "text"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "click_and_type",
+        "description": (
+            "Deterministic macro: click at normalized (x, y), optionally clear existing text (Ctrl+A + BackSpace), "
+            "type plain ASCII text directly via VNC KeyEvents, and optionally press Enter. Returns text-only JSON on success."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "x": {"type": "integer", "description": "Normalized X coordinate (0-1000)."},
+                "y": {"type": "integer", "description": "Normalized Y coordinate (0-1000)."},
+                "text": {"type": "string", "description": "ASCII text to type into the focused widget."},
+                "clear_existing": {"type": "boolean", "description": "If true, select all (Ctrl+A) and delete before typing."},
+                "press_enter": {"type": "boolean", "description": "If true, press Enter after typing."},
+                "intent": {"type": "string", "description": "Short description of why you are typing here."},
+            },
+            "required": ["x", "y", "text"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "get_desktop_status",
+        "description": (
+            "Check lightweight VNC desktop metadata (resolution, desktop name, frame_seq, damage_count, resize_count, "
+            "updating, has_clipboard) without capturing or transferring a screenshot image. Returns text-only JSON."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "intent": {"type": "string", "description": "Short reason for checking desktop status."},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "yield_to_user",
+        "description": (
+            "Pause automation and hand control over to the human collaborator in vncviewer for login, CAPTCHA, "
+            "MFA, or manual intervention, resuming with an updated screenshot when the operator resumes."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "reason": {"type": "string", "description": "Clear explanation of what the human operator needs to do."},
+                "intent": {"type": "string", "description": "Short summary for the collaborative overlay banner."},
+            },
+            "required": ["reason"],
+        },
+    },
+]
+
+CUSTOM_FUNCTION_NAMES = frozenset(d["name"] for d in CUSTOM_FUNCTION_DECLARATIONS)
+READ_ONLY_FUNCTIONS = frozenset(
+    {"take_screenshot", "clipboard_get", "get_desktop_status", "wait", "yield_to_user"}
+)
+
 SYSTEM_INSTRUCTION = """## RULE 1: Seek User Confirmation (USER_CONFIRMATION)
 
 This is your first and most important check. If the next required action falls
@@ -58,7 +194,7 @@ user's explicit permission.
 * **Sending Communications:** Sending emails, messages, or social media posts.
 * **Accessing or Modifying Sensitive Information:** Health, financial, or government records.
 * **Security and Identity:** Logging into user accounts or impersonation.
-* **Insurmountable Obstacles:** If you are technically unable to interact with a UI element or stuck in a loop you cannot resolve, ask the user to take over.
+* **Insurmountable Obstacles:** If you are technically unable to interact with a UI element or stuck in a loop you cannot resolve, use `yield_to_user` (in collaborative mode) or ask the user to take over.
 
 ---
 
@@ -71,9 +207,11 @@ your default behavior is to **Actuate**.
 the user's request forward. Continue to actuate until you either complete the
 non-consequential task or encounter a condition defined in Rule 1.
 
-## VNC Desktop Execution Notes:
-* The remote desktop is controlled over VNC. When typing text or filenames, use plain ASCII characters only.
-* When creating or saving a file on the Desktop, make sure the file is saved and verify on the screenshot that it exists on the Desktop before finishing.
+## VNC Desktop Execution & Optimization Guidelines:
+* **Prefer Custom Deterministic Macros:** When available, prefer `paste_text_at`, `click_and_type`, `clipboard_get`, `clipboard_set`, and `get_desktop_status` over multi-step click+type sequences; they execute deterministically and return compact text-only status results without extra round-trips.
+* **Parallel Batching & Intent:** Always provide a clear `intent` argument on actions. Only batch independent actions in a single turn when their order is deterministic and does not depend on intermediate visual layout changes.
+* **ASCII vs UTF-8:** Direct key-typing (`type`, `click_and_type`) supports plain ASCII characters only; use `paste_text_at` or `clipboard_set` for arbitrary UTF-8 or multi-line text.
+* **Verification:** When creating or saving a file on the Desktop, make sure the file is saved and verify on the screenshot that it exists on the Desktop before finishing.
 
 # Final Response Guidelines:
 Write final response to the user in the following cases:
@@ -323,19 +461,49 @@ class VncDesktopExecutor:
             bool(resp.get("agent_paused", False)),
         )
 
+    def pause_agent(self) -> None:
+        resp, _ = self.client.request("PAUSE_AGENT")
+        if not resp.get("ok"):
+            raise RuntimeError(f"PAUSE_AGENT failed: {resp}")
+
     def resume_agent(self) -> None:
         resp, _ = self.client.request("RESUME_AGENT")
         if not resp.get("ok"):
             raise RuntimeError(f"RESUME_AGENT failed: {resp}")
 
-    def wait_until_resumed(self) -> Tuple[int, List[str]]:
+    def clipboard_get(self) -> Dict[str, Any]:
+        resp, _ = self.client.request("CLIPBOARD_GET")
+        if not resp.get("ok"):
+            raise RuntimeError(f"CLIPBOARD_GET failed: {resp}")
+        return {
+            "status": "ok",
+            "available": bool(resp.get("available")),
+            "text": str(resp.get("text", "")),
+        }
+
+    def clipboard_set(self, text: str) -> Dict[str, Any]:
+        resp, _ = self.client.request("CLIPBOARD_SET", text=text)
+        if not resp.get("ok"):
+            if resp.get("error") == "agent_paused":
+                raise AgentPausedError(resp.get("message", "Agent input paused by operator"))
+            raise RuntimeError(f"CLIPBOARD_SET failed: {resp}")
+        return {
+            "status": "ok",
+            "bytes": int(resp.get("bytes", len(text.encode("utf-8")))),
+        }
+
+    def wait_until_resumed(self, intent: Optional[str] = None) -> Tuple[int, List[str]]:
         st = self.get_status()
         start_human = int(st.get("human_action_count", 0))
+        overlay_intent = summarize_for_overlay(
+            intent or "",
+            fallback="Human collaborator in control - resume when ready",
+        )
         print("  [COLLAB] Agent paused for human takeover; waiting for resume (Ctrl+Alt+P)...")
         self.set_overlay(
             state="waiting_human",
             action="paused",
-            intent="Human collaborator in control - resume when ready",
+            intent=overlay_intent,
         )
         end_human = start_human
         connected_ok = True
@@ -533,7 +701,75 @@ class VncDesktopExecutor:
         png_bytes = encode_rgb24_png(self.width, self.height, pixels)
         return png_bytes, hdr
 
-    def execute(self, fname: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    def _hotkey_syms(self, keysyms: List[int]) -> None:
+        for ks in keysyms:
+            self._key(ks, True)
+            time.sleep(0.04)
+        time.sleep(0.06)
+        for ks in reversed(keysyms):
+            self._key(ks, False)
+            time.sleep(0.04)
+
+    def _type_text_impl(self, text: str, press_enter: bool) -> None:
+        shift_held = False
+        try:
+            for ch in text:
+                needs_shift = ch in SHIFTED_ASCII
+                if needs_shift and not shift_held:
+                    self._key(0xFFE1, True)
+                    time.sleep(0.03)
+                    shift_held = True
+                elif not needs_shift and shift_held:
+                    self._key(0xFFE1, False)
+                    time.sleep(0.03)
+                    shift_held = False
+                self._type_char(ch)
+                time.sleep(0.035)
+        finally:
+            if shift_held:
+                self._key(0xFFE1, False)
+                time.sleep(0.03)
+        if press_enter:
+            self._key(0xFF0D, True)
+            time.sleep(0.04)
+            self._key(0xFF0D, False)
+
+    def verify_action_effect(self, pre_status: Dict[str, Any], settle_wait: float = 0.05) -> Dict[str, Any]:
+        if settle_wait > 0:
+            time.sleep(settle_wait)
+        post = self.get_status()
+        new_w = int(post.get("width", self.width) or self.width)
+        new_h = int(post.get("height", self.height) or self.height)
+        prev_w = int(pre_status.get("width", self.width) or self.width)
+        prev_h = int(pre_status.get("height", self.height) or self.height)
+        prev_dmg = int(pre_status.get("damage_count", 0))
+        post_dmg = int(post.get("damage_count", 0))
+        prev_seq = int(pre_status.get("frame_seq", 0))
+        post_seq = int(post.get("frame_seq", 0))
+        prev_resize = int(pre_status.get("resize_count", 0))
+        post_resize = int(post.get("resize_count", 0))
+        resized = (post_resize > prev_resize) or (new_w != prev_w) or (new_h != prev_h)
+        if new_w > 0 and new_h > 0:
+            self.width = new_w
+            self.height = new_h
+        damage_delta = max(0, post_dmg - prev_dmg)
+        seq_delta = max(0, post_seq - prev_seq)
+        return {
+            "frame_changed": (damage_delta > 0) or (seq_delta > 0) or resized,
+            "damage_delta": damage_delta,
+            "frame_seq_delta": seq_delta,
+            "frame_seq": post_seq,
+            "resized": resized,
+            "width": new_w,
+            "height": new_h,
+        }
+
+    def execute(
+        self,
+        fname: str,
+        args: Dict[str, Any],
+        collaborate_mode: bool = False,
+    ) -> Dict[str, Any]:
         if fname in ("click", "double_click", "triple_click", "middle_click", "right_click", "mouse_down", "mouse_up", "move"):
             px = denormalize_x(args["x"], self.width)
             py = denormalize_y(args["y"], self.height)
@@ -604,28 +840,7 @@ class VncDesktopExecutor:
                 time.sleep(0.15)
             text = str(args.get("text", ""))
             press_enter = bool(args.get("press_enter", False))
-            shift_held = False
-            try:
-                for ch in text:
-                    needs_shift = ch in SHIFTED_ASCII
-                    if needs_shift and not shift_held:
-                        self._key(0xFFE1, True)
-                        time.sleep(0.03)
-                        shift_held = True
-                    elif not needs_shift and shift_held:
-                        self._key(0xFFE1, False)
-                        time.sleep(0.03)
-                        shift_held = False
-                    self._type_char(ch)
-                    time.sleep(0.035)
-            finally:
-                if shift_held:
-                    self._key(0xFFE1, False)
-                    time.sleep(0.03)
-            if press_enter:
-                self._key(0xFF0D, True)
-                time.sleep(0.04)
-                self._key(0xFF0D, False)
+            self._type_text_impl(text, press_enter)
             return {"status": "ok", "chars_typed": len(text), "press_enter": press_enter}
 
         if fname == "press_key":
@@ -672,13 +887,7 @@ class VncDesktopExecutor:
                     ks = ord(k.lower())
                 keysyms.append(ks)
 
-            for ks in keysyms:
-                self._key(ks, True)
-                time.sleep(0.04)
-            time.sleep(0.06)
-            for ks in reversed(keysyms):
-                self._key(ks, False)
-                time.sleep(0.04)
+            self._hotkey_syms(keysyms)
             return {"status": "ok", "keysyms": keysyms}
 
         if fname == "wait":
@@ -689,19 +898,197 @@ class VncDesktopExecutor:
         if fname == "take_screenshot":
             return {"status": "ok"}
 
+        if fname == "clipboard_get":
+            return self.clipboard_get()
+
+        if fname == "clipboard_set":
+            text = str(args.get("text", ""))
+            paste = bool(args.get("paste", False))
+            clip_res = self.clipboard_set(text)
+            if paste:
+                time.sleep(0.05)
+                self._hotkey_syms([0xFFE3, ord("v")])
+            clip_res["pasted"] = paste
+            return clip_res
+
+        if fname == "paste_text_at":
+            px = denormalize_x(args["x"], self.width)
+            py = denormalize_y(args["y"], self.height)
+            text = str(args.get("text", ""))
+            clear_existing = bool(args.get("clear_existing", False))
+            press_enter = bool(args.get("press_enter", False))
+            self._click_px(px, py, btn_bit=1, count=1)
+            time.sleep(0.10)
+            if clear_existing:
+                self._hotkey_syms([0xFFE3, ord("a")])
+                time.sleep(0.05)
+                self._hotkey_syms([0xFF08])
+                time.sleep(0.05)
+            clip_res = self.clipboard_set(text)
+            time.sleep(0.05)
+            self._hotkey_syms([0xFFE3, ord("v")])
+            if press_enter:
+                time.sleep(0.05)
+                self._hotkey_syms([0xFF0D])
+            return {
+                "status": "ok",
+                "pixel_x": px,
+                "pixel_y": py,
+                "chars_pasted": len(text),
+                "bytes": clip_res["bytes"],
+                "clear_existing": clear_existing,
+                "press_enter": press_enter,
+            }
+
+        if fname == "click_and_type":
+            px = denormalize_x(args["x"], self.width)
+            py = denormalize_y(args["y"], self.height)
+            text = str(args.get("text", ""))
+            clear_existing = bool(args.get("clear_existing", False))
+            press_enter = bool(args.get("press_enter", False))
+            self._click_px(px, py, btn_bit=1, count=1)
+            time.sleep(0.10)
+            if clear_existing:
+                self._hotkey_syms([0xFFE3, ord("a")])
+                time.sleep(0.05)
+                self._hotkey_syms([0xFF08])
+                time.sleep(0.05)
+            self._type_text_impl(text, press_enter)
+            return {
+                "status": "ok",
+                "pixel_x": px,
+                "pixel_y": py,
+                "chars_typed": len(text),
+                "clear_existing": clear_existing,
+                "press_enter": press_enter,
+            }
+
+        if fname == "get_desktop_status":
+            st = self.get_status()
+            w = int(st.get("width", self.width) or self.width)
+            h = int(st.get("height", self.height) or self.height)
+            if w > 0 and h > 0:
+                self.width = w
+                self.height = h
+            return {
+                "status": "ok",
+                "width": w,
+                "height": h,
+                "desktop_name": str(st.get("desktop_name", "")),
+                "frame_seq": int(st.get("frame_seq", 0)),
+                "damage_count": int(st.get("damage_count", 0)),
+                "resize_count": int(st.get("resize_count", 0)),
+                "updating": bool(st.get("updating", False)),
+                "has_clipboard": bool(st.get("has_clipboard", False)),
+            }
+
+        if fname == "yield_to_user":
+            reason = str(args.get("reason", "Agent requested human assistance")).strip()
+            if not reason:
+                reason = "Agent requested human assistance"
+            if collaborate_mode:
+                self.pause_agent()
+                human_delta, notes = self.wait_until_resumed(intent=reason)
+                return {
+                    "status": "resumed_by_user",
+                    "reason": reason,
+                    "human_actions": human_delta,
+                    "user_notes": notes,
+                    "_attach_screenshot": True,
+                }
+            return {
+                "status": "yield_requested",
+                "reason": reason,
+                "note": "Run with --collaborate for interactive human takeover.",
+            }
+
         return {"error": f"Unsupported desktop action: {fname}"}
+
+
+class InteractionsApiError(RuntimeError):
+    """Structured error from the Gemini Interactions REST API."""
+
+    def __init__(self, status_code: Optional[int], raw_body: str) -> None:
+        self.status_code = status_code
+        self.raw_body = raw_body or ""
+        self.error_message = self.raw_body.strip()
+        self.error_code = ""
+
+        try:
+            parsed = json.loads(self.raw_body)
+        except (json.JSONDecodeError, TypeError):
+            parsed = None
+
+        if isinstance(parsed, dict):
+            err_obj = parsed.get("error") if isinstance(parsed.get("error"), dict) else parsed
+            msg = err_obj.get("message")
+            code = err_obj.get("code") or err_obj.get("status")
+            if isinstance(msg, str) and msg.strip():
+                self.error_message = msg.strip()
+            if isinstance(code, (str, int)):
+                self.error_code = str(code).strip()
+
+        if status_code is not None:
+            summary = f"Interactions API HTTP {status_code}: {self.error_message or self.error_code or 'Unknown error'}"
+        else:
+            summary = f"Interactions API error: {self.error_message or 'Unknown error'}"
+        super().__init__(summary)
+
+    @property
+    def is_safety_blocked(self) -> bool:
+        hay = f"{self.error_message} {self.error_code}".lower()
+        if any(tok in hay for tok in ("safety", "harmful", "policy violation", "prohibited_content", "content_filter")):
+            return True
+        if "blocked" in hay and any(tok in hay for tok in ("safety", "harmful", "policy", "content")):
+            return True
+        return False
+
+    @property
+    def is_auth_error(self) -> bool:
+        return self.status_code in (401, 403)
+
+    @property
+    def is_previous_interaction_error(self) -> bool:
+        if self.is_safety_blocked or self.is_auth_error:
+            return False
+        if self.status_code in (429, 500, 502, 503, 504) or self.status_code is None:
+            return False
+        if self.status_code == 404:
+            return True
+        if self.status_code == 400:
+            msg = self.error_message.lower()
+            if "previous_interaction" in msg:
+                return True
+            if "interaction" in msg and any(
+                tok in msg for tok in ("not found", "expired", "invalid", "unknown", "requires_action", "pending")
+            ):
+                return True
+        return False
 
 
 class InteractionsClient:
     """Thin REST client for Gemini v1beta Interactions API with computer_use."""
 
-    def __init__(self, api_key: str, model: str, tools: List[Dict[str, Any]], system_instruction: str) -> None:
+    def __init__(
+        self,
+        api_key: str,
+        model: str,
+        tools: List[Dict[str, Any]],
+        system_instruction: str,
+        generation_config: Optional[Dict[str, Any]] = None,
+    ) -> None:
         self.api_key = api_key
         self.model = model
         self.tools = tools
         self.system_instruction = system_instruction
+        self.default_generation_config: Dict[str, Any] = dict(generation_config or {})
 
-    def create(self, input_payload: Any, previous_interaction_id: Optional[str] = None) -> Dict[str, Any]:
+    def create(
+        self,
+        input_payload: Any,
+        previous_interaction_id: Optional[str] = None,
+        thinking_level: Optional[str] = None,
+    ) -> Dict[str, Any]:
         body: Dict[str, Any] = {
             "model": self.model,
             "input": input_payload,
@@ -710,6 +1097,12 @@ class InteractionsClient:
         }
         if previous_interaction_id:
             body["previous_interaction_id"] = previous_interaction_id
+
+        gen_cfg = dict(self.default_generation_config)
+        if thinking_level is not None and thinking_level != "default":
+            gen_cfg["thinking_level"] = thinking_level
+        if gen_cfg:
+            body["generation_config"] = gen_cfg
 
         encoded = json.dumps(body).encode("utf-8")
         last_err: Optional[Exception] = None
@@ -725,26 +1118,92 @@ class InteractionsClient:
             )
             try:
                 with urllib.request.urlopen(req, timeout=60) as resp:
-                    return json.loads(resp.read().decode("utf-8"))
+                    raw_resp = resp.read().decode("utf-8")
+                try:
+                    return json.loads(raw_resp)
+                except json.JSONDecodeError as e:
+                    raise InteractionsApiError(None, f"Invalid JSON response from Interactions API: {e}") from None
             except urllib.error.HTTPError as e:
                 err_text = e.read().decode("utf-8", errors="replace")
+                api_err = InteractionsApiError(e.code, err_text)
                 if e.code in (429, 500, 502, 503, 504) and attempt < 2:
-                    last_err = RuntimeError(f"Interactions API HTTP {e.code}: {err_text}")
+                    last_err = api_err
                     time.sleep(1.5 * (2**attempt))
                     continue
-                raise RuntimeError(f"Interactions API HTTP {e.code}: {err_text}") from None
-            except urllib.error.URLError as e:
+                raise api_err from None
+            except (urllib.error.URLError, TimeoutError, OSError) as e:
                 if attempt < 2:
                     last_err = e
                     time.sleep(1.5 * (2**attempt))
                     continue
-                raise
-        raise RuntimeError(f"Interactions API failed after retries: {last_err}")
+                raise InteractionsApiError(None, f"Network error: {e}") from None
+        if isinstance(last_err, InteractionsApiError):
+            raise last_err
+        raise InteractionsApiError(None, f"Interactions API failed after retries: {last_err}")
+
+
+def parse_excluded_actions(raw_values: Optional[List[str]]) -> List[str]:
+    excluded: List[str] = []
+    seen = set()
+    for item in raw_values or []:
+        for part in str(item).split(","):
+            name = part.strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            if name not in PREDEFINED_DESKTOP_FUNCTIONS:
+                print(
+                    f"  [WARN] Excluded action {name!r} is not in PREDEFINED_DESKTOP_FUNCTIONS; "
+                    "forwarding as configured."
+                )
+            excluded.append(name)
+    return excluded
+
+
+def build_tools_config(
+    strict_safety: bool,
+    excluded_actions: List[str],
+    enable_custom_tools: bool,
+) -> List[Dict[str, Any]]:
+    cu_cfg: Dict[str, Any] = {
+        "type": "computer_use",
+        "environment": "desktop",
+        "enable_prompt_injection_detection": True,
+    }
+    if excluded_actions:
+        cu_cfg["excluded_predefined_functions"] = list(excluded_actions)
+    if not strict_safety:
+        cu_cfg["disabled_safety_policies"] = ["data_modification"]
+
+    tools: List[Dict[str, Any]] = [cu_cfg]
+    if enable_custom_tools:
+        tools.extend(copy.deepcopy(CUSTOM_FUNCTION_DECLARATIONS))
+    return tools
+
+
+def is_sandboxed_local_target(vnc_host: str, socket_path: Optional[str] = None) -> bool:
+    if socket_path:
+        return True
+    raw = (vnc_host or "").strip().lower()
+    if not raw:
+        return False
+    if raw.startswith("["):
+        host = raw[1:].split("]", 1)[0]
+    elif raw == "::1":
+        host = "::1"
+    elif raw.startswith(":"):
+        host = "localhost"
+    else:
+        host = raw.split(":", 1)[0]
+    return host in ("localhost", "127.0.0.1", "::1")
 
 
 def handle_safety_decision(
     safety_decision: Dict[str, Any],
     auto_confirm: bool,
+    executor: Optional[VncDesktopExecutor] = None,
+    collaborate_mode: bool = False,
+    poll_interval: float = 0.25,
 ) -> Tuple[str, bool]:
     """Process model safety_decision per Gemini Computer Use guidelines.
 
@@ -760,7 +1219,56 @@ def handle_safety_decision(
         if auto_confirm:
             print("  -> Auto-confirmed (--auto-confirm enabled).")
             return "ALLOW", True
-        if sys.stdin.isatty():
+
+        stdin_enabled = bool(sys.stdin is not None and sys.stdin.isatty())
+        if collaborate_mode and executor is not None:
+            print("  -> Confirm via vncviewer note ('/allow' or '/deny') or terminal below:")
+            if stdin_enabled:
+                print("  Allow this action? [y/N]: ", end="", flush=True)
+            try:
+                while True:
+                    try:
+                        st = executor.get_status()
+                    except (EOFError, ConnectionError, BrokenPipeError, OSError):
+                        print("\n  -> Viewer disconnected during confirmation; halting execution.")
+                        return "TERMINATE", False
+                    if not st.get("connected"):
+                        print("\n  -> VNC connection closed during confirmation; halting execution.")
+                        return "TERMINATE", False
+                    if int(st.get("pending_user_messages", 0)) > 0:
+                        notes, _, _ = executor.poll_user_messages()
+                        for raw_note in notes:
+                            cleaned = str(raw_note).strip().lower()
+                            if cleaned in ("/allow", "allow", "/yes", "yes", "y"):
+                                print("\n  -> Confirmed via vncviewer note.")
+                                return "ALLOW", True
+                            if cleaned in ("/deny", "deny", "/no", "no", "n", "/exit", "/quit"):
+                                print("\n  -> Denied via vncviewer note; halting execution.")
+                                return "TERMINATE", False
+                            if cleaned:
+                                print(
+                                    f"\n  [COLLAB] Received note {raw_note!r} while awaiting confirmation; "
+                                    "send '/allow' or '/deny'."
+                                )
+                    if stdin_enabled:
+                        readable, _, _ = select.select([sys.stdin], [], [], poll_interval)
+                        if readable:
+                            line = sys.stdin.readline()
+                            if line == "":
+                                print("\n  -> Stdin EOF; halting execution.")
+                                return "TERMINATE", False
+                            ans = line.strip().lower()
+                            if ans in ("y", "yes", "/yes", "/allow", "allow"):
+                                return "ALLOW", True
+                            print("  -> Denied; halting execution.")
+                            return "TERMINATE", False
+                    else:
+                        time.sleep(poll_interval)
+            except KeyboardInterrupt:
+                print("\n  -> Interrupted during confirmation; halting execution.")
+                return "TERMINATE", False
+
+        if stdin_enabled:
             ans = input("  Allow this action? [y/N]: ").strip().lower()
             if ans in ("y", "yes"):
                 return "ALLOW", True
@@ -851,37 +1359,108 @@ def run_agent(args: argparse.Namespace) -> int:
             if not os.path.exists(socket_path):
                 raise TimeoutError(f"Timed out waiting for AgentSocket at {socket_path}")
 
-        tool_cfg: Dict[str, Any] = {
-            "type": "computer_use",
-            "environment": "desktop",
-            "enable_prompt_injection_detection": True,
-        }
-        if not args.strict_safety:
-            tool_cfg["disabled_safety_policies"] = ["data_modification"]
+        raw_base_thinking = str(getattr(args, "thinking_level", "low") or "low")
+        base_thinking_level: Optional[str] = None if raw_base_thinking == "default" else raw_base_thinking
+        raw_rec_thinking = str(getattr(args, "recovery_thinking_level", "high") or "high")
+        recovery_thinking_level: Optional[str] = None if raw_rec_thinking == "off" else raw_rec_thinking
+        excluded_actions = parse_excluded_actions(getattr(args, "exclude_actions", None))
+        enable_custom_tools = not bool(getattr(args, "no_custom_tools", False))
+
+        tools = build_tools_config(
+            strict_safety=bool(args.strict_safety),
+            excluded_actions=excluded_actions,
+            enable_custom_tools=enable_custom_tools,
+        )
 
         llm = InteractionsClient(
             api_key=api_key,
             model=args.model,
-            tools=[tool_cfg],
+            tools=tools,
             system_instruction=SYSTEM_INSTRUCTION,
+            generation_config=({"thinking_level": base_thinking_level} if base_thinking_level else None),
         )
 
         with AgentClient(socket_path, timeout=15.0) as vnc_client:
             executor = VncDesktopExecutor(vnc_client)
             status = executor.wait_ready(timeout=15.0)
+            sandboxed = is_sandboxed_local_target(args.vnc_host, args.socket)
+            endpoint_desc = f"socket={args.socket}" if args.socket else f"host={args.vnc_host}"
             print(
                 f"Connected to VNC desktop: {status['width']}x{status['height']} "
                 f"({status.get('desktop_name', '')})"
             )
+            print(
+                f"Session config: model={args.model} | thinking={raw_base_thinking} "
+                f"(recovery={raw_rec_thinking}) | custom_tools={'on' if enable_custom_tools else 'off'} "
+                f"| excluded={excluded_actions or 'none'} | prompt_injection_detection=on "
+                f"| strict_safety={'on' if args.strict_safety else 'off'} | target={endpoint_desc} "
+                f"({'local/sandboxed' if sandboxed else 'NON-LOOPBACK'})"
+            )
+            if not sandboxed:
+                print(
+                    "  [WARN] Target VNC host is non-loopback; Gemini Computer Use recommends running inside an "
+                    "isolated VM/container sandbox to reduce UI drift and limit host blast radius."
+                )
 
             collaborate_mode = bool(args.collaborate or status.get("collaborate"))
             stay_interactive = collaborate_mode and not bool(getattr(args, "one_shot", False))
+
+            def select_thinking_level(reason: Optional[str]) -> Optional[str]:
+                if reason and recovery_thinking_level is not None and recovery_thinking_level != base_thinking_level:
+                    print(
+                        f"  [THINKING] Escalating thinking_level {raw_base_thinking} -> "
+                        f"{recovery_thinking_level} (reason={reason})"
+                    )
+                    return recovery_thinking_level
+                return base_thinking_level
+
+            def format_collab_prompt(next_text: str, human_delta: int) -> str:
+                if human_delta > 0:
+                    return (
+                        f"[Human collaborator performed {human_delta} desktop action(s) before this instruction; "
+                        f"inspect the updated screenshot.]\n{next_text}"
+                    )
+                return next_text
+
+            def handle_api_error(err: InteractionsApiError, interaction_id: Optional[str]) -> str:
+                if err.is_safety_blocked:
+                    print(f"\n[SAFETY BLOCKED] Gemini API rejected this request: {err.error_message}")
+                    print("  Please modify/rephrase your instruction or perform the action manually in vncviewer.")
+                    wait_intent = summarize_for_overlay(
+                        f"Blocked: {err.error_message}",
+                        fallback="Request blocked by safety filter - modify input and retry",
+                    )
+                    status_label = "safety_blocked"
+                else:
+                    print(f"\n[API ERROR] {err}")
+                    wait_intent = summarize_for_overlay(
+                        f"API error: {err.error_message}",
+                        fallback="API error - retry or send new instruction",
+                    )
+                    status_label = "api_error"
+
+                if trace_file:
+                    entry: Dict[str, Any] = {
+                        "turn": global_turn,
+                        "task": task_index,
+                        "status": status_label,
+                        "http_status": err.status_code,
+                        "error_code": err.error_code,
+                        "error": err.error_message,
+                    }
+                    if interaction_id:
+                        entry["interaction_id"] = interaction_id
+                    trace_file.write(json.dumps(entry, ensure_ascii=False) + "\n")
+                    trace_file.flush()
+                return wait_intent
 
             def start_user_turn(
                 prompt_text: str,
                 png_bytes: bytes,
                 prev_id: Optional[str],
+                thinking_level: Optional[str],
             ) -> Dict[str, Any]:
+                nonlocal last_completed_interaction_id
                 payload = [
                     {"type": "text", "text": prompt_text},
                     {
@@ -892,10 +1471,32 @@ def run_agent(args: argparse.Namespace) -> int:
                 ]
                 if prev_id:
                     try:
-                        return llm.create(input_payload=payload, previous_interaction_id=prev_id)
+                        return llm.create(
+                            input_payload=payload,
+                            previous_interaction_id=prev_id,
+                            thinking_level=thinking_level,
+                        )
                     except RuntimeError as e:
+                        should_retry_fresh = False
+                        if isinstance(e, InteractionsApiError):
+                            should_retry_fresh = e.is_previous_interaction_error
+                        else:
+                            msg_lower = str(e).lower()
+                            if (
+                                "http 404" in msg_lower
+                                or "not found" in msg_lower
+                                or "previous_interaction" in msg_lower
+                            ) and "safety" not in msg_lower and "harmful" not in msg_lower:
+                                should_retry_fresh = True
+                        if not should_retry_fresh:
+                            raise
                         print(f"  [COLLAB] Starting fresh LLM session (previous interaction unavailable: {e})")
-                return llm.create(input_payload=payload, previous_interaction_id=None)
+                        last_completed_interaction_id = None
+                return llm.create(
+                    input_payload=payload,
+                    previous_interaction_id=None,
+                    thinking_level=thinking_level,
+                )
 
             global_turn = 0
             task_index = 0
@@ -912,17 +1513,13 @@ def run_agent(args: argparse.Namespace) -> int:
                         if nxt is None:
                             return 0
                         next_text, human_delta = nxt
-                        if human_delta > 0:
-                            current_prompt = (
-                                f"[Human collaborator performed {human_delta} desktop action(s) before this instruction; "
-                                f"inspect the updated screenshot.]\n{next_text}"
-                            )
-                        else:
-                            current_prompt = next_text
+                        current_prompt = format_collab_prompt(next_text, human_delta)
                     else:
                         raise ValueError("--prompt must not be empty in non-collaborative mode")
 
                 task_index += 1
+                consecutive_no_change_turns = 0
+                init_thinking_lv = select_thinking_level(None)
                 init_png, _ = executor.capture_png(settle_delay=0.2, max_wait=1.0)
                 if log_dir:
                     init_name = "turn_00_initial.png" if task_index == 1 else f"task_{task_index:02d}_initial.png"
@@ -931,18 +1528,41 @@ def run_agent(args: argparse.Namespace) -> int:
 
                 print(f"Goal: {current_prompt}")
                 executor.set_overlay("thinking", "thinking", "Analyzing screen and planning next action...")
-                interaction = start_user_turn(current_prompt, init_png, last_completed_interaction_id)
+                try:
+                    interaction = start_user_turn(
+                        current_prompt,
+                        init_png,
+                        last_completed_interaction_id,
+                        thinking_level=init_thinking_lv,
+                    )
+                except InteractionsApiError as e:
+                    current_prompt = None
+                    wait_intent = handle_api_error(e, None)
+                    if not stay_interactive or e.is_auth_error:
+                        executor.set_overlay("done", "error", wait_intent)
+                        return 2
+                    nxt = executor.wait_for_next_instruction(
+                        viewer_proc=viewer_proc,
+                        overlay_intent=wait_intent,
+                    )
+                    if nxt is None:
+                        return 0
+                    next_text, human_delta = nxt
+                    current_prompt = format_collab_prompt(next_text, human_delta)
+                    continue
                 current_prompt = None
 
                 task_completed = False
                 task_halted = False
                 wait_intent = "Awaiting next instruction"
+                turn_thinking_lv = init_thinking_lv
 
                 for task_turn in range(1, args.max_turns + 1):
                     global_turn += 1
                     print(
                         f"\n--- Turn {global_turn} "
-                        f"(task={task_index}.{task_turn}, interaction={interaction.get('id')}, status={interaction.get('status')}) ---"
+                        f"(task={task_index}.{task_turn}, interaction={interaction.get('id')}, "
+                        f"status={interaction.get('status')}, thinking={turn_thinking_lv or 'default'}) ---"
                     )
                     steps = interaction.get("steps", [])
                     function_calls = [s for s in steps if s.get("type") == "function_call"]
@@ -950,6 +1570,7 @@ def run_agent(args: argparse.Namespace) -> int:
                     if not function_calls:
                         final_text = extract_model_text(interaction)
                         last_completed_interaction_id = interaction.get("id")
+                        consecutive_no_change_turns = 0
                         print(f"Agent finished:\n{final_text}")
                         final_png, _ = executor.capture_png(settle_delay=0.2, max_wait=0.8)
                         if log_dir:
@@ -965,6 +1586,7 @@ def run_agent(args: argparse.Namespace) -> int:
                                         "turn": global_turn,
                                         "task": task_index,
                                         "status": interaction.get("status"),
+                                        "thinking_level": turn_thinking_lv,
                                         "final_text": final_text,
                                     },
                                     ensure_ascii=False,
@@ -982,11 +1604,21 @@ def run_agent(args: argparse.Namespace) -> int:
                         )
                         break
 
+                    if len(function_calls) > 1:
+                        print(f"  [BATCH] Executing {len(function_calls)} actions:")
+                        for b_idx, b_fc in enumerate(function_calls, 1):
+                            b_intent = str((b_fc.get("arguments") or {}).get("intent", "N/A"))
+                            print(f"    {b_idx}. {b_fc.get('name', '')}: {b_intent}")
+
                     halted_reason: Optional[str] = None
-                    results: List[Tuple[str, str, Dict[str, Any]]] = []
+                    results: List[Tuple[str, str, Dict[str, Any], bool]] = []
                     turn_log_actions: List[Dict[str, Any]] = []
                     collab_notes: List[str] = []
                     collaborator_intervened = False
+                    batch_had_error = False
+                    batch_had_resize = False
+                    any_modifying_action = False
+                    any_frame_changed = False
 
                     for idx, fc in enumerate(function_calls):
                         fname = str(fc.get("name", ""))
@@ -1009,25 +1641,41 @@ def run_agent(args: argparse.Namespace) -> int:
                                         "human_actions": human_delta,
                                         "note": "Human collaborator interacted with the desktop and resumed; inspect the updated screenshot before continuing.",
                                     }
-                                    results.append((rem_name, rem_id, cancel_res))
+                                    results.append((rem_name, rem_id, cancel_res, True))
                                     turn_log_actions.append({"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": cancel_res})
                                 break
 
                         action_result: Dict[str, Any] = {}
+                        safety_audit: Optional[Dict[str, Any]] = None
                         safety_decision = fc_args.get("safety_decision")
                         if isinstance(safety_decision, dict):
-                            if str(safety_decision.get("decision", "")).lower() == "require_confirmation":
+                            decision_str = str(safety_decision.get("decision", "")).lower()
+                            if decision_str == "require_confirmation":
                                 executor.set_overlay(
                                     "waiting_confirmation",
                                     fname,
                                     str(safety_decision.get("explanation", "Safety confirmation required")),
                                 )
-                            s_status, ack = handle_safety_decision(safety_decision, args.auto_confirm)
+                            s_status, ack = handle_safety_decision(
+                                safety_decision,
+                                args.auto_confirm,
+                                executor=executor,
+                                collaborate_mode=collaborate_mode,
+                            )
+                            safety_audit = {
+                                "decision": decision_str,
+                                "status": s_status,
+                                "acknowledged": ack,
+                                "explanation": str(safety_decision.get("explanation", "")),
+                            }
                             if s_status != "ALLOW":
                                 halted_reason = f"Safety decision {s_status}: {safety_decision.get('explanation', '')}"
                                 action_result = {"error": halted_reason}
-                                results.append((fname, call_id, action_result))
-                                turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
+                                batch_had_error = True
+                                results.append((fname, call_id, action_result, True))
+                                turn_log_actions.append(
+                                    {"name": fname, "args": fc_args, "result": action_result, "safety_decision": safety_audit}
+                                )
                                 break
                             if ack:
                                 action_result["safety_acknowledgement"] = True
@@ -1052,14 +1700,19 @@ def run_agent(args: argparse.Namespace) -> int:
                                 bmask = 4
                             elif fname == "middle_click":
                                 bmask = 2
-                            elif fname in ("click", "double_click", "triple_click", "mouse_down", "type"):
+                            elif fname in ("click", "double_click", "triple_click", "mouse_down", "type", "paste_text_at", "click_and_type"):
                                 bmask = 1
                             pulse = (fname != "move")
 
+                        hud_intent = (
+                            f"[{idx + 1}/{len(function_calls)}] {intent}"
+                            if len(function_calls) > 1
+                            else intent
+                        )
                         executor.set_overlay(
                             state="acting",
                             action=fname,
-                            intent=intent,
+                            intent=hud_intent,
                             x=px,
                             y=py,
                             end_x=ex,
@@ -1070,8 +1723,11 @@ def run_agent(args: argparse.Namespace) -> int:
                         if action_delay > 0:
                             time.sleep(action_delay)
 
+                        is_modifying = fname not in READ_ONLY_FUNCTIONS
+                        pre_status: Dict[str, Any] = executor.get_status() if is_modifying else {}
+
                         try:
-                            exec_res = executor.execute(fname, fc_args)
+                            exec_res = executor.execute(fname, fc_args, collaborate_mode=collaborate_mode)
                             action_result.update(exec_res)
                         except AgentPausedError as e:
                             if collaborate_mode:
@@ -1083,58 +1739,148 @@ def run_agent(args: argparse.Namespace) -> int:
                                     "human_actions": human_delta,
                                     "note": "Human collaborator paused and took control mid-action; inspect the updated screenshot.",
                                 }
-                                results.append((fname, call_id, action_result))
-                                turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
+                                results.append((fname, call_id, action_result, True))
+                                log_entry: Dict[str, Any] = {"name": fname, "args": fc_args, "result": action_result}
+                                if safety_audit is not None:
+                                    log_entry["safety_decision"] = safety_audit
+                                turn_log_actions.append(log_entry)
                                 for rem_fc in function_calls[idx + 1 :]:
                                     rem_name = str(rem_fc.get("name", ""))
                                     rem_id = str(rem_fc.get("id", ""))
                                     cancel_res = {"status": "paused_for_human_takeover"}
-                                    results.append((rem_name, rem_id, cancel_res))
+                                    results.append((rem_name, rem_id, cancel_res, True))
                                     turn_log_actions.append({"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": cancel_res})
                                 break
                             halted_reason = str(e)
                             action_result = {"error": halted_reason}
-                            results.append((fname, call_id, action_result))
-                            turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
+                            batch_had_error = True
+                            results.append((fname, call_id, action_result, True))
+                            log_entry = {"name": fname, "args": fc_args, "result": action_result}
+                            if safety_audit is not None:
+                                log_entry["safety_decision"] = safety_audit
+                            turn_log_actions.append(log_entry)
                             break
                         except Exception as e:
                             print(f"  [WARN] Error executing {fname}: {e}")
                             action_result["error"] = str(e)
 
-                        results.append((fname, call_id, action_result))
-                        turn_log_actions.append({"name": fname, "args": fc_args, "result": action_result})
+                        explicit_attach = bool(action_result.pop("_attach_screenshot", False))
+                        if "error" in action_result:
+                            batch_had_error = True
+                            item_needs_screenshot = True
+                        else:
+                            if is_modifying:
+                                verify = executor.verify_action_effect(pre_status)
+                                action_result["verification"] = verify
+                                any_modifying_action = True
+                                if verify["frame_changed"]:
+                                    any_frame_changed = True
+                                if verify["resized"]:
+                                    batch_had_resize = True
+                            item_needs_screenshot = (
+                                explicit_attach
+                                or collaborator_intervened
+                                or (fname not in CUSTOM_FUNCTION_NAMES)
+                            )
 
-                    post_png, post_hdr = executor.capture_png(settle_delay=0.45, max_wait=1.2)
+                        results.append((fname, call_id, action_result, item_needs_screenshot))
+                        log_entry = {"name": fname, "args": fc_args, "result": action_result}
+                        if safety_audit is not None:
+                            log_entry["safety_decision"] = safety_audit
+                        turn_log_actions.append(log_entry)
+
+                        if idx + 1 < len(function_calls):
+                            if batch_had_error:
+                                for rem_fc in function_calls[idx + 1 :]:
+                                    rem_name = str(rem_fc.get("name", ""))
+                                    rem_id = str(rem_fc.get("id", ""))
+                                    skip_res: Dict[str, Any] = {
+                                        "status": "skipped_after_batch_abort",
+                                        "reason": f"Prior action {fname} failed: {action_result['error']}",
+                                    }
+                                    results.append((rem_name, rem_id, skip_res, True))
+                                    turn_log_actions.append(
+                                        {"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": skip_res}
+                                    )
+                                break
+                            if batch_had_resize:
+                                for rem_fc in function_calls[idx + 1 :]:
+                                    rem_name = str(rem_fc.get("name", ""))
+                                    rem_id = str(rem_fc.get("id", ""))
+                                    skip_res = {
+                                        "status": "skipped_after_desktop_resize",
+                                        "new_size": [executor.width, executor.height],
+                                    }
+                                    results.append((rem_name, rem_id, skip_res, True))
+                                    turn_log_actions.append(
+                                        {"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": skip_res}
+                                    )
+                                break
+
                     drained_notes, _, _ = executor.poll_user_messages()
                     collab_notes.extend(drained_notes)
                     if collab_notes and results:
-                        results[0][2]["user_notes"] = collab_notes
+                        existing_notes = results[0][2].get("user_notes")
+                        if isinstance(existing_notes, list):
+                            existing_notes.extend(collab_notes)
+                        else:
+                            results[0][2]["user_notes"] = collab_notes
                         print(f"  [COLLAB] Delivering user notes to agent: {collab_notes}")
                     if collaborator_intervened:
                         print("  [COLLAB] Re-syncing model with post-takeover screenshot.")
 
-                    if log_dir:
-                        with open(os.path.join(log_dir, f"turn_{global_turn:02d}.png"), "wb") as f:
-                            f.write(post_png)
-                        with open(os.path.join(log_dir, "final.png"), "wb") as f:
-                            f.write(post_png)
+                    need_capture = (
+                        any(ns for _, _, _, ns in results)
+                        or batch_had_error
+                        or batch_had_resize
+                        or collaborator_intervened
+                    )
+                    if need_capture:
+                        post_png, post_hdr = executor.capture_png(settle_delay=0.45, max_wait=1.2)
+                        post_b64: Optional[str] = base64.b64encode(post_png).decode("ascii")
+                        if log_dir:
+                            with open(os.path.join(log_dir, f"turn_{global_turn:02d}.png"), "wb") as f:
+                                f.write(post_png)
+                            with open(os.path.join(log_dir, "final.png"), "wb") as f:
+                                f.write(post_png)
+                    else:
+                        post_hdr = executor.get_status()
+                        post_b64 = None
+
+                    if any_modifying_action:
+                        if any_frame_changed:
+                            consecutive_no_change_turns = 0
+                        else:
+                            consecutive_no_change_turns += 1
+
+                    escalation_reason: Optional[str] = None
+                    if batch_had_error:
+                        escalation_reason = "action_error"
+                    elif batch_had_resize:
+                        escalation_reason = "desktop_resized"
+                    elif collaborator_intervened:
+                        escalation_reason = "human_takeover"
+                    elif consecutive_no_change_turns >= 2:
+                        escalation_reason = "stalled_ui"
+
+                    next_thinking_lv = select_thinking_level(escalation_reason) if not halted_reason else turn_thinking_lv
 
                     if trace_file:
-                        trace_file.write(
-                            json.dumps(
-                                {
-                                    "turn": global_turn,
-                                    "task": task_index,
-                                    "interaction_id": interaction.get("id"),
-                                    "actions": turn_log_actions,
-                                    "frame_seq": post_hdr.get("frame_seq"),
-                                    "halted_reason": halted_reason,
-                                    "user_notes": collab_notes,
-                                },
-                                ensure_ascii=False,
-                            )
-                            + "\n"
-                        )
+                        trace_entry: Dict[str, Any] = {
+                            "turn": global_turn,
+                            "task": task_index,
+                            "interaction_id": interaction.get("id"),
+                            "actions": turn_log_actions,
+                            "frame_seq": post_hdr.get("frame_seq"),
+                            "captured_screenshot": need_capture,
+                            "thinking_level": turn_thinking_lv,
+                            "halted_reason": halted_reason,
+                            "user_notes": collab_notes,
+                        }
+                        if escalation_reason:
+                            trace_entry["escalated_reason"] = escalation_reason
+                            trace_entry["next_thinking_level"] = next_thinking_lv
+                        trace_file.write(json.dumps(trace_entry, ensure_ascii=False) + "\n")
                         trace_file.flush()
 
                     if halted_reason:
@@ -1149,26 +1895,41 @@ def run_agent(args: argparse.Namespace) -> int:
                         )
                         break
 
-                    post_b64 = base64.b64encode(post_png).decode("ascii")
+                    last_img_idx: Optional[int] = None
+                    if post_b64 is not None and results:
+                        img_indices = [i for i, (_, _, _, ns) in enumerate(results) if ns]
+                        last_img_idx = img_indices[-1] if img_indices else len(results) - 1
+
                     function_responses = []
-                    for fname, call_id, res in results:
+                    for i, (fname, call_id, res, _) in enumerate(results):
+                        res_blocks: List[Dict[str, Any]] = [{"type": "text", "text": json.dumps(res)}]
+                        if post_b64 is not None and i == last_img_idx:
+                            res_blocks.append({"type": "image", "data": post_b64, "mime_type": "image/png"})
                         function_responses.append(
                             {
                                 "type": "function_result",
                                 "name": fname,
                                 "call_id": call_id,
-                                "result": [
-                                    {"type": "text", "text": json.dumps(res)},
-                                    {"type": "image", "data": post_b64, "mime_type": "image/png"},
-                                ],
+                                "result": res_blocks,
                             }
                         )
 
                     executor.set_overlay("thinking", "thinking", "Analyzing screen and planning next action...")
-                    interaction = llm.create(
-                        input_payload=function_responses,
-                        previous_interaction_id=interaction["id"],
-                    )
+                    try:
+                        interaction = llm.create(
+                            input_payload=function_responses,
+                            previous_interaction_id=interaction["id"],
+                            thinking_level=next_thinking_lv,
+                        )
+                        turn_thinking_lv = next_thinking_lv
+                    except InteractionsApiError as e:
+                        wait_intent = handle_api_error(e, interaction.get("id"))
+                        if not stay_interactive or e.is_auth_error:
+                            executor.set_overlay("done", "error", wait_intent)
+                            return 2
+                        task_halted = True
+                        last_completed_interaction_id = None
+                        break
 
                 if not task_completed and not task_halted:
                     if not stay_interactive:
@@ -1185,13 +1946,7 @@ def run_agent(args: argparse.Namespace) -> int:
                 if nxt is None:
                     return 0
                 next_text, human_delta = nxt
-                if human_delta > 0:
-                    current_prompt = (
-                        f"[Human collaborator performed {human_delta} desktop action(s) before this instruction; "
-                        f"inspect the updated screenshot.]\n{next_text}"
-                    )
-                else:
-                    current_prompt = next_text
+                current_prompt = format_collab_prompt(next_text, human_delta)
 
     except KeyboardInterrupt:
         print("\n[COLLAB] Interrupted; ending session.")
@@ -1246,6 +2001,32 @@ def main() -> int:
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model name supporting computer_use")
     parser.add_argument("--max-turns", type=int, default=20, help="Maximum agent turns per task")
     parser.add_argument("--log-dir", default="/tmp/vnc_agent_run", help="Directory for trace.jsonl and PNG snapshots")
+    parser.add_argument(
+        "--thinking-level",
+        choices=THINKING_LEVELS,
+        default="low",
+        help="Baseline generation_config.thinking_level for routine automation turns (default: low)",
+    )
+    parser.add_argument(
+        "--recovery-thinking-level",
+        choices=RECOVERY_THINKING_LEVELS,
+        default="high",
+        help="Adaptive thinking_level used on error/resize/stalled-UI recovery turns (default: high; 'off' disables escalation)",
+    )
+    parser.add_argument(
+        "--exclude-actions",
+        action="append",
+        default=None,
+        help=(
+            "Built-in computer_use actions to disable via excluded_predefined_functions "
+            "(comma-separated or repeatable, e.g. --exclude-actions drag_and_drop,type)"
+        ),
+    )
+    parser.add_argument(
+        "--no-custom-tools",
+        action="store_true",
+        help="Disable registering custom deterministic VNC function declarations alongside computer_use",
+    )
     parser.add_argument(
         "--auto-confirm",
         action="store_true",
