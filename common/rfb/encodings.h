@@ -70,6 +70,8 @@ namespace rfb {
 
   // UltraVNC-specific
   const int pseudoEncodingExtendedClipboard = 0xC0A1E5CE;
+  const int pseudoEncodingSupportedMessages = static_cast<int>(0xFFFE0001U);
+  const int pseudoEncodingFTProtocolVersion = static_cast<int>(0xFFFF8002U);
 
   int encodingNum(const char* name);
   const char* encodingName(int num);

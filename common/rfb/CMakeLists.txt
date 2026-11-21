@@ -58,11 +58,13 @@ add_library(rfbclient STATIC
   CMsgWriter.cxx
   CSecurityPlain.cxx
   CSecurityStack.cxx
+  CSecurityTight.cxx
   CSecurityVeNCrypt.cxx
   CSecurityVncAuth.cxx
   CopyRectDecoder.cxx
   DecodeManager.cxx
   Decoder.cxx
+  FileTransferClient.cxx
   HextileDecoder.cxx
   JPEGDecoder.cxx
   RREDecoder.cxx
@@ -73,7 +75,8 @@ add_library(rfbclient STATIC
   ZRLEDecoder.cxx)
 
 target_include_directories(rfbclient PUBLIC ${CMAKE_SOURCE_DIR}/common)
-target_link_libraries(rfbclient PRIVATE core rdr rfb)
+target_include_directories(rfbclient SYSTEM PUBLIC ${ZLIB_INCLUDE_DIRS})
+target_link_libraries(rfbclient PRIVATE core rdr rfb ${ZLIB_LIBRARIES})
 
 # libstdc++ doesn't implicitly include this, although it is very much
 # required when using any of the C++ threading features (at least on

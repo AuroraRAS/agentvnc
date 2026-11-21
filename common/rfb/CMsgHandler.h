@@ -26,7 +26,12 @@
 
 #include <stdint.h>
 
+#include <string>
+#include <vector>
+
 #include <rfb/ServerParams.h>
+#include <rfb/TightCapability.h>
+#include <rfb/fileTransferTypes.h>
 
 namespace core {
   struct Point;
@@ -89,6 +94,41 @@ namespace rfb {
     virtual void audioBegin() = 0;
     virtual void audioEnd() = 0;
     virtual void audioData(const uint8_t* data, size_t length) = 0;
+
+    virtual void serverTightCaps(const std::vector<TightCapability>& /*serverMsgs*/,
+                                 const std::vector<TightCapability>& /*clientMsgs*/,
+                                 const std::vector<TightCapability>& /*encodings*/) {}
+    virtual void supportedMessages(const uint8_t /*client2server*/[32],
+                                   const uint8_t /*server2client*/[32]) {}
+
+    virtual void tight13FileListData(uint8_t /*flags*/,
+                                     const std::vector<FileEntry>& /*entries*/) {}
+    virtual void tight13FileDownloadData(const uint8_t* /*data*/, size_t /*len*/) {}
+    virtual void tight13FileDownloadEnd(uint32_t /*modTime*/) {}
+    virtual void tight13FileUploadCancel(const std::string& /*reason*/) {}
+    virtual void tight13FileDownloadFailed(const std::string& /*reason*/) {}
+
+    virtual void tight2CompressionSupportReply(bool /*supported*/) {}
+    virtual void tight2FileListReply(const std::vector<FileEntry>& /*entries*/) {}
+    virtual void tight2Md5Reply(const uint8_t /*digest*/[16]) {}
+    virtual void tight2UploadStartReply() {}
+    virtual void tight2UploadDataReply() {}
+    virtual void tight2UploadEndReply() {}
+    virtual void tight2DownloadStartReply() {}
+    virtual void tight2DownloadDataReply(const uint8_t* /*data*/, size_t /*len*/) {}
+    virtual void tight2DownloadEndReply(uint8_t /*flags*/, uint64_t /*modTimeMs*/) {}
+    virtual void tight2MkdirReply() {}
+    virtual void tight2RemoveReply() {}
+    virtual void tight2RenameReply() {}
+    virtual void tight2DirSizeReply(uint64_t /*size*/) {}
+    virtual void tight2LastRequestFailedReply(const std::string& /*message*/) {}
+
+    virtual void ultraFileTransferMessage(uint8_t /*contentType*/,
+                                          uint16_t /*contentParam*/,
+                                          uint32_t /*size*/,
+                                          uint32_t /*sizeH*/,
+                                          const uint8_t* /*payload*/,
+                                          size_t /*length*/) {}
 
     ServerParams server;
   };

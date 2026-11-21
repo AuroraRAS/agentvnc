@@ -55,6 +55,18 @@ add_executable(emulatemb emulatemb.cxx ../../vncviewer/EmulateMB.cxx)
 target_link_libraries(emulatemb PRIVATE core GTest::gtest_main)
 gtest_discover_tests(emulatemb)
 
+add_executable(filetransfer filetransfer.cxx)
+target_link_libraries(filetransfer PRIVATE rfbclient ${ZLIB_LIBRARIES} GTest::gtest_main)
+gtest_discover_tests(filetransfer)
+
+add_executable(ftpprotocol ftpprotocol.cxx ../../vncviewer/FtpProtocol.cxx)
+target_link_libraries(ftpprotocol PRIVATE core GTest::gtest_main)
+gtest_discover_tests(ftpprotocol)
+
+add_executable(ftpbridge ftpbridge.cxx ../../vncviewer/FtpProtocol.cxx ../../vncviewer/FtpServer.cxx)
+target_link_libraries(ftpbridge PRIVATE rfbclient network rdr core ${ZLIB_LIBRARIES} GTest::gtest_main)
+gtest_discover_tests(ftpbridge)
+
 if(ENABLE_H264)
   add_executable(h264decoder h264decoder.cxx)
   target_link_libraries(h264decoder PRIVATE rfbclient GTest::gtest_main)

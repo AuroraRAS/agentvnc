@@ -74,6 +74,7 @@ protected:
   static void handleModifier(Fl_Widget *widget, void *data);
 
   static void handleFullScreenMode(Fl_Widget *widget, void *data);
+  static void handleFtpServer(Fl_Widget *widget, void *data);
 
   static void handleCancel(Fl_Widget *widget, void *data);
   static void handleOK(Fl_Widget *widget, void *data);
@@ -169,6 +170,9 @@ protected:
 #ifdef HAVE_AUDIO
   Fl_Check_Button *audioCheckbox;
 #endif
+  Fl_Check_Button *ftpServerCheckbox;
+  Fl_Int_Input *ftpPortInput;
+  Fl_Input *ftpBindAddressInput;
 
 private:
   static int fltk_event_handler(int event);

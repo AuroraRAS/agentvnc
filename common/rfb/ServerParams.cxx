@@ -43,6 +43,7 @@ ServerParams::ServerParams()
     supportsQEMUKeyEvent(false), supportsQEMUAudio(false),
     supportsSetDesktopSize(false), supportsFence(false),
     supportsContinuousUpdates(false), supportsExtendedMouseButtons(false),
+    tightEnabled(false),
     width_(0), height_(0),
     ledState_(ledUnknown)
 {
@@ -137,4 +138,24 @@ void ServerParams::setClipboardCaps(uint32_t flags, const uint32_t* lengths)
       continue;
     clipSizes[i] = lengths[num++];
   }
+}
+
+bool ServerParams::hasServerMsgCap(int32_t code, const char* vendor,
+                                   const char* sig) const
+{
+  for (const TightCapability& cap : serverMsgCaps) {
+    if (cap.matches(code, vendor, sig))
+      return true;
+  }
+  return false;
+}
+
+bool ServerParams::hasClientMsgCap(int32_t code, const char* vendor,
+                                   const char* sig) const
+{
+  for (const TightCapability& cap : clientMsgCaps) {
+    if (cap.matches(code, vendor, sig))
+      return true;
+  }
+  return false;
 }

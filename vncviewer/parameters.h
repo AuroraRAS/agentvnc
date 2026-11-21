@@ -87,6 +87,13 @@ extern core::BoolParameter fullscreenSystemKeys;
 extern core::BoolParameter alertOnFatalError;
 extern core::BoolParameter reconnectOnError;
 
+extern core::BoolParameter ftpServer;
+extern core::IntParameter ftpPort;
+extern core::StringParameter ftpBindAddress;
+extern core::StringParameter ftpUsername;
+extern core::StringParameter ftpPassword;
+extern core::EnumParameter ftpProtocol;
+
 #ifndef WIN32
 extern core::StringParameter via;
 #endif

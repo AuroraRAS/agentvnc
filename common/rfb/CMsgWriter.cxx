@@ -33,6 +33,7 @@
 
 #include <rfb/msgTypes.h>
 #include <rfb/fenceTypes.h>
+#include <rfb/fileTransferTypes.h>
 #include <rfb/qemuTypes.h>
 #include <rfb/clipboardTypes.h>
 #include <rfb/PixelFormat.h>
@@ -352,6 +353,245 @@ void CMsgWriter::writeQEMUAudioSetFormat(uint8_t sampleFormat,
   os->writeU8(sampleFormat);
   os->writeU8(channels);
   os->writeU32(frequency);
+  endMsg();
+}
+
+static void writeU64(rdr::OutStream* os, uint64_t val)
+{
+  os->writeU32((uint32_t)(val >> 32));
+  os->writeU32((uint32_t)(val & 0xFFFFFFFFU));
+}
+
+static void writeTight2UTF8(rdr::OutStream* os, const std::string& str)
+{
+  if (str.size() > 0xFFFFFFFFU)
+    throw std::length_error("UTF-8 string too long");
+  os->writeU32((uint32_t)str.size());
+  if (!str.empty())
+    os->writeBytes((const uint8_t*)str.data(), str.size());
+}
+
+void CMsgWriter::writeTight13FileListRequest(uint8_t flags,
+                                             const std::string& dir)
+{
+  if (dir.size() > 65535)
+    throw std::length_error("Directory path too long");
+
+  startMsg(msgTypeTightFileListRequest);
+  os->writeU8(flags);
+  os->writeU16((uint16_t)dir.size());
+  if (!dir.empty())
+    os->writeBytes((const uint8_t*)dir.data(), dir.size());
+  endMsg();
+}
+
+void CMsgWriter::writeTight13FileDownloadRequest(uint8_t compressLevel,
+                                                 uint32_t position,
+                                                 const std::string& path)
+{
+  if (path.size() > 65535)
+    throw std::length_error("File path too long");
+
+  startMsg(msgTypeTightFileDownloadRequest);
+  os->writeU8(compressLevel);
+  os->writeU16((uint16_t)path.size());
+  os->writeU32(position);
+  if (!path.empty())
+    os->writeBytes((const uint8_t*)path.data(), path.size());
+  endMsg();
+}
+
+void CMsgWriter::writeTight13FileUploadRequest(uint8_t compressLevel,
+                                               uint32_t position,
+                                               const std::string& path)
+{
+  if (path.size() > 65535)
+    throw std::length_error("File path too long");
+
+  startMsg(msgTypeTightFileUploadRequest);
+  os->writeU8(compressLevel);
+  os->writeU16((uint16_t)path.size());
+  os->writeU32(position);
+  if (!path.empty())
+    os->writeBytes((const uint8_t*)path.data(), path.size());
+  endMsg();
+}
+
+void CMsgWriter::writeTight13FileUploadData(uint8_t compressLevel,
+                                            const uint8_t* data,
+                                            uint16_t len)
+{
+  startMsg(msgTypeTightFileUploadData);
+  os->writeU8(compressLevel);
+  os->writeU16(len);
+  os->writeU16(len);
+  if (len > 0 && data != nullptr)
+    os->writeBytes(data, len);
+  endMsg();
+}
+
+void CMsgWriter::writeTight13FileUploadEnd(uint32_t modTime)
+{
+  startMsg(msgTypeTightFileUploadData);
+  os->writeU8(0);
+  os->writeU16(0);
+  os->writeU16(0);
+  os->writeU32(modTime);
+  endMsg();
+}
+
+void CMsgWriter::writeTight13FileDownloadCancel(const std::string& reason)
+{
+  if (reason.size() > 65535)
+    throw std::length_error("Cancel reason too long");
+
+  startMsg(msgTypeTightFileDownloadCancel);
+  os->writeU8(0);
+  os->writeU16((uint16_t)reason.size());
+  if (!reason.empty())
+    os->writeBytes((const uint8_t*)reason.data(), reason.size());
+  endMsg();
+}
+
+void CMsgWriter::writeTight13FileUploadFailed(const std::string& reason)
+{
+  if (reason.size() > 65535)
+    throw std::length_error("Failure reason too long");
+
+  startMsg(msgTypeTightFileUploadFailed);
+  os->writeU8(0);
+  os->writeU16((uint16_t)reason.size());
+  if (!reason.empty())
+    os->writeBytes((const uint8_t*)reason.data(), reason.size());
+  endMsg();
+}
+
+void CMsgWriter::writeTight13FileCreateDirRequest(const std::string& dir)
+{
+  if (dir.size() > 65535)
+    throw std::length_error("Directory path too long");
+
+  startMsg(msgTypeTightFileCreateDirRequest);
+  os->writeU8(0);
+  os->writeU16((uint16_t)dir.size());
+  if (!dir.empty())
+    os->writeBytes((const uint8_t*)dir.data(), dir.size());
+  endMsg();
+}
+
+void CMsgWriter::writeTight2CompressionSupportRequest()
+{
+  os->writeU32(tight2CompressionSupportReq);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2FileListRequest(uint8_t compressLevel,
+                                            const std::string& path)
+{
+  os->writeU32(tight2FileListReq);
+  os->writeU8(compressLevel);
+  writeTight2UTF8(os, path);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2DownloadStartRequest(const std::string& path,
+                                                 uint64_t offset)
+{
+  os->writeU32(tight2DownloadStartReq);
+  writeTight2UTF8(os, path);
+  writeU64(os, offset);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2DownloadDataRequest(uint8_t compressLevel,
+                                                uint32_t size)
+{
+  os->writeU32(tight2DownloadDataReq);
+  os->writeU8(compressLevel);
+  os->writeU32(size);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2UploadStartRequest(const std::string& path,
+                                               bool overwrite,
+                                               uint64_t offset)
+{
+  os->writeU32(tight2UploadStartReq);
+  writeTight2UTF8(os, path);
+  os->writeU8(overwrite ? 1 : 0);
+  writeU64(os, offset);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2UploadDataRequest(const uint8_t* data,
+                                              uint32_t size)
+{
+  os->writeU32(tight2UploadDataReq);
+  os->writeU8(0);
+  os->writeU32(size);
+  os->writeU32(size);
+  if (size > 0 && data != nullptr)
+    os->writeBytes(data, size);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2UploadEndRequest(uint16_t fileFlags,
+                                             uint64_t modTimeMs)
+{
+  os->writeU32(tight2UploadEndReq);
+  os->writeU16(fileFlags);
+  writeU64(os, modTimeMs);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2MkdirRequest(const std::string& path)
+{
+  os->writeU32(tight2MkdirReq);
+  writeTight2UTF8(os, path);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2RemoveRequest(const std::string& path)
+{
+  os->writeU32(tight2RemoveReq);
+  writeTight2UTF8(os, path);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2RenameRequest(const std::string& oldPath,
+                                          const std::string& newPath)
+{
+  os->writeU32(tight2RenameReq);
+  writeTight2UTF8(os, oldPath);
+  writeTight2UTF8(os, newPath);
+  endMsg();
+}
+
+void CMsgWriter::writeTight2DirSizeRequest(const std::string& path)
+{
+  os->writeU32(tight2DirSizeReq);
+  writeTight2UTF8(os, path);
+  endMsg();
+}
+
+void CMsgWriter::writeUltraFileTransfer(uint8_t contentType,
+                                          uint16_t contentParam,
+                                          uint32_t size,
+                                          const uint8_t* data,
+                                          uint32_t length,
+                                          bool hasSizeH,
+                                          uint32_t sizeH)
+{
+  startMsg(msgTypeFileTransfer);
+  os->writeU8(contentType);
+  os->writeU8(contentParam & 0xFF);
+  os->writeU8((contentParam >> 8) & 0xFF);
+  os->writeU32(size);
+  os->writeU32(length);
+  if (length > 0 && data != nullptr)
+    os->writeBytes(data, length);
+  if (hasSizeH)
+    os->writeU32(sizeH);
   endMsg();
 }
 

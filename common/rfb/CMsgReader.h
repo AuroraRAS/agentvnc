@@ -71,6 +71,14 @@ namespace rfb {
 
     bool readQEMUServerMessage();
 
+    bool readUltraFileTransfer();
+    bool readTight13FileListData();
+    bool readTight13FileDownloadData();
+    bool readTight13FileUploadCancel();
+    bool readTight13FileDownloadFailed();
+    bool readTight2Message();
+    bool readSupportedMessages();
+
   private:
     CMsgHandler* handler;
     rdr::InStream* is;

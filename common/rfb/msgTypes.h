@@ -25,10 +25,18 @@ namespace rfb {
   const int msgTypeSetColourMapEntries = 1;
   const int msgTypeBell = 2;
   const int msgTypeServerCutText = 3;
+  const int msgTypeFileTransfer = 7;
+
+  const int msgTypeTightFileListData = 130;
+  const int msgTypeTightFileDownloadData = 131;
+  const int msgTypeTightFileUploadCancel = 132;
+  const int msgTypeTightFileDownloadFailed = 133;
 
   const int msgTypeEndOfContinuousUpdates = 150;
 
   const int msgTypeServerFence = 248;
+
+  const int msgTypeTightExt = 252;
 
   // client to server
 
@@ -39,6 +47,14 @@ namespace rfb {
   const int msgTypeKeyEvent = 4;
   const int msgTypePointerEvent = 5;
   const int msgTypeClientCutText = 6;
+
+  const int msgTypeTightFileListRequest = 130;
+  const int msgTypeTightFileDownloadRequest = 131;
+  const int msgTypeTightFileUploadRequest = 132;
+  const int msgTypeTightFileUploadData = 133;
+  const int msgTypeTightFileDownloadCancel = 134;
+  const int msgTypeTightFileUploadFailed = 135;
+  const int msgTypeTightFileCreateDirRequest = 136;
 
   const int msgTypeEnableContinuousUpdates = 150;
 

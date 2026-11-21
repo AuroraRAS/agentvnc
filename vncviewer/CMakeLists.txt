@@ -16,6 +16,8 @@ add_executable(vncviewer
   CConn.cxx
   DesktopWindow.cxx
   EmulateMB.cxx
+  FtpProtocol.cxx
+  FtpServer.cxx
   ServerDialog.cxx
   ShortcutHandler.cxx
   Surface.cxx

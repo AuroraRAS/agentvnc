@@ -41,6 +41,7 @@ namespace rdr {
     // hasBufferedData() checks if there is any data yet to be flushed
 
     bool hasBufferedData();
+    size_t bufferedSize() const { return ptr - sentUpTo; }
 
   private:
     // flushBuffer() requests that the stream be flushed. Returns true if it is

@@ -23,8 +23,11 @@
 
 #include <assert.h>
 #include <stdio.h>
+#include <string.h>
 
 #include <vector>
+
+#include <zlib.h>
 
 #include <core/LogWriter.h>
 #include <core/i18n.h>
@@ -36,6 +39,8 @@
 #include <rfb/msgTypes.h>
 #include <rfb/qemuTypes.h>
 #include <rfb/clipboardTypes.h>
+#include <rfb/fileTransferTypes.h>
+#include <rfb/TightCapability.h>
 #include <rfb/Exception.h>
 #include <rfb/CMsgHandler.h>
 #include <rfb/CMsgReader.h>
@@ -54,8 +59,74 @@ static core::IntParameter maxCutText("MaxCutText",
 // reason to send more than a fraction of a second of audio at a time,
 // and we have to be able to buffer whatever we accept.
 static const uint32_t maxAudioData = 1024*1024;
+static const uint32_t maxFileTransferPayload = 16*1024*1024;
 
 using namespace rfb;
+
+static uint64_t readU64(rdr::InStream* is)
+{
+  uint64_t hi = is->readU32();
+  uint64_t lo = is->readU32();
+  return (hi << 32) | lo;
+}
+
+static uint32_t readBE32FromBuf(const uint8_t* p)
+{
+  return ((uint32_t)p[0] << 24) |
+         ((uint32_t)p[1] << 16) |
+         ((uint32_t)p[2] << 8) |
+         (uint32_t)p[3];
+}
+
+static uint64_t readBE64FromBuf(const uint8_t* p)
+{
+  return ((uint64_t)readBE32FromBuf(p) << 32) |
+         (uint64_t)readBE32FromBuf(p + 4);
+}
+
+static uint16_t readBE16FromBuf(const uint8_t* p)
+{
+  return (uint16_t)(((uint16_t)p[0] << 8) | (uint16_t)p[1]);
+}
+
+static std::vector<uint8_t> inflateTightBlock(const uint8_t* compressed,
+                                              size_t compressedSize,
+                                              size_t uncompressedSize)
+{
+  if (uncompressedSize == 0)
+    return std::vector<uint8_t>();
+
+  std::vector<uint8_t> out(uncompressedSize);
+  const int windowModes[2] = { 15, -15 };
+
+  for (int i = 0; i < 2; i++) {
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, windowModes[i]) != Z_OK)
+      continue;
+
+    zs.next_in = const_cast<Bytef*>(compressed);
+    zs.avail_in = (uInt)compressedSize;
+    zs.next_out = out.data();
+    zs.avail_out = (uInt)uncompressedSize;
+
+    int rc = Z_OK;
+    int guard = 0;
+    while ((rc == Z_OK || rc == Z_BUF_ERROR) &&
+           zs.total_out < uncompressedSize && guard++ < 64) {
+      rc = inflate(&zs, Z_SYNC_FLUSH);
+      if (rc == Z_STREAM_END)
+        break;
+    }
+
+    bool ok = (zs.total_out == uncompressedSize);
+    inflateEnd(&zs);
+    if (ok)
+      return out;
+  }
+
+  throw protocol_error(_("Failed to decompress file transfer data"));
+}
 
 CMsgReader::CMsgReader(CMsgHandler* handler_, rdr::InStream* is_)
   : handler(handler_), is(is_),
@@ -86,10 +157,53 @@ bool CMsgReader::readServerInit()
   len = is->readU32();
   if (!is->hasDataOrRestore(len))
     return false;
-  is->clearRestorePoint();
   std::vector<char> name(len + 1);
   is->readBytes((uint8_t*)name.data(), len);
   name[len] = '\0';
+
+  std::vector<TightCapability> serverMsgs;
+  std::vector<TightCapability> clientMsgs;
+  std::vector<TightCapability> encodings;
+
+  if (handler->server.tightEnabled) {
+    if (!is->hasDataOrRestore(8))
+      return false;
+
+    uint16_t nSrv = is->readU16();
+    uint16_t nCli = is->readU16();
+    uint16_t nEnc = is->readU16();
+    is->skip(2);
+
+    size_t totalCaps = (size_t)nSrv + nCli + nEnc;
+    if (totalCaps > 4096) {
+      is->clearRestorePoint();
+      throw protocol_error(_("Too many Tight interaction capabilities"));
+    }
+
+    if (!is->hasDataOrRestore(totalCaps * 16))
+      return false;
+
+    auto readCaps = [this](uint16_t count,
+                           std::vector<TightCapability>& out) {
+      out.resize(count);
+      for (uint16_t i = 0; i < count; i++) {
+        out[i].code = is->readS32();
+        is->readBytes((uint8_t*)out[i].vendor, 4);
+        out[i].vendor[4] = '\0';
+        is->readBytes((uint8_t*)out[i].signature, 8);
+        out[i].signature[8] = '\0';
+      }
+    };
+
+    readCaps(nSrv, serverMsgs);
+    readCaps(nCli, clientMsgs);
+    readCaps(nEnc, encodings);
+  }
+
+  is->clearRestorePoint();
+
+  if (handler->server.tightEnabled)
+    handler->serverTightCaps(serverMsgs, clientMsgs, encodings);
 
   if (core::isValidUTF8(name.data()))
     handler->serverInit(width, height, pf, name.data());
@@ -177,6 +291,21 @@ bool CMsgReader::readMsg()
     case msgTypeServerCutText:
       ret = readServerCutText();
       break;
+    case msgTypeFileTransfer:
+      ret = readUltraFileTransfer();
+      break;
+    case msgTypeTightFileListData:
+      ret = readTight13FileListData();
+      break;
+    case msgTypeTightFileDownloadData:
+      ret = readTight13FileDownloadData();
+      break;
+    case msgTypeTightFileUploadCancel:
+      ret = readTight13FileUploadCancel();
+      break;
+    case msgTypeTightFileDownloadFailed:
+      ret = readTight13FileDownloadFailed();
+      break;
     case msgTypeFramebufferUpdate:
       ret = readFramebufferUpdate();
       break;
@@ -185,6 +314,9 @@ bool CMsgReader::readMsg()
       break;
     case msgTypeEndOfContinuousUpdates:
       ret = readEndOfContinuousUpdates();
+      break;
+    case msgTypeTightExt:
+      ret = readTight2Message();
       break;
     case msgTypeQEMUServerMessage:
       ret = readQEMUServerMessage();
@@ -281,6 +413,9 @@ bool CMsgReader::readMsg()
     case pseudoEncodingExtendedMouseButtons:
       handler->supportsExtendedMouseButtons();
       ret = true;
+      break;
+    case pseudoEncodingSupportedMessages:
+      ret = readSupportedMessages();
       break;
     default:
       ret = readRect(dataRect, rectEncoding);
@@ -931,4 +1066,382 @@ bool CMsgReader::readVMwareLEDState()
   handler->setLEDState(ledState);
 
   return true;
+}
+
+bool CMsgReader::readSupportedMessages()
+{
+  if (!is->hasData(64))
+    return false;
+
+  uint8_t c2s[32];
+  uint8_t s2c[32];
+  is->readBytes(c2s, 32);
+  is->readBytes(s2c, 32);
+
+  handler->supportedMessages(c2s, s2c);
+  return true;
+}
+
+bool CMsgReader::readUltraFileTransfer()
+{
+  if (!is->hasData(1 + 2 + 4 + 4))
+    return false;
+
+  is->setRestorePoint();
+
+  uint8_t contentType = is->readU8();
+  uint8_t paramLo = is->readU8();
+  uint8_t paramHi = is->readU8();
+  uint16_t contentParam = (uint16_t)paramLo | ((uint16_t)paramHi << 8);
+  uint32_t size = is->readU32();
+  uint32_t length = is->readU32();
+
+  if (length > maxFileTransferPayload) {
+    is->clearRestorePoint();
+    throw protocol_error(_("UltraVNC file transfer payload is too large"));
+  }
+
+  bool hasSizeH = (contentType == ultraFileHeader) &&
+                  (handler->server.fileTransferCaps.ultraVersion != 1);
+
+  if (!is->hasDataOrRestore((size_t)length + (hasSizeH ? 4 : 0)))
+    return false;
+
+  std::vector<uint8_t> payload(length);
+  if (length > 0)
+    is->readBytes(payload.data(), length);
+
+  uint32_t sizeH = 0;
+  if (hasSizeH)
+    sizeH = is->readU32();
+
+  is->clearRestorePoint();
+
+  handler->ultraFileTransferMessage(contentType, contentParam,
+                                    size, sizeH,
+                                    payload.empty() ? nullptr : payload.data(),
+                                    payload.size());
+  return true;
+}
+
+bool CMsgReader::readTight13FileListData()
+{
+  if (!is->hasData(1 + 2 + 2 + 2))
+    return false;
+
+  is->setRestorePoint();
+
+  uint8_t flags = is->readU8();
+  uint16_t numFiles = is->readU16();
+  uint16_t dataSize = is->readU16();
+  uint16_t compressedSize = is->readU16();
+
+  size_t sizesBytes = (size_t)numFiles * 8;
+  if (!is->hasDataOrRestore(sizesBytes + compressedSize))
+    return false;
+
+  std::vector<FileEntry> entries(numFiles);
+  for (uint16_t i = 0; i < numFiles; i++) {
+    uint32_t rawSize = is->readU32();
+    uint32_t mtime = is->readU32();
+    entries[i].isDir = (rawSize == tight13DirSize);
+    entries[i].size = entries[i].isDir ? 0 : (uint64_t)rawSize;
+    entries[i].mtime = (int64_t)mtime;
+  }
+
+  std::vector<uint8_t> rawNames(compressedSize);
+  if (compressedSize > 0)
+    is->readBytes(rawNames.data(), compressedSize);
+
+  is->clearRestorePoint();
+
+  std::vector<uint8_t> names;
+  if ((flags & 0x0F) != 0 && compressedSize != dataSize)
+    names = inflateTightBlock(rawNames.data(), rawNames.size(), dataSize);
+  else
+    names.swap(rawNames);
+
+  size_t offset = 0;
+  for (uint16_t i = 0; i < numFiles; i++) {
+    if (offset < names.size()) {
+      const char* s = (const char*)names.data() + offset;
+      size_t maxlen = names.size() - offset;
+      size_t slen = strnlen(s, maxlen);
+      entries[i].name.assign(s, slen);
+      offset += slen;
+      if (offset < names.size() && names[offset] == '\0')
+        offset++;
+    }
+  }
+
+  handler->tight13FileListData(flags, entries);
+  return true;
+}
+
+bool CMsgReader::readTight13FileDownloadData()
+{
+  if (!is->hasData(1 + 2 + 2))
+    return false;
+
+  is->setRestorePoint();
+
+  uint8_t compressLevel = is->readU8();
+  uint16_t realSize = is->readU16();
+  uint16_t compressedSize = is->readU16();
+
+  if (realSize == 0 && compressedSize == 0) {
+    if (!is->hasDataOrRestore(4))
+      return false;
+    uint32_t modTime = is->readU32();
+    is->clearRestorePoint();
+    handler->tight13FileDownloadEnd(modTime);
+    return true;
+  }
+
+  if (!is->hasDataOrRestore(compressedSize))
+    return false;
+
+  std::vector<uint8_t> rawData(compressedSize);
+  if (compressedSize > 0)
+    is->readBytes(rawData.data(), compressedSize);
+
+  is->clearRestorePoint();
+
+  if (compressLevel != 0 && compressedSize != realSize) {
+    std::vector<uint8_t> out = inflateTightBlock(rawData.data(), rawData.size(),
+                                                 realSize);
+    handler->tight13FileDownloadData(out.data(), out.size());
+  } else {
+    handler->tight13FileDownloadData(rawData.data(), rawData.size());
+  }
+
+  return true;
+}
+
+bool CMsgReader::readTight13FileUploadCancel()
+{
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+  is->skip(1);
+  uint16_t reasonLen = is->readU16();
+
+  if (!is->hasDataOrRestore(reasonLen))
+    return false;
+
+  std::string reason(reasonLen, '\0');
+  if (reasonLen > 0)
+    is->readBytes((uint8_t*)&reason[0], reasonLen);
+  is->clearRestorePoint();
+
+  handler->tight13FileUploadCancel(reason);
+  return true;
+}
+
+bool CMsgReader::readTight13FileDownloadFailed()
+{
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+  is->skip(1);
+  uint16_t reasonLen = is->readU16();
+
+  if (!is->hasDataOrRestore(reasonLen))
+    return false;
+
+  std::string reason(reasonLen, '\0');
+  if (reasonLen > 0)
+    is->readBytes((uint8_t*)&reason[0], reasonLen);
+  is->clearRestorePoint();
+
+  handler->tight13FileDownloadFailed(reason);
+  return true;
+}
+
+bool CMsgReader::readTight2Message()
+{
+  if (!is->hasData(3))
+    return false;
+
+  is->setRestorePoint();
+
+  uint8_t b1 = is->readU8();
+  uint8_t b2 = is->readU8();
+  uint8_t b3 = is->readU8();
+  uint32_t msgId = ((uint32_t)msgTypeTightExt << 24) |
+                   ((uint32_t)b1 << 16) |
+                   ((uint32_t)b2 << 8) |
+                   (uint32_t)b3;
+
+  switch (msgId) {
+  case tight2CompressionSupportReply: {
+    if (!is->hasDataOrRestore(1))
+      return false;
+    uint8_t supported = is->readU8();
+    is->clearRestorePoint();
+    handler->tight2CompressionSupportReply(supported != 0);
+    return true;
+  }
+
+  case tight2FileListReply:
+  case tight2DownloadDataReply: {
+    if (!is->hasDataOrRestore(1 + 4 + 4))
+      return false;
+
+    uint8_t level = is->readU8();
+    uint32_t csize = is->readU32();
+    uint32_t usize = is->readU32();
+
+    if (csize > maxFileTransferPayload || usize > maxFileTransferPayload) {
+      is->clearRestorePoint();
+      throw protocol_error(_("TightVNC file transfer block is too large"));
+    }
+
+    if (!is->hasDataOrRestore(csize))
+      return false;
+
+    std::vector<uint8_t> raw(csize);
+    if (csize > 0)
+      is->readBytes(raw.data(), csize);
+
+    is->clearRestorePoint();
+
+    std::vector<uint8_t> block;
+    if (level != 0 && csize != usize)
+      block = inflateTightBlock(raw.data(), raw.size(), usize);
+    else
+      block.swap(raw);
+
+    if (msgId == tight2DownloadDataReply) {
+      handler->tight2DownloadDataReply(block.empty() ? nullptr : block.data(),
+                                       block.size());
+      return true;
+    }
+
+    std::vector<FileEntry> entries;
+    if (block.size() >= 4) {
+      uint32_t count = readBE32FromBuf(block.data());
+      size_t off = 4;
+      if (count > 1000000)
+        throw protocol_error(_("Too many entries in TightVNC file list"));
+      entries.reserve(count);
+      for (uint32_t i = 0; i < count; i++) {
+        if (off + 8 + 8 + 2 + 4 > block.size())
+          throw protocol_error(_("Truncated TightVNC file list entry"));
+        FileEntry entry;
+        entry.size = readBE64FromBuf(block.data() + off);
+        off += 8;
+        uint64_t mtimeMs = readBE64FromBuf(block.data() + off);
+        off += 8;
+        uint16_t flags = readBE16FromBuf(block.data() + off);
+        off += 2;
+        uint32_t nameLen = readBE32FromBuf(block.data() + off);
+        off += 4;
+        if (nameLen > block.size() - off)
+          throw protocol_error(_("Truncated TightVNC file name"));
+        entry.name.assign((const char*)block.data() + off, nameLen);
+        off += nameLen;
+        while (!entry.name.empty() && entry.name.back() == '\0')
+          entry.name.pop_back();
+        entry.mtime = (int64_t)(mtimeMs / 1000ULL);
+        entry.isDir = (flags & tight2FlagDir) != 0;
+        entry.isExecutable = (flags & tight2FlagExec) != 0;
+        entries.push_back(entry);
+      }
+    }
+    handler->tight2FileListReply(entries);
+    return true;
+  }
+
+  case tight2Md5Reply: {
+    if (!is->hasDataOrRestore(16))
+      return false;
+    uint8_t digest[16];
+    is->readBytes(digest, 16);
+    is->clearRestorePoint();
+    handler->tight2Md5Reply(digest);
+    return true;
+  }
+
+  case tight2UploadStartReply:
+    is->clearRestorePoint();
+    handler->tight2UploadStartReply();
+    return true;
+
+  case tight2UploadDataReply:
+    is->clearRestorePoint();
+    handler->tight2UploadDataReply();
+    return true;
+
+  case tight2UploadEndReply:
+    is->clearRestorePoint();
+    handler->tight2UploadEndReply();
+    return true;
+
+  case tight2DownloadStartReply:
+    is->clearRestorePoint();
+    handler->tight2DownloadStartReply();
+    return true;
+
+  case tight2DownloadEndReply: {
+    if (!is->hasDataOrRestore(1 + 8))
+      return false;
+    uint8_t flags = is->readU8();
+    uint64_t modTimeMs = readU64(is);
+    is->clearRestorePoint();
+    handler->tight2DownloadEndReply(flags, modTimeMs);
+    return true;
+  }
+
+  case tight2MkdirReply:
+    is->clearRestorePoint();
+    handler->tight2MkdirReply();
+    return true;
+
+  case tight2RemoveReply:
+    is->clearRestorePoint();
+    handler->tight2RemoveReply();
+    return true;
+
+  case tight2RenameReply:
+    is->clearRestorePoint();
+    handler->tight2RenameReply();
+    return true;
+
+  case tight2DirSizeReply: {
+    if (!is->hasDataOrRestore(8))
+      return false;
+    uint64_t dirSize = readU64(is);
+    is->clearRestorePoint();
+    handler->tight2DirSizeReply(dirSize);
+    return true;
+  }
+
+  case tight2LastRequestFailedReply: {
+    if (!is->hasDataOrRestore(4))
+      return false;
+    uint32_t msgLen = is->readU32();
+    if (msgLen > maxFileTransferPayload) {
+      is->clearRestorePoint();
+      throw protocol_error(_("TightVNC error message is too large"));
+    }
+    if (!is->hasDataOrRestore(msgLen))
+      return false;
+    std::string msg(msgLen, '\0');
+    if (msgLen > 0)
+      is->readBytes((uint8_t*)&msg[0], msgLen);
+    is->clearRestorePoint();
+    while (!msg.empty() && msg.back() == '\0')
+      msg.pop_back();
+    handler->tight2LastRequestFailedReply(msg);
+    return true;
+  }
+
+  default:
+    is->clearRestorePoint();
+    throw protocol_error(
+      core::format(_("Unknown TightVNC extension message 0x%08x"), msgId));
+  }
 }

@@ -190,6 +190,37 @@ Emulate middle mouse button by pressing left and right mouse buttons
 simultaneously. Default is off.
 .
 .TP
+.B \-FtpBindAddress \fIaddress\fP
+Specify the local address the embedded FTP bridge listens on. Default is
+\fB127.0.0.1\fP.
+.
+.TP
+.B \-FtpPassword \fIpassword\fP
+Require this password when logging in to the embedded FTP bridge. By default
+no password check is enforced.
+.
+.TP
+.B \-FtpPort \fIport\fP
+Specify the TCP port the embedded FTP bridge listens on (0 chooses an
+ephemeral port automatically). Default is 2121.
+.
+.TP
+.B \-FtpProtocol \fIprotocol\fP
+Force a specific RFB file transfer protocol instead of automatic negotiation.
+Valid values are \fBAuto\fP, \fBTight2\fP, \fBTight13\fP, and \fBUltra\fP.
+Default is \fBAuto\fP.
+.
+.TP
+.B \-FtpServer
+Enable an embedded FTP server inside \fBvncviewer\fP that bridges FTP commands
+to the remote server's RFB file transfer extension. Default is off.
+.
+.TP
+.B \-FtpUsername \fIusername\fP
+Require this username when logging in to the embedded FTP bridge. By default
+any username is accepted.
+.
+.TP
 .B \-FullColor, \-FullColour
 Tells the VNC server to send full-color pixels in the best format for this
 display.  This is default.
@@ -309,9 +340,9 @@ window changes. Note that this may not work with all VNC servers.
 .B \-SecurityTypes \fIsec-types\fP
 Specify which security schemes to attempt to use when authenticating with
 the server.  Valid values are a comma separated list of \fBNone\fP,
-\fBVncAuth\fP, \fBPlain\fP, \fBTLSNone\fP, \fBTLSVnc\fP, \fBTLSPlain\fP,
-\fBX509None\fP, \fBX509Vnc\fP, \fBX509Plain\fP, \fBRA2\fP, \fBRA2ne\fP,
-\fBRA2_256\fP and \fBRA2ne_256\fP. Default is to attempt
+\fBVncAuth\fP, \fBPlain\fP, \fBTight\fP, \fBTLSNone\fP, \fBTLSVnc\fP,
+\fBTLSPlain\fP, \fBX509None\fP, \fBX509Vnc\fP, \fBX509Plain\fP, \fBRA2\fP,
+\fBRA2ne\fP, \fBRA2_256\fP and \fBRA2ne_256\fP. Default is to attempt
 every supported scheme. 
 .
 .TP
