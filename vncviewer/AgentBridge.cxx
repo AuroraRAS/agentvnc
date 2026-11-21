@@ -45,6 +45,7 @@
 #include <core/LogWriter.h>
 #include <core/i18n.h>
 #include <core/string.h>
+#include <rfb/fileTransferTypes.h>
 
 #include "AgentBridge.h"
 #include "CConn.h"
@@ -844,6 +845,29 @@ void AgentBridge::handleRequest(const InboundRequest& req)
     int64_t lastHumanMs = conn_ ? conn_->getLastHumanInputMs() : 0;
     std::string pauseReason = conn_ ? conn_->getAgentPauseReason() : std::string();
     size_t pendingMsgs = conn_ ? conn_->getPendingUserMessageCount() : 0;
+    bool ftpEnabled = (bool)::ftpServer;
+    bool ftpRunning = conn_ && conn_->isFtpServerRunning();
+    std::string ftpUrl = ftpRunning ? conn_->ftpServerUrl() : std::string();
+    bool ftpSupported = conn_ && conn_->fileTransferClient().isSupported();
+    bool ftpReady = ftpRunning && ftpSupported;
+    const char* ftpProtocolStr = "none";
+    if (conn_) {
+      switch (conn_->fileTransferClient().caps().protocol) {
+      case rfb::FileTransferProtocol::Tight2:
+        ftpProtocolStr = "Tight2";
+        break;
+      case rfb::FileTransferProtocol::Tight13:
+        ftpProtocolStr = "Tight13";
+        break;
+      case rfb::FileTransferProtocol::Ultra:
+        ftpProtocolStr = "Ultra";
+        break;
+      case rfb::FileTransferProtocol::Unsupported:
+      default:
+        ftpProtocolStr = "none";
+        break;
+      }
+    }
 
     std::string fields = core::format(
       "\"connected\":%s,\"ready\":%s,\"headless\":%s,\"view_only\":%s,"
@@ -853,7 +877,9 @@ void AgentBridge::handleRequest(const InboundRequest& req)
       "\"pending_user_messages\":%llu,"
       "\"width\":%d,\"height\":%d,\"desktop_name\":%s,"
       "\"frame_seq\":%llu,\"damage_count\":%llu,\"resize_count\":%llu,"
-      "\"last_update_ms\":%lld,\"updating\":%s,\"has_clipboard\":%s",
+      "\"last_update_ms\":%lld,\"updating\":%s,\"has_clipboard\":%s,"
+      "\"ftp_enabled\":%s,\"ftp_running\":%s,\"ftp_url\":%s,"
+      "\"ftp_supported\":%s,\"ftp_ready\":%s,\"ftp_protocol\":%s",
       connected ? "true" : "false",
       ready ? "true" : "false",
       (bool)headless ? "true" : "false",
@@ -872,7 +898,13 @@ void AgentBridge::handleRequest(const InboundRequest& req)
       (unsigned long long)resizeCount,
       (long long)lastUpdateMs,
       updating ? "true" : "false",
-      hasClipboard ? "true" : "false");
+      hasClipboard ? "true" : "false",
+      ftpEnabled ? "true" : "false",
+      ftpRunning ? "true" : "false",
+      jsonEscape(ftpUrl).c_str(),
+      ftpSupported ? "true" : "false",
+      ftpReady ? "true" : "false",
+      jsonEscape(ftpProtocolStr).c_str());
 
     enqueueResponse(req.clientId,
                     buildJsonResponse(true, cmd, idVal, fields),
