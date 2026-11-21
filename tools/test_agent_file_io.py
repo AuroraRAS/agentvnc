@@ -89,15 +89,21 @@ class MockFtpServer:
     def _send_line(sock: socket.socket, text: str) -> None:
         sock.sendall((text + "\r\n").encode("utf-8"))
 
+    def _resolve_ci_dir(self, norm_dir: str) -> Optional[str]:
+        if norm_dir in self.dirs:
+            return norm_dir
+        return next((d for d in self.dirs if d.lower() == norm_dir.lower()), None)
+
     def _list_entries(self, norm_dir: str) -> Optional[List[Tuple[str, bool, int]]]:
         with self.lock:
-            if norm_dir not in self.dirs:
+            resolved_dir = self._resolve_ci_dir(norm_dir)
+            if resolved_dir is None:
                 return None
             out: List[Tuple[str, bool, int]] = []
-            prefix = "/" if norm_dir == "/" else norm_dir + "/"
+            prefix = "/" if resolved_dir == "/" else resolved_dir + "/"
             seen = set()
             for d in self.dirs:
-                if d == norm_dir or not d.startswith(prefix):
+                if d == resolved_dir or not d.startswith(prefix):
                     continue
                 rest = d[len(prefix) :]
                 if "/" not in rest and rest not in seen:
@@ -113,14 +119,18 @@ class MockFtpServer:
             return out
 
     def _stat_entry(self, norm_path: str) -> Tuple[Optional[bool], Optional[int], bool]:
-        """Returns (is_dir or None if not found, size, parent_exists)."""
-        with self.lock:
-            if norm_path in self.dirs:
-                return True, 0, True
-            if norm_path in self.files:
-                return False, len(self.files[norm_path]), True
-            parent = posixpath.dirname(norm_path) or "/"
-            return None, None, (parent in self.dirs)
+        """Match FtpServer: list parent dir (CI-resolved) and exact-match base name."""
+        if norm_path == "/":
+            return True, 0, True
+        parent = posixpath.dirname(norm_path) or "/"
+        base = posixpath.basename(norm_path)
+        entries = self._list_entries(parent)
+        if entries is None:
+            return None, None, False
+        for name, is_dir, size in entries:
+            if name == base:
+                return is_dir, size, True
+        return None, None, True
 
     def _handle_client(self, ctrl: socket.socket) -> None:
         ctrl.settimeout(2.0)
@@ -341,12 +351,18 @@ class MockFtpServer:
                 elif cmd == "MKD":
                     target = agent_mod.normalize_remote_path(arg)
                     parent = posixpath.dirname(target) or "/"
+                    base = posixpath.basename(target)
                     with self.lock:
-                        if target in self.dirs or target in self.files or parent not in self.dirs:
+                        resolved_parent = self._resolve_ci_dir(parent)
+                        ci_dir = self._resolve_ci_dir(target)
+                        if ci_dir is not None:
+                            self._send_line(ctrl, "550 Directory already exists")
+                        elif target in self.files or resolved_parent is None:
                             self._send_line(ctrl, "550 Cannot create directory.")
                         else:
-                            self.dirs.add(target)
-                            self._send_line(ctrl, f'257 "{target}" created')
+                            canonical = f"/{base}" if resolved_parent == "/" else f"{resolved_parent}/{base}"
+                            self.dirs.add(canonical)
+                            self._send_line(ctrl, f'257 "{canonical}" created')
                 elif cmd == "DELE":
                     target = agent_mod.normalize_remote_path(arg)
                     with self.lock:
@@ -566,6 +582,14 @@ class AgentFileIoUnitTests(unittest.TestCase):
                     create_parents=True,
                 )
                 self.assertEqual(client.read_file("/C:/Temp/deep/nested/file.txt")["content"], "deep!")
+
+                # Windows-style case-insensitive existing parent directory (e.g. WINDOWS vs Windows)
+                with srv.lock:
+                    srv.dirs.add("/C:/WINDOWS")
+                    srv.dirs.add("/C:/WINDOWS/Temp")
+                mk_ci = client.mkdir("/C:/Windows/Temp/ci_subdir", parents=True)
+                self.assertEqual(mk_ci["created"], ["/C:/Windows/Temp/ci_subdir"])
+                self.assertTrue(client.stat("/C:/WINDOWS/Temp/ci_subdir")["exists"])
 
                 # binary + chunked read with early close 426 recovery on same connection
                 blob = bytes((i * 13 + 7) % 256 for i in range(40000))

@@ -1019,6 +1019,13 @@ class VncFtpClient:
                 )
         return result
 
+    def _is_existing_dir(self, norm_path: str) -> bool:
+        try:
+            self.list_dir(norm_path, max_entries=1)
+            return True
+        except Exception:
+            return False
+
     def mkdir(self, path: str, parents: bool = True) -> Dict[str, Any]:
         norm = normalize_remote_path(path)
         if norm == "/" or is_windows_drive_root(norm):
@@ -1037,8 +1044,14 @@ class VncFtpClient:
                     if st.get("type") != "dir":
                         raise FileExistsError(f"Path exists and is not a directory: {cur}")
                     continue
-                self._run_with_retry(lambda ftp, target=cur: ftp.mkd(target), idempotent=False)
-                created.append(cur)
+                try:
+                    self._run_with_retry(lambda ftp, target=cur: ftp.mkd(target), idempotent=False)
+                    created.append(cur)
+                except ftplib.error_perm as exc:
+                    msg = str(exc).lower()
+                    if "exist" in msg and self._is_existing_dir(cur):
+                        continue
+                    raise
         else:
             self._run_with_retry(lambda ftp: ftp.mkd(norm), idempotent=False)
             created.append(norm)
