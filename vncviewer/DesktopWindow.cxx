@@ -482,8 +482,10 @@ void DesktopWindow::draw()
 #endif
 
   // Active area inside scrollbars
-  W = w() - (vscroll->visible() ? vscroll->w() : 0);
-  H = h() - (hscroll->visible() ? hscroll->h() : 0);
+  const int activeW = w() - (vscroll->visible() ? vscroll->w() : 0);
+  const int activeH = h() - (hscroll->visible() ? hscroll->h() : 0);
+  W = activeW;
+  H = activeH;
 
   // Full redraw?
   redraw = (damage() & ~FL_DAMAGE_CHILD);
@@ -549,11 +551,11 @@ void DesktopWindow::draw()
 
     if (agentHudSurface) {
       int bx = 16;
-      int by = H - agentHudSurface->height() - 16;
+      int by = activeH - agentHudSurface->height() - 16;
       if (by < 8)
         by = 8;
-      if (bx + agentHudSurface->width() > W - 8)
-        bx = std::max(8, W - agentHudSurface->width() - 8);
+      if (bx + agentHudSurface->width() > activeW - 8)
+        bx = std::max(8, activeW - agentHudSurface->width() - 8);
       int cx, cy, cw, ch;
       fl_clip_box(bx, by, agentHudSurface->width(), agentHudSurface->height(),
                   cx, cy, cw, ch);
@@ -1594,6 +1596,9 @@ void DesktopWindow::repositionWidgets()
 
   // Scrollbars visbility
 
+  bool hadHScroll = hscroll->visible();
+  bool hadVScroll = vscroll->visible();
+
   if (fullscreen_active()) {
     hscroll->hide();
     vscroll->hide();
@@ -1632,6 +1637,14 @@ void DesktopWindow::repositionWidgets()
   vscroll->resize(w() - Fl::scrollbar_size(), 0,
                   Fl::scrollbar_size(),
                   h() - (hscroll->visible() ? Fl::scrollbar_size() : 0));
+
+  if (agentHudSurface &&
+      ((hscroll->visible() != hadHScroll) ||
+       (vscroll->visible() != hadVScroll))) {
+    if (vscroll->visible() != hadVScroll)
+      rebuildAgentHudSurface();
+    damage(FL_DAMAGE_USER1);
+  }
 
   // Scrollbars range
 
@@ -1943,7 +1956,10 @@ void DesktopWindow::rebuildAgentHudSurface()
         intentCopy[idx] = ' ';
     }
     if (intentCopy.size() > 74) {
-      intentCopy.resize(71);
+      size_t cut = 71;
+      while ((cut > 0) && (((unsigned char)intentCopy[cut] & 0xC0) == 0x80))
+        cut--;
+      intentCopy.resize(cut);
       intentCopy += "...";
     }
     line1 += " ";
@@ -1976,12 +1992,13 @@ void DesktopWindow::rebuildAgentHudSurface()
   int w1 = 0, h1 = 0, w2 = 0, h2 = 0;
 
   fl_font(FL_HELVETICA_BOLD, font1);
-  fl_measure(line1.c_str(), w1, h1);
+  fl_measure(line1.c_str(), w1, h1, 0);
 
   fl_font(FL_HELVETICA, font2);
-  fl_measure(line2.c_str(), w2, h2);
+  fl_measure(line2.c_str(), w2, h2, 0);
 
-  int maxW = std::max(240, std::min(w() - 32, 640));
+  int activeW = w() - (vscroll->visible() ? vscroll->w() : 0);
+  int maxW = std::max(240, std::min(activeW - 32, 640));
   int cardW = std::min(maxW, std::max(w1, w2) + 28);
   int cardH = h1 + h2 + 20;
 
@@ -1996,15 +2013,21 @@ void DesktopWindow::rebuildAgentHudSurface()
 
   fl_font(FL_HELVETICA_BOLD, font1);
   fl_color(245, 248, 252);
-  fl_draw(line1.c_str(), 12, 6, cardW - 20, h1 + 2, FL_ALIGN_LEFT | FL_ALIGN_CLIP);
+  fl_draw(line1.c_str(), 12, 6, cardW - 20, h1 + 2, FL_ALIGN_LEFT | FL_ALIGN_CLIP, nullptr, 0);
 
   fl_font(FL_HELVETICA, font2);
   fl_color(178, 192, 212);
-  fl_draw(line2.c_str(), 12, 10 + h1, cardW - 20, h2 + 2, FL_ALIGN_LEFT | FL_ALIGN_CLIP);
+  fl_draw(line2.c_str(), 12, 10 + h1, cardW - 20, h2 + 2, FL_ALIGN_LEFT | FL_ALIGN_CLIP, nullptr, 0);
 
   Fl_RGB_Image* rendered = surf->image();
   delete surf;
   Fl_Display_Device::display_device()->set_current();
+
+  if (!rendered || (rendered->w() != cardW) || (rendered->h() != cardH) ||
+      !rendered->data() || !rendered->data()[0]) {
+    delete rendered;
+    return;
+  }
 
   unsigned char* buf = new unsigned char[(size_t)cardW * (size_t)cardH * 4];
   const unsigned char* src = (const unsigned char*)rendered->data()[0];
