@@ -9,19 +9,24 @@ Implements official Gemini Computer Use & Interactions API best practices:
 
 import argparse
 import base64
+import codecs
 import copy
+import ftplib
 import io
 import json
 import os
+import re
 import select
 import shutil
 import signal
+import socket
 import struct
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 import zlib
 from typing import Any, Dict, List, Optional, Tuple
@@ -40,6 +45,13 @@ DEFAULT_VNCVIEWER = os.path.join(REPO_ROOT, "build", "vncviewer", "vncviewer")
 
 THINKING_LEVELS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "default")
 RECOVERY_THINKING_LEVELS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "off")
+FTP_PROTOCOLS: Tuple[str, ...] = ("Auto", "Tight2", "Tight13", "Ultra")
+
+DEFAULT_FILE_READ_MAX_BYTES = 131072
+MAX_FILE_READ_BYTES = 1048576
+MAX_FILE_WRITE_BYTES = 16 * 1024 * 1024
+DEFAULT_FILE_LIST_MAX_ENTRIES = 200
+MAX_FILE_LIST_ENTRIES = 1000
 
 PREDEFINED_DESKTOP_FUNCTIONS: Tuple[str, ...] = (
     "click",
@@ -167,8 +179,142 @@ CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
 ]
 
 CUSTOM_FUNCTION_NAMES = frozenset(d["name"] for d in CUSTOM_FUNCTION_DECLARATIONS)
-READ_ONLY_FUNCTIONS = frozenset(
-    {"take_screenshot", "clipboard_get", "get_desktop_status", "wait", "yield_to_user"}
+
+FILE_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "file_list",
+        "description": (
+            "List files and subdirectories in a remote directory over TigerVNC's RFB file transfer FTP bridge "
+            "without opening a GUI file manager. Returns JSON entries with name, path, type ('file' or 'dir'), "
+            "and optional size/modified timestamp."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "Remote directory path (default '/'). Forward slashes or Windows paths like 'C:\\Users' are accepted.",
+                },
+                "max_entries": {
+                    "type": "integer",
+                    "description": "Maximum number of entries to return (1-1000, default 200).",
+                },
+                "intent": {"type": "string", "description": "Short reason for listing this directory."},
+            },
+        },
+    },
+    {
+        "type": "function",
+        "name": "file_stat",
+        "description": (
+            "Check whether a remote file or directory exists and retrieve its type ('file' or 'dir'), size in bytes, "
+            "and modified timestamp via the FTP bridge."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Remote file or directory path."},
+                "intent": {"type": "string", "description": "Short reason for checking file metadata."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "file_read",
+        "description": (
+            "Read bytes or decoded text directly from a remote file over the FTP bridge without taking a screenshot. "
+            "Supports byte offset and max_bytes chunking for large files, or as_base64=true for binary files."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Remote file path to read."},
+                "encoding": {"type": "string", "description": "Text encoding when as_base64 is false (default 'utf-8')."},
+                "as_base64": {"type": "boolean", "description": "If true, return base64-encoded bytes in content_base64."},
+                "offset": {"type": "integer", "description": "Byte offset to start reading from (default 0)."},
+                "max_bytes": {"type": "integer", "description": "Maximum bytes to read (default 131072, max 1048576)."},
+                "intent": {"type": "string", "description": "Short reason for reading this file."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "file_write",
+        "description": (
+            "Write or append text or binary data directly to a remote file over the FTP bridge without GUI editors. "
+            "Provide either 'content' (text) or 'content_base64' (binary)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Remote destination file path."},
+                "content": {"type": "string", "description": "Text content to write (mutually exclusive with content_base64)."},
+                "content_base64": {
+                    "type": "string",
+                    "description": "Base64-encoded binary content to write (mutually exclusive with content).",
+                },
+                "encoding": {"type": "string", "description": "Text encoding when using content (default 'utf-8')."},
+                "append": {"type": "boolean", "description": "If true, append to existing file instead of overwriting."},
+                "create_parents": {"type": "boolean", "description": "If true, create missing parent directories first."},
+                "intent": {"type": "string", "description": "Short reason for writing this file."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "file_mkdir",
+        "description": "Create a remote directory (and optionally missing parent directories) via the FTP bridge.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Remote directory path to create."},
+                "parents": {"type": "boolean", "description": "If true (default), create missing parent directories."},
+                "intent": {"type": "string", "description": "Short reason for creating this directory."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "file_delete",
+        "description": "Delete a remote file or empty directory via the FTP bridge.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Remote file or empty directory path to delete."},
+                "is_dir": {"type": "boolean", "description": "Set true to delete an empty directory (default false for files)."},
+                "intent": {"type": "string", "description": "Short reason for deleting this path."},
+            },
+            "required": ["path"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "file_rename",
+        "description": "Rename or move a remote file or directory via the FTP bridge.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "from_path": {"type": "string", "description": "Existing remote source path."},
+                "to_path": {"type": "string", "description": "Target remote destination path."},
+                "intent": {"type": "string", "description": "Short reason for renaming/moving."},
+            },
+            "required": ["from_path", "to_path"],
+        },
+    },
+]
+
+FILE_READ_ONLY_FUNCTIONS = frozenset({"file_list", "file_stat", "file_read"})
+FILE_MUTATING_FUNCTIONS = frozenset({"file_write", "file_mkdir", "file_delete", "file_rename"})
+FILE_FUNCTION_NAMES = FILE_READ_ONLY_FUNCTIONS | FILE_MUTATING_FUNCTIONS
+ALL_CUSTOM_FUNCTION_NAMES = CUSTOM_FUNCTION_NAMES | FILE_FUNCTION_NAMES
+READ_ONLY_FUNCTIONS = (
+    frozenset({"take_screenshot", "clipboard_get", "get_desktop_status", "wait", "yield_to_user"})
+    | FILE_READ_ONLY_FUNCTIONS
 )
 
 SYSTEM_INSTRUCTION = """## RULE 1: Seek User Confirmation (USER_CONFIRMATION)
@@ -217,6 +363,13 @@ non-consequential task or encounter a condition defined in Rule 1.
 Write final response to the user in the following cases:
 - User confirmation
 - When the task is complete or you have enough information to respond to the user
+"""
+
+FTP_SYSTEM_INSTRUCTION = """## Direct Remote File I/O Tools (RFB-to-FTP Bridge):
+* **Prefer Direct File Tools:** When reading, writing, creating, inspecting, renaming, or deleting remote files/directories, prefer `file_list`, `file_stat`, `file_read`, `file_write`, `file_mkdir`, `file_delete`, and `file_rename` directly instead of opening GUI editors, file managers, or terminals.
+* **Path Format:** Use `/` separators (e.g. `/tmp/notes.txt` or `/C:/Users/Alice/Desktop/hello.txt`). Windows paths such as `C:\\Users\\Alice\\Desktop\\hello.txt` are also normalized automatically.
+* **Chunked & Binary I/O:** For large files, pass `offset` and `max_bytes` to `file_read`; for binary files, use `as_base64=true` on `file_read` and `content_base64` on `file_write`. Pass `append=true` or `create_parents=true` to `file_write` when appropriate.
+* **Visual Verification When Requested:** Direct file tools return compact JSON without capturing a screenshot; if the task requires confirming a file is visually displayed on the desktop/UI, call `take_screenshot` afterward.
 """
 
 KEY_MAP: Dict[str, int] = {
@@ -386,11 +539,602 @@ class AgentPausedError(RuntimeError):
     """Raised when synthetic input is blocked by operator PAUSE_AGENT."""
 
 
+def normalize_remote_path(path: str) -> str:
+    """Normalize POSIX or Windows remote file paths into canonical FTP paths."""
+    if not isinstance(path, str):
+        raise ValueError("Remote path must be a string")
+    if "\x00" in path or "\r" in path or "\n" in path:
+        raise ValueError("Remote path contains invalid control characters")
+    replaced = path.strip().replace("\\", "/")
+    parts: List[str] = []
+    for seg in replaced.split("/"):
+        if not seg or seg == ".":
+            continue
+        if seg == "..":
+            if parts:
+                parts.pop()
+            continue
+        parts.append(seg)
+    if parts and len(parts[0]) == 2 and parts[0][0].isascii() and parts[0][0].isalpha() and parts[0][1] == ":":
+        parts[0] = parts[0][0].upper() + ":"
+    return "/" if not parts else "/" + "/".join(parts)
+
+
+def is_windows_drive_root(norm_path: str) -> bool:
+    """Return True if norm_path is a top-level Windows drive root like '/C:'."""
+    return (
+        len(norm_path) == 3
+        and norm_path[0] == "/"
+        and norm_path[1].isascii()
+        and norm_path[1].isalpha()
+        and norm_path[2] == ":"
+    )
+
+
+def split_remote_path(norm_path: str) -> Tuple[str, str]:
+    """Split a normalized remote path into (parent_dir, base_name)."""
+    norm = normalize_remote_path(norm_path)
+    if norm == "/":
+        return "/", ""
+    parent, _, name = norm.rpartition("/")
+    return (parent or "/"), name
+
+
+def parse_ftp_url(url: str) -> Tuple[str, int, Optional[str], Optional[str]]:
+    """Parse an ftp:// URL into (host, port, username, password)."""
+    raw = (url or "").strip()
+    if not raw:
+        raise ValueError("FTP URL must not be empty")
+    parsed = urllib.parse.urlsplit(raw)
+    if parsed.scheme.lower() != "ftp" or not parsed.hostname:
+        raise ValueError(f"Invalid FTP URL: {url!r}")
+    port = parsed.port if parsed.port is not None else 2121
+    user = urllib.parse.unquote(parsed.username) if parsed.username is not None else None
+    passwd = urllib.parse.unquote(parsed.password) if parsed.password is not None else None
+    return parsed.hostname, int(port), user, passwd
+
+
+def redact_ftp_url(url: str) -> str:
+    """Redact any embedded password in an FTP URL for logging."""
+    try:
+        parsed = urllib.parse.urlsplit(url)
+        if parsed.password is None:
+            return url
+        host = parsed.hostname or ""
+        if ":" in host:
+            host = f"[{host}]"
+        netloc = f"{host}:{parsed.port}" if parsed.port is not None else host
+        if parsed.username is not None:
+            netloc = f"{parsed.username}:***@{netloc}"
+        else:
+            netloc = f"***@{netloc}"
+        return urllib.parse.urlunsplit((parsed.scheme, netloc, parsed.path, parsed.query, parsed.fragment))
+    except Exception:
+        return url
+
+
+def vncviewer_supports_ftp(vncviewer_bin: str) -> bool:
+    """Return True if the vncviewer binary advertises -FtpServer in --help."""
+    if not vncviewer_bin or not os.path.exists(vncviewer_bin):
+        return False
+    try:
+        proc = subprocess.run(
+            [vncviewer_bin, "--help"],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            text=True,
+            timeout=5.0,
+            check=False,
+        )
+        return "FtpServer" in (proc.stdout or "")
+    except (OSError, subprocess.SubprocessError):
+        return False
+
+
+def discover_ftp_url_from_log(log_path: Optional[str]) -> Optional[str]:
+    """Extract the most recent FTP bridge URL from a vncviewer log file."""
+    if not log_path or not os.path.exists(log_path):
+        return None
+    try:
+        with open(log_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+    except OSError:
+        return None
+    matches = re.findall(r"FTP server listening on (ftp://[^\s]+)", content)
+    return matches[-1] if matches else None
+
+
+def _is_ftp_transient_error(exc: Exception) -> bool:
+    if isinstance(exc, (EOFError, BrokenPipeError, ConnectionResetError, ConnectionAbortedError, TimeoutError)):
+        return True
+    if isinstance(exc, ftplib.error_temp):
+        return str(exc).startswith("421")
+    if isinstance(exc, OSError):
+        return True
+    return False
+
+
+def _parse_mlst_response(resp: str) -> Dict[str, str]:
+    for line in resp.splitlines():
+        if line.startswith(" "):
+            facts_str, _, _ = line[1:].partition(" ")
+            facts: Dict[str, str] = {}
+            for item in facts_str.split(";"):
+                if not item or "=" not in item:
+                    continue
+                k, _, v = item.partition("=")
+                facts[k.strip().lower()] = v.strip()
+            return facts
+    raise ValueError(f"Unexpected MLST response format: {resp!r}")
+
+
+def _parse_list_line(line: str) -> Optional[Tuple[str, Dict[str, str]]]:
+    parts = line.rstrip("\r\n").split(None, 8)
+    if len(parts) < 9:
+        return None
+    perms = parts[0]
+    name = parts[8]
+    if name in (".", ".."):
+        return None
+    facts: Dict[str, str] = {"type": "dir" if perms.startswith("d") else "file"}
+    if not perms.startswith("d") and parts[4].isdigit():
+        facts["size"] = parts[4]
+    return name, facts
+
+
+class VncFtpClient:
+    """Direct remote file I/O client over TigerVNC's embedded -FtpServer bridge."""
+
+    def __init__(
+        self,
+        host: str,
+        port: int,
+        username: str = "",
+        password: str = "",
+        timeout: float = 30.0,
+    ) -> None:
+        self.host = host
+        self.port = int(port)
+        self.username = username
+        self.password = password
+        self.timeout = float(timeout)
+        self._ftp: Optional[ftplib.FTP] = None
+        self._last_activity = 0.0
+        self._is_binary = False
+        self._features: List[str] = []
+
+    def close(self) -> None:
+        ftp = self._ftp
+        self._ftp = None
+        self._is_binary = False
+        if ftp is not None:
+            try:
+                ftp.quit()
+            except Exception:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+
+    def _reset(self) -> None:
+        ftp = self._ftp
+        self._ftp = None
+        self._is_binary = False
+        if ftp is not None:
+            try:
+                ftp.close()
+            except Exception:
+                pass
+
+    def _ensure_connected(self) -> ftplib.FTP:
+        if self._ftp is not None:
+            if (time.monotonic() - self._last_activity) > 5.0:
+                try:
+                    self._ftp.voidcmd("NOOP")
+                    self._last_activity = time.monotonic()
+                except (*ftplib.all_errors, OSError, EOFError):
+                    self._reset()
+
+        if self._ftp is None:
+            ftp = ftplib.FTP(timeout=self.timeout, encoding="utf-8")
+            try:
+                ftp.connect(self.host, self.port, timeout=self.timeout)
+                ftp.set_pasv(True)
+                ftp.login(user=(self.username or "agent"), passwd=(self.password or ""))
+                try:
+                    ftp.sendcmd("OPTS UTF8 ON")
+                except ftplib.error_perm:
+                    pass
+                ftp.voidcmd("TYPE I")
+            except Exception:
+                try:
+                    ftp.close()
+                except Exception:
+                    pass
+                raise
+            self._ftp = ftp
+            self._is_binary = True
+            self._last_activity = time.monotonic()
+
+        return self._ftp
+
+    def _ensure_binary(self, ftp: ftplib.FTP) -> None:
+        if not self._is_binary:
+            ftp.voidcmd("TYPE I")
+            self._is_binary = True
+
+    def _run_with_retry(self, fn: Any, idempotent: bool = True) -> Any:
+        attempts = 2 if idempotent else 1
+        for attempt in range(attempts):
+            ftp = self._ensure_connected()
+            try:
+                res = fn(ftp)
+                self._last_activity = time.monotonic()
+                return res
+            except (*ftplib.all_errors, OSError, EOFError) as exc:
+                if _is_ftp_transient_error(exc):
+                    self._reset()
+                    if attempt + 1 < attempts:
+                        continue
+                raise
+
+    def probe(self) -> Dict[str, Any]:
+        def _do(ftp: ftplib.FTP) -> Dict[str, Any]:
+            features: List[str] = []
+            try:
+                feat_resp = ftp.sendcmd("FEAT")
+                for line in feat_resp.splitlines()[1:-1]:
+                    cleaned = line.strip()
+                    if cleaned:
+                        features.append(cleaned)
+            except ftplib.all_errors:
+                pass
+            self._features = features
+            try:
+                root_list = self._list_dir_impl(ftp, "/", DEFAULT_FILE_LIST_MAX_ENTRIES)
+                return {
+                    "connected": True,
+                    "supported": True,
+                    "features": features,
+                    "root_entries": root_list["entries"],
+                }
+            except ftplib.error_perm as exc:
+                msg = str(exc)
+                if "not supported" in msg.lower():
+                    return {
+                        "connected": True,
+                        "supported": False,
+                        "features": features,
+                        "reason": msg,
+                    }
+                raise
+
+        return self._run_with_retry(_do, idempotent=True)
+
+    def _list_dir_impl(self, ftp: ftplib.FTP, norm: str, limit: int) -> Dict[str, Any]:
+        entries: List[Dict[str, Any]] = []
+        try:
+            raw_items = list(ftp.mlsd(norm))
+            self._is_binary = False
+        except ftplib.error_perm as exc:
+            code = str(exc)[:3]
+            if code not in ("500", "502"):
+                raise
+            lines: List[str] = []
+            ftp.retrlines(f"LIST {norm}", lines.append)
+            self._is_binary = False
+            raw_items = []
+            for line in lines:
+                parsed = _parse_list_line(line)
+                if parsed is not None:
+                    raw_items.append(parsed)
+
+        for name, facts in raw_items:
+            ftype_raw = str(facts.get("type", "")).lower()
+            if ftype_raw in ("cdir", "pdir") or name in (".", ".."):
+                continue
+            is_dir = ftype_raw == "dir"
+            full_path = f"/{name}" if norm == "/" else f"{norm}/{name}"
+            item: Dict[str, Any] = {
+                "name": name,
+                "path": full_path,
+                "type": "dir" if is_dir else "file",
+            }
+            if not is_dir and "size" in facts:
+                try:
+                    item["size"] = int(facts["size"])
+                except ValueError:
+                    pass
+            if "modify" in facts and facts["modify"]:
+                item["modified"] = facts["modify"]
+            entries.append(item)
+
+        entries.sort(key=lambda e: (0 if e["type"] == "dir" else 1, e["name"].lower(), e["name"]))
+        sliced = entries[:limit]
+        return {
+            "status": "ok",
+            "path": norm,
+            "entries": sliced,
+            "returned_entries": len(sliced),
+            "total_entries": len(entries),
+            "truncated": len(entries) > limit,
+        }
+
+    def list_dir(
+        self,
+        path: str = "/",
+        max_entries: int = DEFAULT_FILE_LIST_MAX_ENTRIES,
+    ) -> Dict[str, Any]:
+        norm = normalize_remote_path(path or "/")
+        if isinstance(max_entries, bool):
+            raise ValueError("max_entries must be an integer")
+        limit = max(1, min(int(max_entries), MAX_FILE_LIST_ENTRIES))
+        return self._run_with_retry(
+            lambda ftp: self._list_dir_impl(ftp, norm, limit),
+            idempotent=True,
+        )
+
+    def stat(self, path: str) -> Dict[str, Any]:
+        norm = normalize_remote_path(path)
+        if norm == "/":
+            return {"status": "ok", "path": "/", "exists": True, "type": "dir"}
+
+        def _do(ftp: ftplib.FTP) -> Dict[str, Any]:
+            try:
+                resp = ftp.sendcmd(f"MLST {norm}")
+            except ftplib.error_perm as exc:
+                msg = str(exc).lower()
+                if msg.startswith("550") and any(
+                    tok in msg for tok in ("not found", "cannot find", "no such", "does not exist")
+                ):
+                    return {"status": "ok", "path": norm, "exists": False}
+                raise
+
+            facts = _parse_mlst_response(resp)
+            is_dir = str(facts.get("type", "")).lower() == "dir"
+            res: Dict[str, Any] = {
+                "status": "ok",
+                "path": norm,
+                "exists": True,
+                "type": "dir" if is_dir else "file",
+            }
+            if not is_dir and "size" in facts:
+                try:
+                    res["size"] = int(facts["size"])
+                except ValueError:
+                    pass
+            if "modify" in facts and facts["modify"]:
+                res["modified"] = facts["modify"]
+            return res
+
+        return self._run_with_retry(_do, idempotent=True)
+
+    def read_file(
+        self,
+        path: str,
+        encoding: str = "utf-8",
+        as_base64: bool = False,
+        offset: int = 0,
+        max_bytes: int = DEFAULT_FILE_READ_MAX_BYTES,
+    ) -> Dict[str, Any]:
+        norm = normalize_remote_path(path)
+        if norm == "/" or is_windows_drive_root(norm):
+            raise ValueError(f"Cannot read directory/root path as a file: {norm}")
+        if isinstance(offset, bool) or isinstance(max_bytes, bool):
+            raise ValueError("offset and max_bytes must be integers")
+        offset = int(offset)
+        max_bytes = int(max_bytes)
+        if offset < 0:
+            raise ValueError("offset must be >= 0")
+        if max_bytes < 1:
+            raise ValueError("max_bytes must be >= 1")
+        limit = min(max_bytes, MAX_FILE_READ_BYTES)
+        if not as_base64:
+            codecs.lookup(encoding)
+
+        st = self.stat(norm)
+        if not st.get("exists"):
+            raise FileNotFoundError(f"Remote file not found: {norm}")
+        if st.get("type") == "dir":
+            raise IsADirectoryError(f"Remote path is a directory: {norm}")
+        total_size = st.get("size")
+        if total_size is not None and offset >= int(total_size):
+            empty_res: Dict[str, Any] = {
+                "status": "ok",
+                "path": norm,
+                "offset": offset,
+                "bytes_read": 0,
+                "total_size": int(total_size),
+                "truncated": False,
+                "eof": True,
+            }
+            if as_base64:
+                empty_res["encoding"] = "base64"
+                empty_res["content_base64"] = ""
+            else:
+                empty_res["encoding"] = encoding
+                empty_res["content"] = ""
+            return empty_res
+
+        def _do(ftp: ftplib.FTP) -> Tuple[bytes, bool]:
+            self._ensure_binary(ftp)
+            conn = ftp.transfercmd(f"RETR {norm}", rest=(offset if offset > 0 else None))
+            buf = bytearray()
+            try:
+                while len(buf) <= limit:
+                    want = min(65536, limit + 1 - len(buf))
+                    chunk = conn.recv(want)
+                    if not chunk:
+                        break
+                    buf.extend(chunk)
+            finally:
+                try:
+                    conn.close()
+                except OSError:
+                    pass
+
+            truncated_local = len(buf) > limit
+            try:
+                ftp.voidresp()
+            except ftplib.error_temp as exc:
+                if truncated_local and str(exc).startswith("426"):
+                    pass
+                else:
+                    raise
+            except (EOFError, OSError, TimeoutError):
+                self._reset()
+                if not truncated_local:
+                    raise
+
+            return bytes(buf[:limit]), truncated_local
+
+        raw, truncated = self._run_with_retry(_do, idempotent=True)
+        eof = not truncated
+        if total_size is not None and (offset + len(raw)) >= int(total_size):
+            eof = True
+
+        result: Dict[str, Any] = {
+            "status": "ok",
+            "path": norm,
+            "offset": offset,
+            "bytes_read": len(raw),
+            "truncated": truncated,
+            "eof": eof,
+        }
+        if total_size is not None:
+            result["total_size"] = int(total_size)
+
+        if as_base64:
+            result["encoding"] = "base64"
+            result["content_base64"] = base64.b64encode(raw).decode("ascii")
+        else:
+            result["encoding"] = encoding
+            try:
+                result["content"] = raw.decode(encoding)
+            except UnicodeDecodeError:
+                result["content"] = raw.decode(encoding, errors="replace")
+                result["had_decode_errors"] = True
+                result["note"] = (
+                    "Some bytes could not be decoded cleanly; retry with as_base64=true for binary files."
+                )
+        return result
+
+    def mkdir(self, path: str, parents: bool = True) -> Dict[str, Any]:
+        norm = normalize_remote_path(path)
+        if norm == "/" or is_windows_drive_root(norm):
+            raise ValueError(f"Cannot create root/drive directory: {norm}")
+
+        created: List[str] = []
+        if parents:
+            segs = norm.strip("/").split("/")
+            cur = ""
+            for seg in segs:
+                cur = f"{cur}/{seg}"
+                if is_windows_drive_root(cur):
+                    continue
+                st = self.stat(cur)
+                if st.get("exists"):
+                    if st.get("type") != "dir":
+                        raise FileExistsError(f"Path exists and is not a directory: {cur}")
+                    continue
+                self._run_with_retry(lambda ftp, target=cur: ftp.mkd(target), idempotent=False)
+                created.append(cur)
+        else:
+            self._run_with_retry(lambda ftp: ftp.mkd(norm), idempotent=False)
+            created.append(norm)
+
+        return {"status": "ok", "path": norm, "created": created}
+
+    def write_file(
+        self,
+        path: str,
+        content: Optional[str] = None,
+        content_base64: Optional[str] = None,
+        encoding: str = "utf-8",
+        append: bool = False,
+        create_parents: bool = False,
+    ) -> Dict[str, Any]:
+        norm = normalize_remote_path(path)
+        if norm == "/" or is_windows_drive_root(norm):
+            raise ValueError(f"Cannot write to directory/root path: {norm}")
+        if (content is None) == (content_base64 is None):
+            raise ValueError("Provide exactly one of 'content' or 'content_base64'")
+
+        if content_base64 is not None:
+            if not isinstance(content_base64, str):
+                raise ValueError("content_base64 must be a string")
+            raw = base64.b64decode(content_base64, validate=True)
+        else:
+            codecs.lookup(encoding)
+            raw = str(content).encode(encoding)
+
+        if len(raw) > MAX_FILE_WRITE_BYTES:
+            raise ValueError(
+                f"Write payload ({len(raw)} bytes) exceeds MAX_FILE_WRITE_BYTES ({MAX_FILE_WRITE_BYTES})"
+            )
+
+        if create_parents:
+            parent, _ = split_remote_path(norm)
+            if parent != "/" and not is_windows_drive_root(parent):
+                self.mkdir(parent, parents=True)
+
+        ftp_cmd = f"APPE {norm}" if append else f"STOR {norm}"
+
+        def _do(ftp: ftplib.FTP) -> None:
+            ftp.storbinary(ftp_cmd, io.BytesIO(raw))
+            self._is_binary = True
+
+        self._run_with_retry(_do, idempotent=(not append))
+        return {
+            "status": "ok",
+            "path": norm,
+            "bytes_written": len(raw),
+            "mode": "append" if append else "overwrite",
+        }
+
+    def delete(self, path: str, is_dir: bool = False) -> Dict[str, Any]:
+        norm = normalize_remote_path(path)
+        if norm == "/" or is_windows_drive_root(norm):
+            raise ValueError(f"Cannot delete root/drive path: {norm}")
+
+        def _do(ftp: ftplib.FTP) -> None:
+            if is_dir:
+                ftp.rmd(norm)
+            else:
+                ftp.delete(norm)
+
+        self._run_with_retry(_do, idempotent=False)
+        return {
+            "status": "ok",
+            "path": norm,
+            "deleted_type": "dir" if is_dir else "file",
+        }
+
+    def rename(self, from_path: str, to_path: str) -> Dict[str, Any]:
+        norm_from = normalize_remote_path(from_path)
+        norm_to = normalize_remote_path(to_path)
+        if norm_from == "/" or is_windows_drive_root(norm_from):
+            raise ValueError(f"Cannot rename root/drive path: {norm_from}")
+        if norm_to == "/" or is_windows_drive_root(norm_to):
+            raise ValueError(f"Invalid target path: {norm_to}")
+
+        self._run_with_retry(
+            lambda ftp: ftp.rename(norm_from, norm_to),
+            idempotent=False,
+        )
+        return {
+            "status": "ok",
+            "from_path": norm_from,
+            "to_path": norm_to,
+        }
+
+
 class VncDesktopExecutor:
     """Executes Gemini ENVIRONMENT_DESKTOP actions against TigerVNC's AgentSocket."""
 
-    def __init__(self, client: AgentClient) -> None:
+    def __init__(self, client: AgentClient, ftp_client: Optional[VncFtpClient] = None) -> None:
         self.client = client
+        self.ftp_client = ftp_client
         self.width = 0
         self.height = 0
         self.button_mask = 0
@@ -982,6 +1726,75 @@ class VncDesktopExecutor:
                 "has_clipboard": bool(st.get("has_clipboard", False)),
             }
 
+        if fname in FILE_FUNCTION_NAMES:
+            if self.ftp_client is None:
+                return {"error": f"Direct file tool {fname!r} is unavailable (FTP bridge not active)."}
+            if fname in FILE_MUTATING_FUNCTIONS:
+                st = self.get_status()
+                if st.get("view_only"):
+                    return {"error": "Viewer is running in ViewOnly mode; file modifications are disabled."}
+                if st.get("agent_paused"):
+                    raise AgentPausedError("Agent input is paused by operator")
+
+            if fname == "file_list":
+                path_arg = "/" if args.get("path") is None else str(args["path"])
+                max_entries = (
+                    DEFAULT_FILE_LIST_MAX_ENTRIES
+                    if args.get("max_entries") is None
+                    else int(args["max_entries"])
+                )
+                return self.ftp_client.list_dir(path=path_arg, max_entries=max_entries)
+            if fname == "file_stat":
+                if args.get("path") is None:
+                    raise ValueError("file_stat requires 'path'")
+                return self.ftp_client.stat(str(args["path"]))
+            if fname == "file_read":
+                if args.get("path") is None:
+                    raise ValueError("file_read requires 'path'")
+                return self.ftp_client.read_file(
+                    path=str(args["path"]),
+                    encoding=str(args.get("encoding") or "utf-8"),
+                    as_base64=bool(args.get("as_base64", False)),
+                    offset=0 if args.get("offset") is None else int(args["offset"]),
+                    max_bytes=(
+                        DEFAULT_FILE_READ_MAX_BYTES
+                        if args.get("max_bytes") is None
+                        else int(args["max_bytes"])
+                    ),
+                )
+            if fname == "file_write":
+                if args.get("path") is None:
+                    raise ValueError("file_write requires 'path'")
+                return self.ftp_client.write_file(
+                    path=str(args["path"]),
+                    content=args.get("content"),
+                    content_base64=args.get("content_base64"),
+                    encoding=str(args.get("encoding") or "utf-8"),
+                    append=bool(args.get("append", False)),
+                    create_parents=bool(args.get("create_parents", False)),
+                )
+            if fname == "file_mkdir":
+                if args.get("path") is None:
+                    raise ValueError("file_mkdir requires 'path'")
+                return self.ftp_client.mkdir(
+                    path=str(args["path"]),
+                    parents=(True if args.get("parents") is None else bool(args["parents"])),
+                )
+            if fname == "file_delete":
+                if args.get("path") is None:
+                    raise ValueError("file_delete requires 'path'")
+                return self.ftp_client.delete(
+                    path=str(args["path"]),
+                    is_dir=bool(args.get("is_dir", False)),
+                )
+            if fname == "file_rename":
+                if args.get("from_path") is None or args.get("to_path") is None:
+                    raise ValueError("file_rename requires 'from_path' and 'to_path'")
+                return self.ftp_client.rename(
+                    from_path=str(args["from_path"]),
+                    to_path=str(args["to_path"]),
+                )
+
         if fname == "yield_to_user":
             reason = str(args.get("reason", "Agent requested human assistance")).strip()
             if not reason:
@@ -1164,6 +1977,7 @@ def build_tools_config(
     strict_safety: bool,
     excluded_actions: List[str],
     enable_custom_tools: bool,
+    enable_file_tools: bool = False,
 ) -> List[Dict[str, Any]]:
     cu_cfg: Dict[str, Any] = {
         "type": "computer_use",
@@ -1178,6 +1992,8 @@ def build_tools_config(
     tools: List[Dict[str, Any]] = [cu_cfg]
     if enable_custom_tools:
         tools.extend(copy.deepcopy(CUSTOM_FUNCTION_DECLARATIONS))
+    if enable_file_tools:
+        tools.extend(copy.deepcopy(FILE_FUNCTION_DECLARATIONS))
     return tools
 
 
@@ -1311,6 +2127,9 @@ def run_agent(args: argparse.Namespace) -> int:
     temp_dir: Optional[str] = None
     viewer_proc: Optional[subprocess.Popen] = None
     viewer_log: Optional[Any] = None
+    viewer_log_path: Optional[str] = None
+    ftp_client: Optional[VncFtpClient] = None
+    spawned_ftp = False
     socket_path = args.socket
     collaborate_mode = bool(args.collaborate)
 
@@ -1345,6 +2164,30 @@ def run_agent(args: argparse.Namespace) -> int:
                 cmd.append("-Headless")
             if args.collaborate:
                 cmd.append("-AgentCollaborate")
+            if not args.no_ftp and not args.ftp_url:
+                supports_ftp_flag = vncviewer_supports_ftp(args.vncviewer_bin)
+                if args.ftp and not supports_ftp_flag:
+                    raise RuntimeError(
+                        f"vncviewer binary {args.vncviewer_bin!r} does not support -FtpServer "
+                        "(pass --ftp-url or build from draft-full/draft-ftp)."
+                    )
+                if supports_ftp_flag:
+                    cmd.extend(
+                        [
+                            "-FtpServer",
+                            "-FtpBindAddress",
+                            args.ftp_bind_address,
+                            "-FtpPort",
+                            str(args.ftp_port),
+                            "-FtpProtocol",
+                            args.ftp_protocol,
+                        ]
+                    )
+                    if args.ftp_username:
+                        cmd.extend(["-FtpUsername", args.ftp_username])
+                    if args.ftp_password:
+                        cmd.extend(["-FtpPassword", args.ftp_password])
+                    spawned_ftp = True
             cmd.append(args.vnc_host)
             mode_label = "collaborative windowed" if args.collaborate else ("windowed" if windowed else "headless")
             print(f"Starting {mode_label} vncviewer -> {args.vnc_host} (socket={socket_path})")
@@ -1366,20 +2209,6 @@ def run_agent(args: argparse.Namespace) -> int:
         excluded_actions = parse_excluded_actions(getattr(args, "exclude_actions", None))
         enable_custom_tools = not bool(getattr(args, "no_custom_tools", False))
 
-        tools = build_tools_config(
-            strict_safety=bool(args.strict_safety),
-            excluded_actions=excluded_actions,
-            enable_custom_tools=enable_custom_tools,
-        )
-
-        llm = InteractionsClient(
-            api_key=api_key,
-            model=args.model,
-            tools=tools,
-            system_instruction=SYSTEM_INSTRUCTION,
-            generation_config=({"thinking_level": base_thinking_level} if base_thinking_level else None),
-        )
-
         with AgentClient(socket_path, timeout=15.0) as vnc_client:
             executor = VncDesktopExecutor(vnc_client)
             status = executor.wait_ready(timeout=15.0)
@@ -1389,9 +2218,115 @@ def run_agent(args: argparse.Namespace) -> int:
                 f"Connected to VNC desktop: {status['width']}x{status['height']} "
                 f"({status.get('desktop_name', '')})"
             )
+
+            ftp_active = False
+            ftp_display_url = ""
+            system_instruction = SYSTEM_INSTRUCTION
+            if not args.no_ftp:
+                ftp_url: Optional[str] = args.ftp_url
+                if not ftp_url:
+                    if status.get("ftp_running") and status.get("ftp_url"):
+                        ftp_url = str(status["ftp_url"])
+                    elif spawned_ftp:
+                        ftp_url = discover_ftp_url_from_log(viewer_log_path)
+                        if not ftp_url:
+                            ftp_deadline = time.monotonic() + 2.0
+                            while time.monotonic() < ftp_deadline:
+                                status = executor.get_status()
+                                if status.get("ftp_running") and status.get("ftp_url"):
+                                    ftp_url = str(status["ftp_url"])
+                                    break
+                                ftp_url = discover_ftp_url_from_log(viewer_log_path)
+                                if ftp_url:
+                                    break
+                                time.sleep(0.1)
+
+                if ftp_url:
+                    if status.get("ftp_running") and not status.get("ftp_ready", True):
+                        ready_deadline = time.monotonic() + 2.0
+                        while time.monotonic() < ready_deadline:
+                            status = executor.get_status()
+                            if status.get("ftp_ready") or not status.get("ftp_running"):
+                                break
+                            time.sleep(0.1)
+
+                    ftp_host, ftp_port_num, url_user, url_pass = parse_ftp_url(ftp_url)
+                    ftp_user = args.ftp_username if args.ftp_username else (url_user or "")
+                    ftp_pass = args.ftp_password if args.ftp_password else (url_pass or "")
+                    ftp_client = VncFtpClient(
+                        host=ftp_host,
+                        port=ftp_port_num,
+                        username=ftp_user,
+                        password=ftp_pass,
+                        timeout=args.ftp_timeout,
+                    )
+                    probe_deadline = time.monotonic() + 2.0
+                    probe_res: Optional[Dict[str, Any]] = None
+                    last_probe_err: Optional[Exception] = None
+                    while True:
+                        try:
+                            probe_res = ftp_client.probe()
+                            break
+                        except Exception as exc:
+                            last_probe_err = exc
+                            ftp_client._reset()
+                            if time.monotonic() >= probe_deadline:
+                                break
+                            time.sleep(0.15)
+
+                    if probe_res is None:
+                        ftp_client.close()
+                        ftp_client = None
+                        if args.ftp:
+                            raise RuntimeError(
+                                f"Failed to probe FTP bridge at {redact_ftp_url(ftp_url)}: {last_probe_err}"
+                            )
+                        print(f"  [WARN] FTP bridge probe failed ({last_probe_err}); direct file tools disabled.")
+                    elif probe_res.get("supported"):
+                        ftp_active = True
+                        ftp_display_url = redact_ftp_url(ftp_url)
+                        executor.ftp_client = ftp_client
+                        system_instruction = SYSTEM_INSTRUCTION + "\n" + FTP_SYSTEM_INSTRUCTION
+                        root_entries = probe_res.get("root_entries") or []
+                        if root_entries:
+                            summary = ", ".join(
+                                f"{e['path']} ({e['type']})" for e in root_entries[:20]
+                            )
+                            system_instruction += f"\nDetected remote root entries: {summary}\n"
+                    else:
+                        ftp_client.close()
+                        ftp_client = None
+                        print(
+                            "[INFO] Remote VNC server does not support RFB file transfer; "
+                            "direct file tools disabled."
+                        )
+                elif args.ftp:
+                    raise RuntimeError(
+                        "Direct FTP file tools requested (--ftp) but no FTP bridge was detected "
+                        "(pass --ftp-url or connect to a vncviewer running with -FtpServer)."
+                    )
+
+            enable_file_tools = ftp_active and (enable_custom_tools or bool(args.ftp))
+            tools = build_tools_config(
+                strict_safety=bool(args.strict_safety),
+                excluded_actions=excluded_actions,
+                enable_custom_tools=enable_custom_tools,
+                enable_file_tools=enable_file_tools,
+            )
+
+            llm = InteractionsClient(
+                api_key=api_key,
+                model=args.model,
+                tools=tools,
+                system_instruction=system_instruction,
+                generation_config=({"thinking_level": base_thinking_level} if base_thinking_level else None),
+            )
+
+            ftp_banner = f"on ({ftp_display_url})" if ftp_active else "off"
             print(
                 f"Session config: model={args.model} | thinking={raw_base_thinking} "
                 f"(recovery={raw_rec_thinking}) | custom_tools={'on' if enable_custom_tools else 'off'} "
+                f"| file_tools={'on' if enable_file_tools else 'off'} | ftp={ftp_banner} "
                 f"| excluded={excluded_actions or 'none'} | prompt_injection_detection=on "
                 f"| strict_safety={'on' if args.strict_safety else 'off'} | target={endpoint_desc} "
                 f"({'local/sandboxed' if sandboxed else 'NON-LOOPBACK'})"
@@ -1619,6 +2554,7 @@ def run_agent(args: argparse.Namespace) -> int:
                     batch_had_resize = False
                     any_modifying_action = False
                     any_frame_changed = False
+                    any_file_mutating_success = False
 
                     for idx, fc in enumerate(function_calls):
                         fname = str(fc.get("name", ""))
@@ -1723,8 +2659,9 @@ def run_agent(args: argparse.Namespace) -> int:
                         if action_delay > 0:
                             time.sleep(action_delay)
 
-                        is_modifying = fname not in READ_ONLY_FUNCTIONS
-                        pre_status: Dict[str, Any] = executor.get_status() if is_modifying else {}
+                        is_file_mutating = fname in FILE_MUTATING_FUNCTIONS
+                        is_gui_modifying = (fname not in READ_ONLY_FUNCTIONS) and (not is_file_mutating)
+                        pre_status: Dict[str, Any] = executor.get_status() if is_gui_modifying else {}
 
                         try:
                             exec_res = executor.execute(fname, fc_args, collaborate_mode=collaborate_mode)
@@ -1769,7 +2706,7 @@ def run_agent(args: argparse.Namespace) -> int:
                             batch_had_error = True
                             item_needs_screenshot = True
                         else:
-                            if is_modifying:
+                            if is_gui_modifying:
                                 verify = executor.verify_action_effect(pre_status)
                                 action_result["verification"] = verify
                                 any_modifying_action = True
@@ -1777,10 +2714,12 @@ def run_agent(args: argparse.Namespace) -> int:
                                     any_frame_changed = True
                                 if verify["resized"]:
                                     batch_had_resize = True
+                            elif is_file_mutating:
+                                any_file_mutating_success = True
                             item_needs_screenshot = (
                                 explicit_attach
                                 or collaborator_intervened
-                                or (fname not in CUSTOM_FUNCTION_NAMES)
+                                or (fname not in ALL_CUSTOM_FUNCTION_NAMES)
                             )
 
                         results.append((fname, call_id, action_result, item_needs_screenshot))
@@ -1847,7 +2786,9 @@ def run_agent(args: argparse.Namespace) -> int:
                         post_hdr = executor.get_status()
                         post_b64 = None
 
-                    if any_modifying_action:
+                    if any_file_mutating_success:
+                        consecutive_no_change_turns = 0
+                    elif any_modifying_action:
                         if any_frame_changed:
                             consecutive_no_change_turns = 0
                         else:
@@ -1958,6 +2899,8 @@ def run_agent(args: argparse.Namespace) -> int:
         raise
 
     finally:
+        if ftp_client is not None:
+            ftp_client.close()
         if trace_file:
             trace_file.close()
         if viewer_proc is not None:
@@ -2061,7 +3004,57 @@ def main() -> int:
         default=None,
         help="Delay in seconds after updating the live overlay before executing each action",
     )
+    parser.add_argument(
+        "--ftp",
+        action="store_true",
+        help="Require and enable direct remote file I/O tools via TigerVNC -FtpServer",
+    )
+    parser.add_argument(
+        "--no-ftp",
+        action="store_true",
+        help="Disable direct remote file I/O tools and do not spawn vncviewer with -FtpServer",
+    )
+    parser.add_argument(
+        "--ftp-url",
+        default=None,
+        help="Explicit FTP bridge URL (e.g. ftp://127.0.0.1:2121) for direct remote file I/O",
+    )
+    parser.add_argument(
+        "--ftp-port",
+        type=int,
+        default=0,
+        help="TCP port for spawned vncviewer -FtpPort (default: 0 = auto)",
+    )
+    parser.add_argument(
+        "--ftp-bind-address",
+        default="127.0.0.1",
+        help="Bind address for spawned vncviewer -FtpBindAddress (default: 127.0.0.1)",
+    )
+    parser.add_argument(
+        "--ftp-username",
+        default="",
+        help="Username for authenticating with the TigerVNC -FtpServer bridge",
+    )
+    parser.add_argument(
+        "--ftp-password",
+        default="",
+        help="Password for authenticating with the TigerVNC -FtpServer bridge",
+    )
+    parser.add_argument(
+        "--ftp-protocol",
+        choices=FTP_PROTOCOLS,
+        default="Auto",
+        help="Preferred RFB file transfer protocol passed to vncviewer -FtpProtocol (default: Auto)",
+    )
+    parser.add_argument(
+        "--ftp-timeout",
+        type=float,
+        default=30.0,
+        help="Socket timeout in seconds for direct FTP file operations (default: 30.0)",
+    )
     args = parser.parse_args()
+    if args.ftp and args.no_ftp:
+        parser.error("--ftp and --no-ftp cannot be used together")
     return run_agent(args)
 
 
