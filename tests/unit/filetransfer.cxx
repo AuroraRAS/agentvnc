@@ -40,6 +40,7 @@
 #include <rfb/Exception.h>
 #include <rfb/FileTransferClient.h>
 #include <rfb/PixelBuffer.h>
+#include <rfb/Security.h>
 #include <rfb/TightCapability.h>
 #include <rfb/encodings.h>
 #include <rfb/fileTransferTypes.h>
@@ -251,9 +252,10 @@ public:
 
 class TestCConnection : public rfb::CConnection {
 public:
-  TestCConnection()
+  explicit TestCConnection(bool preferTight = false)
   {
     supportsFileTransfer = true;
+    preferTightForFileTransfer = preferTight;
   }
 
   void initDone() override
@@ -287,6 +289,27 @@ public:
 };
 
 } // namespace
+
+TEST(FileTransferUnit, TightPreferenceRequiresOptIn)
+{
+  const std::string version = "RFB 003.008\n";
+  std::vector<uint8_t> offer(version.begin(), version.end());
+  offer.insert(offer.end(), {2, rfb::secTypeVncAuth, rfb::secTypeTight});
+
+  for (bool preferTight : {false, true}) {
+    rdr::MemInStream in(offer.data(), offer.size());
+    rdr::MemOutStream out;
+    TestCConnection conn(preferTight);
+    conn.setStreams(&in, &out);
+    conn.initialiseProtocol();
+
+    ASSERT_TRUE(conn.processMsg());
+    ASSERT_TRUE(conn.processMsg());
+    ASSERT_EQ(out.length(), version.size() + 1);
+    EXPECT_EQ(out.data()[version.size()],
+              preferTight ? rfb::secTypeTight : rfb::secTypeVncAuth);
+  }
+}
 
 TEST(FileTransferUnit, CSecurityTight_NoTunnelNoAuth_Incremental)
 {
