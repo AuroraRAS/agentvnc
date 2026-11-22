@@ -31,7 +31,7 @@ Surface::Surface(int width, int height) :
 }
 
 Surface::Surface(const Fl_RGB_Image* image) :
-  w(image->w()), h(image->h())
+  w(image->data_w()), h(image->data_h())
 {
   alloc();
   update(image);

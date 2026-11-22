@@ -55,6 +55,13 @@ public:
   int framebufferWidth() const;
   int framebufferHeight() const;
 
+  int phys_x() const { return physX; }
+  int phys_y() const { return physY; }
+  int phys_w() const;
+  int phys_h() const;
+  void setPhysicalPosition(int px, int py, float uiScale);
+  void syncLogicalGeometry(float uiScale);
+
   // New image for the locally rendered cursor
   void setCursor();
 
@@ -62,6 +69,8 @@ public:
   void setLEDState(unsigned int state);
 
   void draw(Surface* dst);
+  void draw(Surface* dst, int clipX, int clipY, int clipW, int clipH);
+  void draw(int clipX, int clipY, int clipW, int clipH);
 
   // Clipboard events
   void handleClipboardRequest();
@@ -114,6 +123,7 @@ private:
 
   PlatformPixelBuffer* frameBuffer;
   int scale;
+  int physX, physY;
 
   core::Point lastPointerPos;
   uint16_t lastButtonMask;

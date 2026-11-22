@@ -26,7 +26,7 @@
 #include <stdexcept>
 
 #include <FL/Fl_RGB_Image.H>
-#include <FL/x.H>
+#include <FL/platform.H>
 
 #include "Surface.h"
 
@@ -204,8 +204,8 @@ void Surface::update(const Fl_RGB_Image* image)
   const unsigned char* in;
   unsigned char* out;
 
-  assert(image->w() == width());
-  assert(image->h() == height());
+  assert(image->data_w() == width());
+  assert(image->data_h() == height());
 
   img = XCreateImage(fl_display, (Visual*)CopyFromParent, 32,
                      ZPixmap, 0, nullptr, width(), height(),
@@ -251,7 +251,7 @@ void Surface::update(const Fl_RGB_Image* image)
       in += image->d();
     }
     if (image->ld() != 0)
-      in += image->ld() - image->w() * image->d();
+      in += image->ld() - image->data_w() * image->d();
   }
 
   gc = XCreateGC(fl_display, pixmap, 0, nullptr);

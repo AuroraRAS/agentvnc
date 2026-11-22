@@ -1,6 +1,7 @@
 #defining macros needed by SELinux
 %global selinuxtype targeted
 %global modulename vncsession
+%global fltkversion 1.4.5
 
 Name:           tigervnc
 Version:        @VERSION@
@@ -9,11 +10,12 @@ Summary:        A TigerVNC remote display system
 
 %global _hardened_build 1
 
-License:        GPLv2+
+License:        GPL-2.0-or-later AND (LGPL-2.0-or-later WITH FLTK-exception)
 URL:            http://www.tigervnc.com
 
 Source0:        %{name}-%{version}%{?snap:-%{snap}}.tar.bz2
 Source3:        10-libvnc.conf
+Source4:        https://github.com/fltk/fltk/archive/refs/tags/release-%{fltkversion}.tar.gz#/fltk.tar.gz
 
 BuildRequires:  make
 BuildRequires:  gcc-c++
@@ -39,12 +41,12 @@ BuildRequires:  libXfont2-devel
 BuildRequires:  libselinux-devel, selinux-policy-devel
 BuildRequires:  systemd-devel
 
-# TigerVNC 1.4.x requires fltk 1.3.3 for keyboard handling support
-# See https://github.com/TigerVNC/tigervnc/issues/8, also bug #1208814
-BuildRequires:  fltk-devel >= 1.3.3
+# FLTK 1.4 is built from Source4 for the viewer.
+BuildRequires:  libXcursor-devel, libXft-devel, libpng-devel
 BuildRequires:  xorg-x11-server-devel
 
 Requires:       tigervnc-common
+Provides:       bundled(fltk) = %{fltkversion}
 
 %description
 Virtual Network Computing (VNC) is a remote display system which
@@ -123,6 +125,8 @@ runs properly under an environment with SELinux enabled.
 
 %prep
 %setup -q -n %{name}-%{version}%{?snap:-%{snap}}
+mkdir fltk
+tar -xzf %{SOURCE4} -C fltk --strip-components=1
 
 cp -r /usr/share/xorg-x11-server-source/* unix/xserver
 pushd unix/xserver
@@ -134,7 +138,9 @@ patch -p1 -b --suffix .vnc < "$xserver_patch"
 popd
 
 %build
+sh contrib/packages/build-fltk.sh fltk fltk-build
 %cmake \
+  -DFLTK_DIR:PATH="$PWD/fltk-build" \
   -DENABLE_NLS=ON \
   -DENABLE_GNUTLS=ON \
   -DENABLE_NETTLE=ON \
@@ -208,6 +214,7 @@ fi
 
 
 %files
+%license fltk/COPYING
 %doc %{_docdir}/%{name}/README.rst
 %{_bindir}/vncviewer
 %{_datadir}/applications/*

@@ -22,6 +22,7 @@ chmod a+w ${CURDIR}/build
 ## Copy over the source code
 
 (cd ${TOPDIR} && git archive --prefix tigervnc-${VERSION}/ HEAD) | xz > ${CURDIR}/build/tigervnc_${VERSION}.orig.tar.xz
+sh "${CURDIR}/../fetch-fltk.sh" "${CURDIR}/build/tigervnc_${VERSION}.orig-fltk.tar.gz"
 
 ## Copy over the packaging files
 
@@ -46,6 +47,8 @@ cat ${DEBDIR}/debian/changelog >> ${CURDIR}/build/debian/changelog
 docker run --volume ${CURDIR}/build:/home/deb/build --interactive --rm tigervnc/${DOCKER} \
 	bash -e -x -c "
 	tar -C ~/build -axf ~/build/tigervnc_${VERSION}.orig.tar.xz
+	mkdir ~/build/tigervnc-${VERSION}/fltk
+	tar -C ~/build/tigervnc-${VERSION}/fltk --strip-components=1 -xzf ~/build/tigervnc_${VERSION}.orig-fltk.tar.gz
 	cp -a ~/build/debian ~/build/tigervnc-${VERSION}/debian
 	sudo apt-get update
 	mk-build-deps ~/build/tigervnc-${VERSION}/debian/control

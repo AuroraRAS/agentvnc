@@ -23,6 +23,9 @@
 #include <vector>
 
 #include <core/Configuration.h>
+#include <core/Rect.h>
+
+core::Rect monitorRect(int index);
 
 class MonitorIndicesParameter: public core::IntListParameter {
 public:

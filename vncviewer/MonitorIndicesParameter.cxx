@@ -35,8 +35,33 @@
 #include <core/i18n.h>
 
 #include "MonitorIndicesParameter.h"
+#include "Scale.h"
+
+#if defined(WIN32)
+#include "win32.h"
+#elif !defined(__APPLE__)
+#include "x11.h"
+#endif
 
 static core::LogWriter vlog("MonitorIndicesParameter");
+
+core::Rect monitorRect(int index)
+{
+    int x, y, w, h;
+    Fl::screen_xywh(x, y, w, h, index);
+    core::Rect logical(x, y, x + w, y + h);
+    float scale = Fl::screen_scale(index);
+    if (scale <= 0.0f)
+        scale = 1.0f;
+
+#if defined(WIN32)
+    return win32_screen_rect(logical, scale);
+#elif defined(__APPLE__)
+    return scaleScreenRectToPhysical(logical, scale);
+#else
+    return x11_screen_rect(logical, scale);
+#endif
+}
 
 MonitorIndicesParameter::MonitorIndicesParameter(const char* name_,
                                                  const char* desc_,
@@ -102,14 +127,12 @@ std::vector<MonitorIndicesParameter::Monitor> MonitorIndicesParameter::fetchMoni
         Monitor monitor;
         bool match;
 
-        // Get the properties of the monitor at the current index;
-        Fl::screen_xywh(
-            monitor.x,
-            monitor.y,
-            monitor.w,
-            monitor.h,
-            i
-        );
+        // Get the properties of the monitor at the current index in physical pixels
+        core::Rect pr = monitorRect(i);
+        monitor.x = pr.tl.x;
+        monitor.y = pr.tl.y;
+        monitor.w = pr.width();
+        monitor.h = pr.height();
 
         // Only keep a single entry for mirrored screens
         match = false;

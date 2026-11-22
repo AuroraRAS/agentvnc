@@ -63,6 +63,7 @@
 #include <FL/Fl_PNG_Image.H>
 #include <FL/Fl_Sys_Menu_Bar.H>
 #include <FL/fl_ask.H>
+#include <FL/platform.H>
 
 #include "fltk/Fl_Password_Input.h"
 #include "fltk/theme.h"
@@ -79,6 +80,15 @@
 #ifdef WIN32
 #include "resource.h"
 #include "win32.h"
+#elif !defined(__APPLE__)
+#include "x11.h"
+
+// Prevent hybrid Wayland/X11 FLTK builds from selecting Wayland;
+// the Unix viewer requires X11 APIs (XRender, XShm, XInput2, XKB).
+extern "C" {
+extern bool fl_disable_wayland;
+__attribute__((visibility("default"))) bool fl_disable_wayland = true;
+}
 #endif
 
 static core::LogWriter vlog("main");
@@ -693,6 +703,15 @@ static void mktunnel()
 
 int main(int argc, char** argv)
 {
+#if !defined(WIN32) && !defined(__APPLE__)
+  // Must be set before any FLTK call (including parameter parsing)
+  // triggers screen/display initialization in hybrid Wayland/X11 builds.
+  setenv("FLTK_BACKEND", "x11", 1);
+#endif
+
+  // FLTK installs its zoom shortcuts when the display first opens.
+  Fl::keyboard_screen_scaling(0);
+
   argv0 = argv[0];
 
   setlocale(LC_ALL, "");
@@ -784,6 +803,7 @@ int main(int argc, char** argv)
       Fl::display(display);
     }
     fl_open_display();
+    x11_init_scale_sync();
 #endif
 
     init_fltk();

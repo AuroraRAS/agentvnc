@@ -20,6 +20,9 @@
 #include <config.h>
 #endif
 
+#include <math.h>
+
+#include <limits>
 #include <vector>
 
 #include <gtest/gtest.h>
@@ -255,4 +258,128 @@ TEST(Scale, computeScaledBlitParams)
       }
     }
   }
+}
+
+TEST(Scale, logicalToPhysicalAndBack)
+{
+  EXPECT_EQ(logicalToPhysical(0, 1.0f), 0);
+  EXPECT_EQ(logicalToPhysical(100, 1.0f), 100);
+  EXPECT_EQ(logicalToPhysical(100, 1.25f), 125);
+  EXPECT_EQ(logicalToPhysical(100, 1.5f), 150);
+  EXPECT_EQ(logicalToPhysical(101, 1.5f), 152);
+  EXPECT_EQ(logicalToPhysical(100, 2.0f), 200);
+  EXPECT_EQ(logicalToPhysical(-10, 1.5f), -15);
+  EXPECT_EQ(logicalToPhysical(-3, 1.5f), -5);
+
+  EXPECT_EQ(physicalToLogicalSize(0, 2.0f), 0);
+  EXPECT_EQ(physicalToLogicalSize(-5, 2.0f), 0);
+  EXPECT_EQ(physicalToLogicalSize(1, 2.0f), 1);
+  EXPECT_EQ(physicalToLogicalSize(200, 2.0f), 100);
+  EXPECT_EQ(physicalToLogicalSize(150, 1.5f), 100);
+  EXPECT_EQ(physicalToLogicalSize(125, 1.25f), 100);
+  EXPECT_EQ(physicalToLogicalSize(1920, 1.75f), 1098);
+  EXPECT_EQ(physicalToLogicalSize(641, 1.5f), 428);
+}
+
+TEST(Scale, logicalAndPhysicalRectRoundTrip)
+{
+  EXPECT_TRUE(logicalRectToPhysical(core::Rect(), 2.0f, 100, 100).is_empty());
+  EXPECT_TRUE(logicalRectToPhysical(core::Rect(0, 0, 10, 10), 2.0f, 0, 100).is_empty());
+  EXPECT_TRUE(logicalRectToPhysical(core::Rect(60, 0, 70, 10), 2.0f, 100, 100).is_empty());
+  EXPECT_TRUE(physicalRectToLogical(core::Rect(), 2.0f).is_empty());
+
+  EXPECT_EQ(logicalRectToPhysical(core::Rect(-5, -5, 60, 60), 2.0f, 100, 100),
+            core::Rect(0, 0, 100, 100));
+
+  for (float s : {1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f}) {
+    const int maxW = 500;
+    const int maxH = 400;
+    core::Rect phys(7, 13, 83, 97);
+    core::Rect log = physicalRectToLogical(phys, s);
+    core::Rect back = logicalRectToPhysical(log, s, maxW, maxH);
+    EXPECT_TRUE(phys.enclosed_by(back)) << "scale=" << s;
+
+    core::Rect farRight(maxW + (int)ceilf(s) + 2, 10, maxW + 30, 40);
+    EXPECT_TRUE(logicalRectToPhysical(physicalRectToLogical(farRight, s),
+                                      s, maxW, maxH).is_empty()) << "scale=" << s;
+  }
+}
+
+TEST(Scale, screenRectToPhysicalAndMatch)
+{
+  EXPECT_TRUE(scaleScreenRectToPhysical(core::Rect(), 1.5f).is_empty());
+  EXPECT_EQ(scaleScreenRectToPhysical(core::Rect(0, 0, 2560, 1440), 2.0f),
+            core::Rect(0, 0, 5120, 2880));
+
+  // FLTK integer truncation: 1366 / 1.5 = 910, 910 * 1.5 = 1365 (1px diff)
+  core::Rect fltkTruncated(0, 0, 910, 512);
+  core::Rect xrandrExact(0, 0, 1366, 768);
+  EXPECT_TRUE(screenRectMatchesPhysical(fltkTruncated, 1.5f, xrandrExact));
+
+  // Fractional 1.25x with offset monitor
+  EXPECT_TRUE(screenRectMatchesPhysical(core::Rect(1536, 0, 3072, 864),
+                                        1.25f,
+                                        core::Rect(1920, 0, 3840, 1080)));
+
+  EXPECT_FALSE(screenRectMatchesPhysical(fltkTruncated, 1.5f,
+                                         core::Rect(0, 0, 1920, 1080)));
+  EXPECT_FALSE(screenRectMatchesPhysical(fltkTruncated, 1.5f,
+                                         core::Rect(1366, 0, 2732, 768)));
+  EXPECT_FALSE(screenRectMatchesPhysical(core::Rect(), 1.5f, xrandrExact));
+}
+
+TEST(Scale, parseXftDpiFromResources)
+{
+  float dpi = -1.0f;
+
+  EXPECT_FALSE(parseXftDpiFromResources(nullptr, &dpi));
+  EXPECT_FALSE(parseXftDpiFromResources("", &dpi));
+  EXPECT_FALSE(parseXftDpiFromResources("! Xft.dpi: 192\nXft.hinting: 1\n", &dpi));
+  EXPECT_FLOAT_EQ(dpi, -1.0f);
+
+  EXPECT_TRUE(parseXftDpiFromResources("Xft.dpi:\t192\n", &dpi));
+  EXPECT_FLOAT_EQ(dpi, 192.0f);
+
+  EXPECT_TRUE(parseXftDpiFromResources("*.Xft.dpi :  144 \r\n", &dpi));
+  EXPECT_FLOAT_EQ(dpi, 144.0f);
+
+  EXPECT_TRUE(parseXftDpiFromResources("*Xft.dpi: 120.5\n", &dpi));
+  EXPECT_FLOAT_EQ(dpi, 120.5f);
+
+  // Last entry wins; invalid entries do not clobber earlier valid ones
+  const char* multi =
+    "Xft.dpi: 96\n"
+    "!Xft.dpi: 240\n"
+    "Xft.antialias: 1\n"
+    "Xft.dpi: 168\n"
+    "Xft.dpi: 0\n"
+    "Xft.dpi: -96\n"
+    "Xft.dpi: nan\n"
+    "Xft.dpi: 120,5\n"
+    "Xft.dpi: 120px\n"
+    "Xft.dpi:\n";
+  EXPECT_TRUE(parseXftDpiFromResources(multi, &dpi));
+  EXPECT_FLOAT_EQ(dpi, 168.0f);
+
+  dpi = 77.0f;
+  EXPECT_FALSE(parseXftDpiFromResources("Xft.dpi: 0\nXft.dpi: inf\nXft.dpi: abc\n", &dpi));
+  EXPECT_FLOAT_EQ(dpi, 77.0f);
+}
+
+TEST(Scale, computeUIScaleFromDpi)
+{
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(96.0f), 1.0f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(120.0f), 1.25f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(144.0f), 1.5f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(168.0f), 1.75f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(192.0f), 2.0f);
+
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(192.0f, 1.25f), 2.5f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(0.0f), 1.0f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(-96.0f), 1.0f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(std::numeric_limits<float>::quiet_NaN()), 1.0f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(192.0f, -2.0f), 2.0f);
+
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(12.0f), 0.5f);
+  EXPECT_FLOAT_EQ(computeUIScaleFromDpi(9600.0f), 10.0f);
 }

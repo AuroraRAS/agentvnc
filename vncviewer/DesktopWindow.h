@@ -28,6 +28,7 @@
 
 #include <FL/Fl_Window.H>
 
+#include <core/Rect.h>
 #include <rfb/ScreenSet.h>
 
 namespace rfb { class ModifiablePixelBuffer; }
@@ -95,7 +96,16 @@ public:
   // Display a temporary status message in the window overlay
   void showOverlayMessage(const char* text) { addOverlayTip("%s", text); }
 
+  // Display / DPI helpers
+  int currentScreenNum() const;
+  float uiScale() const;
+  void getPhysicalSize(int* physW, int* physH) const;
+  void getWindowPhysicalRect(int* wx, int* wy, int* ww, int* wh) const;
+  core::Point getEventPhysicalPos() const;
+  void resizeWindowToSession();
+
 private:
+  core::Rect getScreenPhysicalRect(int idx) const;
   void addOverlayTip(const char *text, ...)
     __attribute__((__format__ (__printf__, 2, 3)));
   void addOverlayError(const char *text, ...)
@@ -131,6 +141,7 @@ private:
   void scrollTo(int x, int y);
   static void handleScroll(Fl_Widget *wnd, void *data);
   static void handleEdgeScroll(void *data);
+  core::Point edgeScrollPos;
 
   static void handleStatsTimeout(void *data);
 
@@ -168,6 +179,9 @@ private:
   bool mouseGrabbed;
 
   bool regrabOnFocus;
+
+  float lastUIScale;
+  int lastPhysW, lastPhysH;
 
   struct statsEntry {
     unsigned ups;

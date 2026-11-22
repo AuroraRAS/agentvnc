@@ -21,10 +21,13 @@
 #include <config.h>
 #endif
 
+#include <assert.h>
 #include <windows.h>
 
-#include <FL/x.H>
+#include <FL/Fl_Window.H>
+#include <FL/platform.H>
 
+#include "Scale.h"
 #include "win32.h"
 
 static HANDLE thread;
@@ -243,5 +246,115 @@ bool win32_win_is_maximized(Fl_Window* win)
   GetWindowPlacement(fl_xid(win), &wndpl);
   if (wndpl.showCmd == SW_SHOWMAXIMIZED)
     return true;
+  return false;
+}
+
+bool win32_win_get_physical_size(Fl_Window* win, int* w, int* h)
+{
+  RECT r;
+
+  assert(win && win->shown());
+  assert(w);
+  assert(h);
+
+  if (!GetClientRect(fl_xid(win), &r))
+    return false;
+  *w = r.right - r.left;
+  *h = r.bottom - r.top;
+  return true;
+}
+
+bool win32_win_get_coords(Fl_Window* win, int* x, int* y, int* w, int* h)
+{
+  POINT pt = {0, 0};
+
+  assert(win && win->shown());
+  assert(x);
+  assert(y);
+  assert(w);
+  assert(h);
+
+  if (!win32_win_get_physical_size(win, w, h) ||
+      !ClientToScreen(fl_xid(win), &pt))
+    return false;
+
+  *x = pt.x;
+  *y = pt.y;
+  return true;
+}
+
+struct MonitorMatch {
+  core::Rect logicalRect;
+  float scale;
+  core::Rect physicalRect;
+};
+
+static BOOL CALLBACK matchMonitorRect(HMONITOR, HDC, LPRECT bounds, LPARAM data)
+{
+  MonitorMatch* match = reinterpret_cast<MonitorMatch*>(data);
+  core::Rect rect(bounds->left, bounds->top, bounds->right, bounds->bottom);
+  if (!screenRectMatchesPhysical(match->logicalRect, match->scale, rect))
+    return TRUE;
+
+  match->physicalRect = rect;
+  return FALSE;
+}
+
+core::Rect win32_screen_rect(const core::Rect& logicalRect, float scale)
+{
+  MonitorMatch match = {logicalRect, scale, scaleScreenRectToPhysical(logicalRect, scale)};
+  EnumDisplayMonitors(nullptr, nullptr, matchMonitorRect,
+                      reinterpret_cast<LPARAM>(&match));
+  return match.physicalRect;
+}
+
+void win32_win_warp_pointer(Fl_Window* win, int x, int y)
+{
+  POINT pt = {x, y};
+
+  if (win && win->shown() && ClientToScreen(fl_xid(win), &pt))
+    SetCursorPos(pt.x, pt.y);
+}
+
+bool win32_event_physical_pos(Fl_Window* win, int* x, int* y)
+{
+  assert(x);
+  assert(y);
+
+  if (!win || !win->shown())
+    return false;
+
+  if (fl_msg.hwnd != fl_xid(win))
+    return false;
+
+  switch (fl_msg.message) {
+  case WM_MOUSEMOVE:
+  case WM_LBUTTONDOWN:
+  case WM_LBUTTONUP:
+  case WM_RBUTTONDOWN:
+  case WM_RBUTTONUP:
+  case WM_MBUTTONDOWN:
+  case WM_MBUTTONUP:
+  case WM_XBUTTONDOWN:
+  case WM_XBUTTONUP:
+    *x = (int)(short)LOWORD(fl_msg.lParam);
+    *y = (int)(short)HIWORD(fl_msg.lParam);
+    return true;
+  case WM_MOUSEWHEEL:
+#ifdef WM_MOUSEHWHEEL
+  case WM_MOUSEHWHEEL:
+#endif
+  {
+    POINT pt;
+    pt.x = (int)(short)LOWORD(fl_msg.lParam);
+    pt.y = (int)(short)HIWORD(fl_msg.lParam);
+    if (!ScreenToClient(fl_xid(win), &pt))
+      return false;
+    *x = pt.x;
+    *y = pt.y;
+    return true;
+  }
+  }
+
   return false;
 }

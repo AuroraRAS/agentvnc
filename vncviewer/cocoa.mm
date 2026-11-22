@@ -22,9 +22,10 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <math.h>
 
 #include <FL/Fl_Window.H>
-#include <FL/x.H>
+#include <FL/platform.H>
 
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -263,10 +264,124 @@ void cocoa_event_delay(double seconds)
   CFRelease(event);
 }
 
-void cocoa_set_cursor_pos(int x, int y)
+float cocoa_backing_scale(Fl_Window *win)
 {
-  CGPoint new_pos;
-  new_pos.x = x;
-  new_pos.y = y;
-  CGWarpMouseCursorPosition(new_pos);
+  if (win && win->shown()) {
+    NSWindow *nsw = (NSWindow*)fl_xid(win);
+    if (nsw)
+      return (float)[nsw backingScaleFactor];
+  }
+
+  NSScreen *screen = [NSScreen mainScreen];
+  if (screen)
+    return (float)[screen backingScaleFactor];
+
+  return 1.0f;
+}
+
+float cocoa_screen_backing_scale(int screenNum)
+{
+  CGDirectDisplayID displays[16];
+  CGDisplayCount count;
+
+  if ((CGGetActiveDisplayList(16, displays, &count) == kCGErrorSuccess) &&
+      (screenNum >= 0) && ((unsigned)screenNum < count)) {
+    for (NSScreen* screen in [NSScreen screens]) {
+      NSNumber* screenId = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+      if ([screenId unsignedIntValue] == displays[screenNum])
+        return (float)[screen backingScaleFactor];
+    }
+  }
+
+  return cocoa_backing_scale(nullptr);
+}
+
+void cocoa_win_get_physical_size(Fl_Window *win, int *w, int *h)
+{
+  assert(w);
+  assert(h);
+
+  if (win && win->shown()) {
+    NSWindow *nsw = (NSWindow*)fl_xid(win);
+    NSView* view = [nsw contentView];
+    if (view) {
+      NSRect backing = [view convertRectToBacking:[view bounds]];
+      *w = (int)lround(backing.size.width);
+      *h = (int)lround(backing.size.height);
+      return;
+    }
+  }
+
+  float s = cocoa_backing_scale(win);
+  *w = win ? (int)lroundf((float)win->w() * s) : 0;
+  *h = win ? (int)lroundf((float)win->h() * s) : 0;
+}
+
+bool cocoa_event_physical_pos(Fl_Window *win, int *x, int *y)
+{
+  assert(x);
+  assert(y);
+
+  if (!win || !win->shown())
+    return false;
+
+  NSWindow *nsw = (NSWindow*)fl_xid(win);
+  NSEvent *ev = [NSApp currentEvent];
+  if (!nsw || !ev || ([ev window] != nsw))
+    return false;
+
+  switch ([ev type]) {
+  case NSEventTypeLeftMouseDown:
+  case NSEventTypeLeftMouseUp:
+  case NSEventTypeRightMouseDown:
+  case NSEventTypeRightMouseUp:
+  case NSEventTypeOtherMouseDown:
+  case NSEventTypeOtherMouseUp:
+  case NSEventTypeMouseMoved:
+  case NSEventTypeLeftMouseDragged:
+  case NSEventTypeRightMouseDragged:
+  case NSEventTypeOtherMouseDragged:
+  case NSEventTypeMouseEntered:
+  case NSEventTypeMouseExited:
+  case NSEventTypeScrollWheel: {
+    NSView *view = [nsw contentView];
+    if (!view)
+      return false;
+    NSPoint viewPt = [view convertPoint:[ev locationInWindow] fromView:nil];
+    NSPoint backPt = [view convertPointToBacking:viewPt];
+    *x = (int)lround(backPt.x);
+    if ([view isFlipped]) {
+      *y = (int)lround(backPt.y);
+    } else {
+      NSRect backRect = [view convertRectToBacking:[view bounds]];
+      *y = (int)lround(backRect.size.height - backPt.y);
+    }
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+void cocoa_win_warp_pointer(Fl_Window *win, int x, int y)
+{
+  if (!win || !win->shown())
+    return;
+
+  NSWindow *nsw = (NSWindow*)fl_xid(win);
+  NSView *view = [nsw contentView];
+  if (!view)
+    return;
+
+  NSRect bounds = [view convertRectToBacking:[view bounds]];
+  NSPoint backing = NSMakePoint(x + bounds.origin.x, y + bounds.origin.y);
+  if (![view isFlipped])
+    backing.y = NSMaxY(bounds) - y;
+
+  NSPoint viewPt = [view convertPointFromBacking:backing];
+  NSPoint winPt = [view convertPoint:viewPt toView:nil];
+  NSPoint screenPt = [nsw convertPointToScreen:winPt];
+  CGFloat primaryH = CGDisplayBounds(CGMainDisplayID()).size.height;
+
+  CGWarpMouseCursorPosition(CGPointMake(screenPt.x, primaryH - screenPt.y));
 }

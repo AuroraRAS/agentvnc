@@ -22,11 +22,18 @@
 #define __VNCVIEWER_WIN32_H__
 
 class Fl_Window;
+namespace core { struct Rect; }
 
 int win32_enable_lowlevel_keyboard(Fl_Window* win);
 void win32_disable_lowlevel_keyboard(Fl_Window* win);
 
 void win32_win_maximize(Fl_Window* win);
 bool win32_win_is_maximized(Fl_Window* win);
+
+bool win32_win_get_physical_size(Fl_Window* win, int* w, int* h);
+bool win32_win_get_coords(Fl_Window* win, int* x, int* y, int* w, int* h);
+core::Rect win32_screen_rect(const core::Rect& logicalRect, float scale);
+void win32_win_warp_pointer(Fl_Window* win, int x, int y);
+bool win32_event_physical_pos(Fl_Window* win, int* x, int* y);
 
 #endif

@@ -28,8 +28,9 @@
 
 #include <FL/Fl_RGB_Image.H>
 #include <FL/Fl_Window.H>
-#include <FL/x.H>
+#include <FL/platform.H>
 
+#include "cocoa.h"
 #include "Scale.h"
 #include "Surface.h"
 
@@ -166,8 +167,8 @@ void Surface::clear(unsigned char r, unsigned char g, unsigned char b, unsigned 
   b = (unsigned)b * a / 255;
 
   out = data;
-  for (y = 0;y < width();y++) {
-    for (x = 0;x < height();x++) {
+  for (y = 0;y < height();y++) {
+    for (x = 0;x < width();x++) {
       *out++ = b;
       *out++ = g;
       *out++ = r;
@@ -180,6 +181,7 @@ void Surface::draw(int src_x, int src_y, int dst_x, int dst_y,
                    int dst_w, int dst_h, int scale)
 {
   CGColorSpaceRef lut;
+  int win_w, win_h;
 
   CGContextSaveGState(fl_gc);
 
@@ -188,7 +190,8 @@ void Surface::draw(int src_x, int src_y, int dst_x, int dst_y,
   CGContextConcatCTM(fl_gc, CGAffineTransformInvert(CGContextGetCTM(fl_gc)));
 
   // macOS Coordinates are from bottom left, not top left
-  dst_y = Fl_Window::current()->h() - (dst_y + dst_h);
+  cocoa_win_get_physical_size(Fl_Window::current(), &win_w, &win_h);
+  dst_y = win_h - (dst_y + dst_h);
 
   lut = CGBitmapContextGetColorSpace(fl_gc);
   assert(lut);
@@ -219,6 +222,7 @@ void Surface::blend(int src_x, int src_y, int dst_x, int dst_y,
                     int dst_w, int dst_h, int a)
 {
   CGColorSpaceRef lut;
+  int win_w, win_h;
 
   CGContextSaveGState(fl_gc);
 
@@ -227,7 +231,8 @@ void Surface::blend(int src_x, int src_y, int dst_x, int dst_y,
   CGContextConcatCTM(fl_gc, CGAffineTransformInvert(CGContextGetCTM(fl_gc)));
 
   // macOS Coordinates are from bottom left, not top left
-  dst_y = Fl_Window::current()->h() - (dst_y + dst_h);
+  cocoa_win_get_physical_size(Fl_Window::current(), &win_w, &win_h);
+  dst_y = win_h - (dst_y + dst_h);
 
   lut = CGBitmapContextGetColorSpace(fl_gc);
   assert(lut);
@@ -270,14 +275,14 @@ void Surface::update(const Fl_RGB_Image* image)
   const unsigned char* in;
   unsigned char* out;
 
-  assert(image->w() == width());
-  assert(image->h() == height());
+  assert(image->data_w() == width());
+  assert(image->data_h() == height());
 
   // Convert data and pre-multiply alpha
   in = (const unsigned char*)image->data()[0];
   out = data;
-  for (y = 0;y < image->h();y++) {
-    for (x = 0;x < image->w();x++) {
+  for (y = 0;y < image->data_h();y++) {
+    for (x = 0;x < image->data_w();x++) {
       switch (image->d()) {
       case 1:
         *out++ = in[0];
@@ -307,6 +312,6 @@ void Surface::update(const Fl_RGB_Image* image)
       in += image->d();
     }
     if (image->ld() != 0)
-      in += image->ld() - image->w() * image->d();
+      in += image->ld() - image->data_w() * image->d();
   }
 }
