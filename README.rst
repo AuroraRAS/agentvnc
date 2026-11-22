@@ -1,5 +1,8 @@
-About TigerVNC
+About AgentVNC
 ==============
+
+AgentVNC is a derivative of `TigerVNC`_ and is developed as a feature-enhanced
+superset of TigerVNC that tracks upstream updates over the long term.
 
 Virtual Network Computing (VNC) is a remote display system which allows you to
 view and interact with a virtual desktop environment that is running on another
@@ -8,12 +11,28 @@ remote machine and send only the display from these applications to your local
 machine.  VNC is platform-independent and supports a wide variety of operating
 systems and architectures as both servers and clients.
 
-TigerVNC is a high-speed version of VNC based on the RealVNC 4 and X.org code
-bases.  TigerVNC started as a next-generation development effort for TightVNC
-on Unix and Linux platforms, but it split from its parent project in early 2009
-so that TightVNC could focus on Windows platforms.  TigerVNC supports a variant
-of Tight encoding that is greatly accelerated by the use of the libjpeg-turbo
-JPEG codec.
+AgentVNC builds on TigerVNC, a high-speed version of VNC based on the RealVNC 4
+and X.org code bases.  TigerVNC started as a next-generation development effort
+for TightVNC on Unix and Linux platforms, splitting from its parent project in
+early 2009 so that TightVNC could focus on Windows platforms.  Like upstream
+TigerVNC, AgentVNC supports a variant of Tight encoding that is greatly
+accelerated by the use of the libjpeg-turbo JPEG codec.
+
+.. _TigerVNC: https://github.com/TigerVNC/tigervnc
+
+
+Development Model
+=================
+
+AgentVNC tracks the `official TigerVNC repository`_ over the long term so that
+upstream improvements and fixes are continuously incorporated.
+
+To keep enhancements cleanly decoupled from both upstream code and one another,
+development is organized into multiple modular "draft" branches.  During
+upstream updates, these draft branches are rebased against the upstream
+TigerVNC ``master`` branch, ensuring that no fixes from upstream are missed.
+
+.. _official TigerVNC repository: https://github.com/TigerVNC/tigervnc
 
 
 Legal
@@ -39,32 +58,33 @@ Incomplete and generally out of date copyright list::
 
 This software is distributed under the GNU General Public Licence as published
 by the Free Software Foundation.  See the file LICENCE.TXT for the conditions
-under which this software is made available.  TigerVNC also contains code from
-other sources.  See the Acknowledgements section below, and the individual
-source files, for details of the conditions under which they are made
-available.
+under which this software is made available.  AgentVNC is derived from TigerVNC
+and also contains code from other sources.  See the Acknowledgements section
+below, and the individual source files, for details of the conditions under
+which they are made available.
 
 
 All Platforms
 =============
 
-All versions of TigerVNC contain the following programs:
+All versions of AgentVNC contain the following programs:
 
-* vncviewer - the cross-platform TigerVNC Viewer, written using FLTK.
-              vncviewer connects to a VNC server and allows you to interact
-              with the remote desktop being displayed by the VNC server.  The
-              VNC server can be running on a Windows or a Unix/Linux machine.
+* vncviewer - the cross-platform VNC viewer (derived from TigerVNC Viewer),
+              written using FLTK.  vncviewer connects to a VNC server and
+              allows you to interact with the remote desktop being displayed by
+              the VNC server.  The VNC server can be running on a Windows or a
+              Unix/Linux machine.
 
 
 Windows-specific
 ================
 
-The Windows version of TigerVNC contains the following programs:
+The Windows version of AgentVNC contains the following programs:
 
-* winvnc - the TigerVNC server for Windows.  winvnc allows a Windows desktop to
-           be accessed remotely using a VNC viewer.
+* winvnc - the VNC server for Windows.  winvnc allows a Windows desktop to be
+           accessed remotely using a VNC viewer.
 
-WARNING: winvnc is currently unmaintained and and may not function correctly.
+WARNING: winvnc is currently unmaintained and may not function correctly.
 
 winvnc may not work if the Fast user switching or Remote desktop features are
 in use.
@@ -73,11 +93,11 @@ in use.
 Unix/Linux-specific (not Mac)
 =============================
 
-The Unix/Linux version of TigerVNC contains the following programs:
+The Unix/Linux version of AgentVNC contains the following programs:
 
-* Xvnc - the TigerVNC server for Unix.  Xvnc is both a VNC server and an X
-         server with a "virtual" framebuffer.  You should normally use the
-         vncserver service to start Xvnc.
+* Xvnc - the VNC server for Unix.  Xvnc is both a VNC server and an X server
+         with a "virtual" framebuffer.  You should normally use the vncserver
+         service to start Xvnc.
 
 * vncpasswd - a program which allows you to change the VNC password used to
               access your VNC server sessions (assuming that VNC authentication
