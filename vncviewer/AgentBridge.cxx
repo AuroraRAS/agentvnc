@@ -60,7 +60,8 @@ const size_t MAX_CLIENT_QUEUE_BYTES = 128 * 1024 * 1024;
 const size_t MAX_INFLIGHT_PER_CLIENT = 16;
 const int MAX_JSON_DEPTH = 32;
 
-char g_activeSocketPath[108] = {0};
+char g_activeSocketPath[sizeof(sockaddr_un::sun_path)] = {0};
+struct stat g_activeSocketStat;
 volatile sig_atomic_t g_hasActiveSocketPath = 0;
 
 uint32_t readBE32(const uint8_t* p)
@@ -625,29 +626,16 @@ void AgentBridge::start()
       _("AgentSocket path \"%s\" exceeds maximum length (%u bytes)"),
       socketPath_.c_str(), (unsigned)(sizeof(addr.sun_path) - 1)));
 
-  createPipePair(mainWakePipe_);
-  createPipePair(ipcWakePipe_);
-
+  bool ownsSocket = false;
   try {
+    createPipePair(mainWakePipe_);
+    createPipePair(ipcWakePipe_);
+
     listenFd_ = socket(AF_UNIX, SOCK_STREAM, 0);
     if (listenFd_ < 0)
       throw std::runtime_error(core::format("socket(AF_UNIX) failed: %s",
                                             strerror(errno)));
     setNonBlockCloexec(listenFd_);
-
-    struct stat st;
-    if (lstat(socketPath_.c_str(), &st) == 0) {
-      if (S_ISSOCK(st.st_mode)) {
-        if (unlink(socketPath_.c_str()) != 0)
-          throw std::runtime_error(core::format(
-            "Failed to remove stale socket \"%s\": %s",
-            socketPath_.c_str(), strerror(errno)));
-      } else {
-        throw std::runtime_error(core::format(
-          "AgentSocket path \"%s\" already exists and is not a socket",
-          socketPath_.c_str()));
-      }
-    }
 
     memset(&addr, 0, sizeof(addr));
     addr.sun_family = AF_UNIX;
@@ -661,6 +649,15 @@ void AgentBridge::start()
       throw std::runtime_error(core::format(
         "bind(\"%s\") failed: %s", socketPath_.c_str(), strerror(bindErr)));
 
+    if (lstat(socketPath_.c_str(), &g_activeSocketStat) < 0)
+      throw std::runtime_error(core::format(
+        "lstat(\"%s\") failed: %s", socketPath_.c_str(), strerror(errno)));
+
+    snprintf(g_activeSocketPath, sizeof(g_activeSocketPath), "%s",
+             socketPath_.c_str());
+    g_hasActiveSocketPath = 1;
+    ownsSocket = true;
+
     if (chmod(socketPath_.c_str(), 0600) < 0)
       throw std::runtime_error(core::format(
         "chmod(\"%s\") failed: %s", socketPath_.c_str(), strerror(errno)));
@@ -669,18 +666,14 @@ void AgentBridge::start()
       throw std::runtime_error(core::format(
         "listen(\"%s\") failed: %s", socketPath_.c_str(), strerror(errno)));
 
-    snprintf(g_activeSocketPath, sizeof(g_activeSocketPath), "%s",
-             socketPath_.c_str());
-    g_hasActiveSocketPath = 1;
-
     stopRequested_ = false;
     ioThread_ = std::thread(&AgentBridge::ioLoop, this);
     started_ = true;
 
     vlog.info(_("Listening for agent IPC on %s"), socketPath_.c_str());
   } catch (...) {
-    g_hasActiveSocketPath = 0;
-    g_activeSocketPath[0] = '\0';
+    if (ownsSocket)
+      cleanupOnSignal();
     if (listenFd_ >= 0) {
       close(listenFd_);
       listenFd_ = -1;
@@ -701,24 +694,13 @@ void AgentBridge::stop()
     wakeIpcThread();
     if (ioThread_.joinable())
       ioThread_.join();
+    cleanupOnSignal();
     started_ = false;
-  }
-
-  if (g_hasActiveSocketPath &&
-      strcmp(g_activeSocketPath, socketPath_.c_str()) == 0) {
-    g_hasActiveSocketPath = 0;
-    g_activeSocketPath[0] = '\0';
   }
 
   if (listenFd_ >= 0) {
     close(listenFd_);
     listenFd_ = -1;
-  }
-
-  if (!socketPath_.empty()) {
-    struct stat st;
-    if (lstat(socketPath_.c_str(), &st) == 0 && S_ISSOCK(st.st_mode))
-      unlink(socketPath_.c_str());
   }
 
   closePipePair(mainWakePipe_);
@@ -731,8 +713,12 @@ void AgentBridge::stop()
 
 void AgentBridge::cleanupOnSignal()
 {
-  if (g_hasActiveSocketPath)
+  struct stat st;
+  if (g_hasActiveSocketPath && lstat(g_activeSocketPath, &st) == 0 &&
+      st.st_dev == g_activeSocketStat.st_dev &&
+      st.st_ino == g_activeSocketStat.st_ino)
     unlink(g_activeSocketPath);
+  g_hasActiveSocketPath = 0;
 }
 
 void AgentBridge::setConnection(CConn* conn)
