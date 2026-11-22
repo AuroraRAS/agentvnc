@@ -106,6 +106,10 @@ void FtpServer::setNonBlockingCloExec(int fd)
   int fdFlags = ::fcntl(fd, F_GETFD, 0);
   if (fdFlags != -1)
     ::fcntl(fd, F_SETFD, fdFlags | FD_CLOEXEC);
+#ifdef SO_NOSIGPIPE
+  int one = 1;
+  ::setsockopt(fd, SOL_SOCKET, SO_NOSIGPIPE, &one, sizeof(one));
+#endif
 }
 
 std::string FtpServer::socketPeerIp(int fd)
@@ -472,10 +476,16 @@ void FtpServer::handleListenerRead(int fd)
 
 void FtpServer::sendReply(ClientSession* s, const std::string& line)
 {
-  if (s == nullptr)
+  if (s == nullptr || s->closeAfterFlush)
     return;
   if (s->outBuf.size() + line.size() + 2 > kMaxCtrlOutBuf) {
-    destroySession(s->id);
+    // Callers may still be using this session. Close it from the write event.
+    s->closeAfterFlush = true;
+    if (s->outOff == s->outBuf.size()) {
+      s->outBuf = "421 Control response too large.\r\n";
+      s->outOff = 0;
+    }
+    updateControlWatch(s);
     return;
   }
   s->outBuf += line;
