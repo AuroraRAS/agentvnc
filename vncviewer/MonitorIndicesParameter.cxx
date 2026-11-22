@@ -37,7 +37,31 @@
 #include "MonitorIndicesParameter.h"
 #include "Scale.h"
 
+#if defined(WIN32)
+#include "win32.h"
+#elif !defined(__APPLE__)
+#include "x11.h"
+#endif
+
 static core::LogWriter vlog("MonitorIndicesParameter");
+
+core::Rect monitorRect(int index)
+{
+    int x, y, w, h;
+    Fl::screen_xywh(x, y, w, h, index);
+    core::Rect logical(x, y, x + w, y + h);
+    float scale = Fl::screen_scale(index);
+    if (scale <= 0.0f)
+        scale = 1.0f;
+
+#if defined(WIN32)
+    return win32_screen_rect(logical, scale);
+#elif defined(__APPLE__)
+    return scaleScreenRectToPhysical(logical, scale);
+#else
+    return x11_screen_rect(logical, scale);
+#endif
+}
 
 MonitorIndicesParameter::MonitorIndicesParameter(const char* name_,
                                                  const char* desc_,
@@ -104,12 +128,7 @@ std::vector<MonitorIndicesParameter::Monitor> MonitorIndicesParameter::fetchMoni
         bool match;
 
         // Get the properties of the monitor at the current index in physical pixels
-        int lx, ly, lw, lh;
-        Fl::screen_xywh(lx, ly, lw, lh, i);
-        float s = Fl::screen_scale(i);
-        if (s <= 0.0f)
-            s = 1.0f;
-        core::Rect pr = scaleScreenRectToPhysical(core::Rect(lx, ly, lx + lw, ly + lh), s);
+        core::Rect pr = monitorRect(i);
         monitor.x = pr.tl.x;
         monitor.y = pr.tl.y;
         monitor.w = pr.width();

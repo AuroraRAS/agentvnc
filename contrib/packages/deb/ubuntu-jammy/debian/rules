@@ -52,8 +52,10 @@ xorg-source-stamp: $(XORG_SOURCE_ARCHIVE)
 configure: config-stamp
 config-stamp: xorg-source-stamp
 	dh_testdir
+	sh contrib/packages/build-fltk.sh fltk debian/fltk-build
 	# Add here commands to configure the package.
 	cmake -G"Unix Makefiles" \
+		-DFLTK_DIR:PATH=$(CURDIR)/debian/fltk-build \
 		-DBUILD_STATIC=off \
 		-DENABLE_NLS=ON \
 		-DENABLE_H264=ON \
@@ -160,6 +162,7 @@ clean:
 	dh_testdir
 	dh_testroot
 	rm -f build-arch-stamp build-indep-stamp config-stamp
+	rm -rf debian/fltk-build
 
 	# Add here commands to clean up after the build process.
 	dh_clean

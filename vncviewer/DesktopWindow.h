@@ -28,6 +28,7 @@
 
 #include <FL/Fl_Window.H>
 
+#include <core/Rect.h>
 #include <rfb/ScreenSet.h>
 
 namespace rfb { class ModifiablePixelBuffer; }
@@ -128,6 +129,7 @@ private:
   void scrollTo(int x, int y);
   static void handleScroll(Fl_Widget *wnd, void *data);
   static void handleEdgeScroll(void *data);
+  core::Point edgeScrollPos;
 
   static void handleStatsTimeout(void *data);
 

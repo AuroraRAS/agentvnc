@@ -197,6 +197,11 @@ void Viewport::updateWindow()
     core::Rect(r.tl.x + physX, r.tl.y + physY,
                r.br.x + physX, r.br.y + physY),
     ui);
+  // FLTK can report a logical size that omits the last physical pixels.
+  if (dw && (ld.tl.x == dw->w()))
+    ld.tl.x--;
+  if (dw && (ld.tl.y == dw->h()))
+    ld.tl.y--;
   damage(FL_DAMAGE_USER1, ld.tl.x, ld.tl.y, ld.width(), ld.height());
 }
 
@@ -338,9 +343,6 @@ void Viewport::setCursor()
     }
   }
 
-  if (Fl::belowmouse() == this)
-    showCursor();
-
 #ifdef __APPLE__
   if (cursor != nullptr) {
     float bs = cocoa_backing_scale(window());
@@ -355,6 +357,9 @@ void Viewport::setCursor()
     }
   }
 #endif
+
+  if (Fl::belowmouse() == this)
+    showCursor();
 }
 
 void Viewport::showCursor()

@@ -279,6 +279,23 @@ float cocoa_backing_scale(Fl_Window *win)
   return 1.0f;
 }
 
+float cocoa_screen_backing_scale(int screenNum)
+{
+  CGDirectDisplayID displays[16];
+  CGDisplayCount count;
+
+  if ((CGGetActiveDisplayList(16, displays, &count) == kCGErrorSuccess) &&
+      (screenNum >= 0) && ((unsigned)screenNum < count)) {
+    for (NSScreen* screen in [NSScreen screens]) {
+      NSNumber* screenId = [[screen deviceDescription] objectForKey:@"NSScreenNumber"];
+      if ([screenId unsignedIntValue] == displays[screenNum])
+        return (float)[screen backingScaleFactor];
+    }
+  }
+
+  return cocoa_backing_scale(nullptr);
+}
+
 void cocoa_win_get_physical_size(Fl_Window *win, int *w, int *h)
 {
   assert(w);
@@ -286,8 +303,9 @@ void cocoa_win_get_physical_size(Fl_Window *win, int *w, int *h)
 
   if (win && win->shown()) {
     NSWindow *nsw = (NSWindow*)fl_xid(win);
-    if (nsw && [nsw contentView]) {
-      NSRect backing = [nsw convertRectToBacking:[[nsw contentView] bounds]];
+    NSView* view = [nsw contentView];
+    if (view) {
+      NSRect backing = [view convertRectToBacking:[view bounds]];
       *w = (int)lround(backing.size.width);
       *h = (int)lround(backing.size.height);
       return;
@@ -347,24 +365,23 @@ bool cocoa_event_physical_pos(Fl_Window *win, int *x, int *y)
 
 void cocoa_win_warp_pointer(Fl_Window *win, int x, int y)
 {
-  if (win && win->shown()) {
-    float s = cocoa_backing_scale(win);
-    NSWindow *nsw = (NSWindow*)fl_xid(win);
-    NSView *view = nsw ? [nsw contentView] : nil;
-    if (nsw && view && (s > 0.0f)) {
-      CGFloat ptX = (CGFloat)x / s;
-      CGFloat ptY = (CGFloat)y / s;
-      NSPoint viewPt = [view isFlipped]
-        ? NSMakePoint(ptX, ptY)
-        : NSMakePoint(ptX, [view bounds].size.height - ptY);
-      NSPoint winPt = [view convertPoint:viewPt toView:nil];
-      NSPoint screenPt = [nsw convertPointToScreen:winPt];
-      NSScreen *primary = [[NSScreen screens] firstObject];
-      CGFloat primaryH = primary ? [primary frame].size.height : 0.0;
-      CGWarpMouseCursorPosition(CGPointMake(screenPt.x, primaryH - screenPt.y));
-      return;
-    }
-  }
+  if (!win || !win->shown())
+    return;
 
-  CGWarpMouseCursorPosition(CGPointMake(x, y));
+  NSWindow *nsw = (NSWindow*)fl_xid(win);
+  NSView *view = [nsw contentView];
+  if (!view)
+    return;
+
+  NSRect bounds = [view convertRectToBacking:[view bounds]];
+  NSPoint backing = NSMakePoint(x + bounds.origin.x, y + bounds.origin.y);
+  if (![view isFlipped])
+    backing.y = NSMaxY(bounds) - y;
+
+  NSPoint viewPt = [view convertPointFromBacking:backing];
+  NSPoint winPt = [view convertPoint:viewPt toView:nil];
+  NSPoint screenPt = [nsw convertPointToScreen:winPt];
+  CGFloat primaryH = CGDisplayBounds(CGMainDisplayID()).size.height;
+
+  CGWarpMouseCursorPosition(CGPointMake(screenPt.x, primaryH - screenPt.y));
 }

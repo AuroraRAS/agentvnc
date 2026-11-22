@@ -38,6 +38,7 @@ void cocoa_enable_minimize(Fl_Window *win);
 void cocoa_event_delay(double seconds);
 
 float cocoa_backing_scale(Fl_Window *win);
+float cocoa_screen_backing_scale(int screenNum);
 void cocoa_win_get_physical_size(Fl_Window *win, int *w, int *h);
 bool cocoa_event_physical_pos(Fl_Window *win, int *x, int *y);
 void cocoa_win_warp_pointer(Fl_Window *win, int x, int y);

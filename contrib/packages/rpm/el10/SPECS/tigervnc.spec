@@ -1,6 +1,7 @@
 #defining macros needed by SELinux
 %global selinuxtype targeted
 %global modulename vncsession
+%global fltkversion 1.4.5
 
 %global xorgversion 21.1.23
 
@@ -11,13 +12,14 @@ Summary:        A TigerVNC remote display system
 
 %global _hardened_build 1
 
-License:        GPLv2+
+License:        GPL-2.0-or-later AND (LGPL-2.0-or-later WITH FLTK-exception)
 URL:            http://www.tigervnc.com
 
 Source0:        %{name}-%{version}%{?snap:-%{snap}}.tar.bz2
 Source1:        https://xorg.freedesktop.org/releases/individual/xserver/xorg-server-%{xorgversion}.tar.xz
 # Patch from RHEL to avoid dependency on xorg-x11-font-utils
 Source2:        0001-configure.ac-search-for-the-fontrootdir-ourselves.patch
+Source4:        https://github.com/fltk/fltk/archive/refs/tags/release-%{fltkversion}.tar.gz#/fltk.tar.gz
 
 BuildRequires:  make
 BuildRequires:  gcc-c++
@@ -42,10 +44,11 @@ BuildRequires:  libXfont2-devel
 BuildRequires:  libselinux-devel, selinux-policy-devel
 BuildRequires:  systemd-devel
 
-# TigerVNC requires FLTK 1.4.0 or later for HiDPI scaling support
-BuildRequires:  fltk-devel >= 1.4.0
+# FLTK 1.4 is built from Source4 for the viewer.
+BuildRequires:  libXcursor-devel, libXft-devel, libpng-devel
 
 Requires:       tigervnc-common
+Provides:       bundled(fltk) = %{fltkversion}
 
 %description
 Virtual Network Computing (VNC) is a remote display system which
@@ -115,6 +118,8 @@ runs properly under an environment with SELinux enabled.
 
 %prep
 %setup -q -n %{name}-%{version}%{?snap:-%{snap}}
+mkdir fltk
+tar -xzf %{SOURCE4} -C fltk --strip-components=1
 
 tar -axf %{SOURCE1}
 cp -r xorg-server-%{xorgversion}/* unix/xserver
@@ -127,7 +132,9 @@ patch -p1 -b --suffix .vnc < ../xserver21.patch
 popd
 
 %build
+sh contrib/packages/build-fltk.sh fltk fltk-build
 %cmake \
+  -DFLTK_DIR:PATH="$PWD/fltk-build" \
   -DENABLE_NLS=ON \
   -DENABLE_GNUTLS=ON \
   -DENABLE_NETTLE=ON \
@@ -198,6 +205,7 @@ fi
 
 
 %files
+%license fltk/COPYING
 %doc %{_docdir}/%{name}/README.rst
 %{_bindir}/vncviewer
 %{_datadir}/applications/*

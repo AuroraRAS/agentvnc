@@ -28,6 +28,8 @@
 
 #include <algorithm>
 #include <cmath>
+#include <locale>
+#include <sstream>
 #include <string>
 
 #include "Scale.h"
@@ -58,7 +60,8 @@ int physicalToLogicalSize(int phys, float uiScale)
   if (phys <= 0)
     return 0;
 
-  return std::max(1, (int)lroundf((float)phys / uiScale));
+  // FLTK window sizes are integral. Round up so the entire framebuffer fits.
+  return (int)ceil(phys / (double)uiScale);
 }
 
 core::Rect logicalRectToPhysical(const core::Rect& logicalRect,
@@ -126,6 +129,23 @@ bool screenRectMatchesPhysical(const core::Rect& logicalRect,
          (abs(p.height() - osPhysRect.height()) <= tol);
 }
 
+bool parsePositiveScale(const std::string& value, float* result)
+{
+  std::istringstream input(value);
+  float parsed;
+
+  input.imbue(std::locale::classic());
+  if (!(input >> parsed) || !std::isfinite(parsed) || (parsed <= 0.0f))
+    return false;
+
+  input >> std::ws;
+  if (!input.eof())
+    return false;
+
+  *result = parsed;
+  return true;
+}
+
 bool parseXftDpiFromResources(const char* resources, float* dpi)
 {
   assert(dpi != nullptr);
@@ -163,25 +183,8 @@ bool parseXftDpiFromResources(const char* resources, float* dpi)
           ((keyLen == 8) && (strncmp(cur, "*Xft.dpi", 8) == 0)) ||
           ((keyLen == 9) && (strncmp(cur, "*.Xft.dpi", 9) == 0));
 
-        if (keyMatches) {
-          const char* valStart = colon + 1;
-          while ((valStart < end) && isspace((unsigned char)*valStart))
-            valStart++;
-
-          if (valStart < end) {
-            std::string valStr(valStart, (size_t)(end - valStart));
-            char* parseEnd = nullptr;
-            float parsed = strtof(valStr.c_str(), &parseEnd);
-            if (parseEnd != valStr.c_str()) {
-              while ((*parseEnd != '\0') && isspace((unsigned char)*parseEnd))
-                parseEnd++;
-              if ((*parseEnd == '\0') && std::isfinite(parsed) && (parsed > 0.0f)) {
-                found = true;
-                lastDpi = parsed;
-              }
-            }
-          }
-        }
+        if (keyMatches && parsePositiveScale(std::string(colon + 1, end), &lastDpi))
+          found = true;
       }
     }
 

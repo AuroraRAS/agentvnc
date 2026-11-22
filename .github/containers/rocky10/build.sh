@@ -28,6 +28,7 @@ sed -i "s/@VERSION@/${VERSION}/" ${CURDIR}/rpmbuild/SPECS/tigervnc.spec
 ## Copy over the source code
 
 (cd ${TOPDIR} && git archive --prefix tigervnc-${VERSION}/ HEAD) | bzip2 > ${CURDIR}/rpmbuild/SOURCES/tigervnc-${VERSION}.tar.bz2
+sh "${CURDIR}/../fetch-fltk.sh" "${CURDIR}/rpmbuild/SOURCES/fltk.tar.gz"
 
 ## Download the xorg-server source code
 

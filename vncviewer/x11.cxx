@@ -22,16 +22,19 @@
 
 #include <assert.h>
 #include <limits.h>
-#include <math.h>
 #include <stdlib.h>
 #include <unistd.h>
 
-#include <cmath>
 #include <string>
+#include <vector>
 
 #include <FL/Fl.H>
 #include <FL/Fl_Window.H>
 #include <FL/platform.H>
+
+#ifdef HAVE_XRANDR
+#include <X11/extensions/Xrandr.h>
+#endif
 
 #include <core/LogWriter.h>
 
@@ -39,6 +42,11 @@
 #include "x11.h"
 
 static core::LogWriter vlog("x11");
+
+static Window pointerWindow = None;
+static int pointerX, pointerY;
+static std::vector<core::Rect> monitorRects;
+static bool monitorRectsValid = false;
 
 #define _NET_WM_STATE_ADD           1  /* add/set property */
 
@@ -151,7 +159,7 @@ bool x11_win_is_maximized(Fl_Window* win)
   return maximized;
 }
 
-void x11_win_get_coords(Fl_Window* win, int* x, int* y, int* w, int* h)
+bool x11_win_get_coords(Fl_Window* win, int* x, int* y, int* w, int* h)
 {
   XWindowAttributes actual;
   Window cr;
@@ -161,25 +169,69 @@ void x11_win_get_coords(Fl_Window* win, int* x, int* y, int* w, int* h)
   assert(w);
   assert(h);
 
-  XGetWindowAttributes(fl_display, fl_xid(win), &actual);
+  if (!XGetWindowAttributes(fl_display, fl_xid(win), &actual))
+    return false;
 
   *w = actual.width;
   *h = actual.height;
 
-  XTranslateCoordinates(fl_display, fl_xid(win), actual.root,
-                        0, 0, x, y, &cr);
+  return XTranslateCoordinates(fl_display, fl_xid(win), actual.root,
+                               0, 0, x, y, &cr);
 }
 
-void x11_win_get_physical_size(Fl_Window* win, int* w, int* h)
+bool x11_win_get_physical_size(Fl_Window* win, int* w, int* h)
 {
   XWindowAttributes actual;
 
   assert(w);
   assert(h);
 
-  XGetWindowAttributes(fl_display, fl_xid(win), &actual);
+  if (!XGetWindowAttributes(fl_display, fl_xid(win), &actual))
+    return false;
   *w = actual.width;
   *h = actual.height;
+  return true;
+}
+
+static void refreshMonitorRects()
+{
+  monitorRectsValid = true;
+  monitorRects.clear();
+#ifdef HAVE_XRANDR
+  int eventBase, errorBase;
+  if (!XRRQueryExtension(fl_display, &eventBase, &errorBase))
+    return;
+
+  Window root = RootWindow(fl_display, fl_screen);
+  XRRScreenResources* resources = XRRGetScreenResourcesCurrent(fl_display, root);
+  if (!resources)
+    return;
+
+  for (int i = 0; i < resources->ncrtc; i++) {
+    XRRCrtcInfo* crtc = XRRGetCrtcInfo(fl_display, resources, resources->crtcs[i]);
+    if (!crtc)
+      continue;
+    if (crtc->mode != None)
+      monitorRects.emplace_back(crtc->x, crtc->y,
+                                 crtc->x + (int)crtc->width,
+                                 crtc->y + (int)crtc->height);
+    XRRFreeCrtcInfo(crtc);
+  }
+  XRRFreeScreenResources(resources);
+#endif
+}
+
+core::Rect x11_screen_rect(const core::Rect& logicalRect, float scale)
+{
+  if (!monitorRectsValid)
+    refreshMonitorRects();
+
+  for (const core::Rect& rect : monitorRects) {
+    if (screenRectMatchesPhysical(logicalRect, scale, rect))
+      return rect;
+  }
+
+  return scaleScreenRectToPhysical(logicalRect, scale);
 }
 
 void x11_win_may_grab(Fl_Window* win)
@@ -231,15 +283,8 @@ void x11_ungrab_keyboard()
 
 void x11_win_warp_pointer(Fl_Window* win, int x, int y)
 {
-  Window root = DefaultRootWindow(fl_display);
-  Window cr;
-  int rx = x;
-  int ry = y;
-
   if (win && win->shown())
-    XTranslateCoordinates(fl_display, fl_xid(win), root, x, y, &rx, &ry, &cr);
-
-  XWarpPointer(fl_display, root, root, 0, 0, 0, 0, rx, ry);
+    XWarpPointer(fl_display, None, fl_xid(win), 0, 0, 0, 0, x, y);
 }
 
 bool x11_event_physical_pos(Fl_Window* win, int* x, int* y)
@@ -247,30 +292,36 @@ bool x11_event_physical_pos(Fl_Window* win, int* x, int* y)
   assert(x);
   assert(y);
 
-  if (!fl_xevent || !win || !win->shown())
+  if (!win || !win->shown() || (pointerWindow != fl_xid(win)))
     return false;
 
-  if (fl_xevent->xany.window != fl_xid(win))
-    return false;
+  *x = pointerX;
+  *y = pointerY;
+  return true;
+}
 
-  switch (fl_xevent->type) {
+static void rememberPointerPosition(const XEvent& event)
+{
+  // FLTK's fl_xevent only points to live storage during native dispatch.
+  pointerWindow = event.xany.window;
+  switch (event.type) {
   case MotionNotify:
-    *x = fl_xevent->xmotion.x;
-    *y = fl_xevent->xmotion.y;
-    return true;
+    pointerX = event.xmotion.x;
+    pointerY = event.xmotion.y;
+    break;
   case ButtonPress:
   case ButtonRelease:
-    *x = fl_xevent->xbutton.x;
-    *y = fl_xevent->xbutton.y;
-    return true;
+    pointerX = event.xbutton.x;
+    pointerY = event.xbutton.y;
+    break;
   case EnterNotify:
   case LeaveNotify:
-    *x = fl_xevent->xcrossing.x;
-    *y = fl_xevent->xcrossing.y;
-    return true;
+    pointerX = event.xcrossing.x;
+    pointerY = event.xcrossing.y;
+    break;
+  default:
+    pointerWindow = None;
   }
-
-  return false;
 }
 
 bool x11_is_pointer_on_same_screen(Fl_Window* win)
@@ -316,16 +367,12 @@ void x11_sync_screen_scale()
 
   float envMultiplier = 1.0f;
   const char* envScale = getenv("FLTK_SCALING_FACTOR");
-  if (envScale && (*envScale != '\0')) {
-    char* end = nullptr;
-    float v = strtof(envScale, &end);
-    if ((end != envScale) && (*end == '\0') && std::isfinite(v) && (v > 0.0f))
-      envMultiplier = v;
-  }
+  if (envScale)
+    parsePositiveScale(envScale, &envMultiplier);
 
   float scale = computeUIScaleFromDpi(dpi, envMultiplier);
   for (int i = 0; i < Fl::screen_count(); i++) {
-    if (fabsf(Fl::screen_scale(i) - scale) > 0.001f) {
+    if (Fl::screen_scale(i) != scale) {
       vlog.debug("Setting FLTK screen %d scale to %.3f (Xft.dpi=%.1f)",
                  i, scale, dpi);
       Fl::screen_scale(i, scale);
@@ -338,15 +385,19 @@ static void sync_scale_timeout(void*)
   x11_sync_screen_scale();
 }
 
-static int x11_scale_system_handler(void* event, void*)
+static int x11_system_handler(void* event, void* workAreaAtom)
 {
   if (!fl_display || !event)
     return 0;
 
   const XEvent* xev = (const XEvent*)event;
+  rememberPointerPosition(*xev);
+
+  // FLTK can also change its scale when the window manager updates work areas.
   if ((xev->type == PropertyNotify) &&
       (xev->xproperty.window == RootWindow(fl_display, fl_screen)) &&
-      (xev->xproperty.atom == XA_RESOURCE_MANAGER)) {
+      ((xev->xproperty.atom == XA_RESOURCE_MANAGER) ||
+       (xev->xproperty.atom == *static_cast<Atom*>(workAreaAtom)))) {
     Fl::remove_timeout(sync_scale_timeout);
     Fl::add_timeout(0.05, sync_scale_timeout);
   }
@@ -357,6 +408,7 @@ static int x11_scale_system_handler(void* event, void*)
 static int x11_scale_fltk_handler(int event)
 {
   if (event == FL_SCREEN_CONFIGURATION_CHANGED) {
+    monitorRectsValid = false;
     Fl::remove_timeout(sync_scale_timeout);
     Fl::add_timeout(0.05, sync_scale_timeout);
   }
@@ -367,6 +419,7 @@ static int x11_scale_fltk_handler(int event)
 void x11_init_scale_sync()
 {
   static bool initialized = false;
+  static Atom workAreaAtom;
 
   x11_sync_screen_scale();
 
@@ -379,6 +432,7 @@ void x11_init_scale_sync()
   if (XGetWindowAttributes(fl_display, root, &attrs))
     XSelectInput(fl_display, root, attrs.your_event_mask | PropertyChangeMask);
 
-  Fl::add_system_handler(x11_scale_system_handler, nullptr);
+  workAreaAtom = XInternAtom(fl_display, "_NET_WORKAREA", False);
+  Fl::add_system_handler(x11_system_handler, &workAreaAtom);
   Fl::add_handler(x11_scale_fltk_handler);
 }

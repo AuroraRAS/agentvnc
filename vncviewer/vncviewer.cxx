@@ -264,11 +264,6 @@ static void CleanupSignalHandler(int sig)
 
 static void init_fltk()
 {
-  // Keep FLTK UI scaling locked to the current screen rather than
-  // manual Ctrl/Cmd +/-/0 shortcuts
-  Fl::keyboard_screen_scaling(0);
-  Fl::option(Fl::OPTION_SHOW_SCALING, false);
-
   // Adjust look of FLTK
   init_theme();
 
@@ -582,6 +577,9 @@ int main(int argc, char** argv)
   // triggers screen/display initialization in hybrid Wayland/X11 builds.
   setenv("FLTK_BACKEND", "x11", 1);
 #endif
+
+  // FLTK installs its zoom shortcuts when the display is first opened.
+  Fl::keyboard_screen_scaling(0);
 
   argv0 = argv[0];
 

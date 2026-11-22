@@ -277,7 +277,8 @@ TEST(Scale, logicalToPhysicalAndBack)
   EXPECT_EQ(physicalToLogicalSize(200, 2.0f), 100);
   EXPECT_EQ(physicalToLogicalSize(150, 1.5f), 100);
   EXPECT_EQ(physicalToLogicalSize(125, 1.25f), 100);
-  EXPECT_EQ(physicalToLogicalSize(1920, 1.75f), 1097);
+  EXPECT_EQ(physicalToLogicalSize(1920, 1.75f), 1098);
+  EXPECT_EQ(physicalToLogicalSize(641, 1.5f), 428);
 }
 
 TEST(Scale, logicalAndPhysicalRectRoundTrip)
@@ -354,6 +355,7 @@ TEST(Scale, parseXftDpiFromResources)
     "Xft.dpi: 0\n"
     "Xft.dpi: -96\n"
     "Xft.dpi: nan\n"
+    "Xft.dpi: 120,5\n"
     "Xft.dpi: 120px\n"
     "Xft.dpi:\n";
   EXPECT_TRUE(parseXftDpiFromResources(multi, &dpi));

@@ -21,6 +21,8 @@
 
 #include <stdint.h>
 
+#include <string>
+
 #include <core/Rect.h>
 
 static const int MIN_SCALE_FACTOR = 1;
@@ -51,6 +53,7 @@ core::Rect scaleScreenRectToPhysical(const core::Rect& logicalRect,
 bool screenRectMatchesPhysical(const core::Rect& logicalRect,
                                float uiScale,
                                const core::Rect& osPhysRect);
+bool parsePositiveScale(const std::string& value, float* result);
 bool parseXftDpiFromResources(const char* resources, float* dpi);
 float computeUIScaleFromDpi(float dpi, float envMultiplier = 1.0f);
 

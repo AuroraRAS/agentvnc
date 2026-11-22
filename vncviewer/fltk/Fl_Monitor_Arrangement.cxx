@@ -53,17 +53,13 @@
 #include <IOKit/hidsystem/IOHIDParameter.h>
 #endif
 
+#include "../MonitorIndicesParameter.h"
 #include "../Scale.h"
 #include "Fl_Monitor_Arrangement.h"
 
 static void get_screen_physical_xywh(int m, int& x, int& y, int& w, int& h)
 {
-  int lx, ly, lw, lh;
-  Fl::screen_xywh(lx, ly, lw, lh, m);
-  float s = Fl::screen_scale(m);
-  if (s <= 0.0f)
-    s = 1.0f;
-  core::Rect pr = scaleScreenRectToPhysical(core::Rect(lx, ly, lx + lw, ly + lh), s);
+  core::Rect pr = monitorRect(m);
   x = pr.tl.x;
   y = pr.tl.y;
   w = pr.width();

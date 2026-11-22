@@ -4,7 +4,7 @@ on: [push, pull_request]
 
 jobs:
   build-linux:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     env:
       VERBOSE: 1
@@ -76,7 +76,7 @@ jobs:
           reporter: java-junit
 
   build-all-disabled:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-26.04
     timeout-minutes: 10
     env:
       VERBOSE: 1
