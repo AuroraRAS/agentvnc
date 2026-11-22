@@ -2300,12 +2300,6 @@ def run_agent(args: argparse.Namespace) -> int:
                         ftp_display_url = redact_ftp_url(ftp_url)
                         executor.ftp_client = ftp_client
                         system_instruction = SYSTEM_INSTRUCTION + "\n" + FTP_SYSTEM_INSTRUCTION
-                        root_entries = probe_res.get("root_entries") or []
-                        if root_entries:
-                            summary = ", ".join(
-                                f"{e['path']} ({e['type']})" for e in root_entries[:20]
-                            )
-                            system_instruction += f"\nDetected remote root entries: {summary}\n"
                     else:
                         ftp_client.close()
                         ftp_client = None
