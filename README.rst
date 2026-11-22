@@ -35,6 +35,206 @@ TigerVNC ``master`` branch, ensuring that no fixes from upstream are missed.
 .. _official TigerVNC repository: https://github.com/TigerVNC/tigervnc
 
 
+AgentVNC Features and Usage
+===========================
+
+Compared to upstream TigerVNC, AgentVNC adds three main feature sets to
+``vncviewer`` (plus supporting Python tools in ``tools/``):
+
+1. An external AI agent IPC bridge with headless mode, a live action overlay,
+   and human-agent collaborative takeover.
+2. Integer-factor HiDPI screen scaling (``1x`` to ``8x``) with crisp
+   nearest-neighbor rendering.
+3. An embedded FTP server bridge that exposes RFB file transfer extensions
+   (TightVNC 2.x, TightVNC 1.3.x, and UltraVNC) over standard FTP.
+
+
+Agent IPC Bridge, Headless Mode, and Collaborative Control
+----------------------------------------------------------
+
+On Unix platforms (Linux and macOS), ``vncviewer`` can expose a local Unix
+domain socket IPC bridge for external automation and AI desktop agents, run
+entirely without a display server in headless mode, render a real-time action
+overlay, and let a human operator take over or send notes at any time.
+
+Agent Viewer Options
+~~~~~~~~~~~~~~~~~~~~
+
+* ``-AgentSocket <path>`` - Start the local Unix domain socket IPC bridge at
+  ``<path>`` (created with mode ``0600``).  Unix platforms only.
+* ``-Headless`` - Run ``vncviewer`` without opening a GUI window or requiring
+  X11/Wayland, driving RFB I/O, ``-AgentSocket``, and ``-FtpServer`` from a
+  single ``poll()`` event loop.  Unix platforms only.
+* ``-AgentOverlay`` - Draw a live HUD on the viewer showing the agent's status
+  and intent, click reticles with pulse feedback, and drag vectors.  Overlay
+  coordinates automatically scale with ``-ScaleFactor``.
+* ``-AgentCollaborate`` - Enable collaborative mode (implies ``-AgentOverlay``)
+  where local mouse or keyboard input automatically pauses agent input for
+  immediate human takeover.
+
+Interactive Controls (Windowed Mode)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+When ``vncviewer`` is running with ``-AgentSocket`` in a GUI window, the
+operator can use the viewer shortcut modifiers (configured via
+``-ShortcutModifiers``) or the right-click context menu:
+
+* ``<Shortcut>+P`` or **Pause agent input** - Pause or resume agent input.
+* ``<Shortcut>+N`` or **Send note to agent...** - Queue a text note that the
+  agent retrieves via ``POLL_USER_MESSAGES``.
+* **Show agent overlay** / **Collaborative takeover** - Toggle the live overlay
+  and automatic human takeover from the context menu.
+
+Example viewer invocations::
+
+  # Headless viewer with IPC bridge and embedded FTP bridge (auto port)
+  vncviewer -Headless -AgentSocket /tmp/agentvnc.sock -FtpServer -FtpPort 0 \
+      localhost:5900
+
+  # Windowed collaborative session with live overlay and human takeover
+  vncviewer -AgentSocket /tmp/agentvnc.sock -AgentCollaborate localhost:5900
+
+IPC Protocol and Test Client
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Messages on ``-AgentSocket`` use length-prefixed binary frames::
+
+  [4-byte big-endian header_len][4-byte big-endian payload_len]
+  [UTF-8 JSON header][optional binary payload]
+
+Supported JSON ``cmd`` values are: ``PING``, ``GET_STATUS``, ``GET_FRAME``
+(returns raw ``RGB24`` or ``RGBA32`` pixel buffers in the binary payload),
+``REQUEST_REFRESH``, ``POINTER_EVENT``, ``KEY_EVENT``, ``TEXT_TYPE``,
+``CLIPBOARD_GET``, ``CLIPBOARD_SET``, ``PAUSE_AGENT``, ``RESUME_AGENT``,
+``AGENT_OVERLAY``, and ``POLL_USER_MESSAGES``.  When the embedded FTP bridge is
+enabled, ``GET_STATUS`` also reports ``ftp_enabled``, ``ftp_running``,
+``ftp_url``, ``ftp_supported``, ``ftp_ready``, and ``ftp_protocol``.
+
+To verify a running ``-AgentSocket`` session, run the bundled Python test
+client (uses only the Python standard library)::
+
+  python3 tools/test_agent_bridge.py --socket /tmp/agentvnc.sock
+
+Running the Gemini Computer Use Agent
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+``tools/vnc_computer_use_agent.py`` implements a Gemini Computer Use desktop
+agent over ``-AgentSocket`` using only the Python standard library.  Provide an
+API key via the ``GEMINI_API_KEY`` environment variable or ``--api-key-file``
+(default: ``./gemini.key``)::
+
+  # Spawn a headless viewer automatically and run a task
+  GEMINI_API_KEY=... python3 tools/vnc_computer_use_agent.py \
+      --vnc-host localhost:5900 \
+      --prompt "Create hello.txt on the desktop"
+
+  # Launch a visible window with live overlay and interactive collaboration
+  GEMINI_API_KEY=... python3 tools/vnc_computer_use_agent.py \
+      --vnc-host localhost:5900 \
+      --collaborate \
+      --prompt "Inspect the desktop and wait for follow-up instructions"
+
+  # Attach to an already running vncviewer -AgentSocket instance
+  GEMINI_API_KEY=... python3 tools/vnc_computer_use_agent.py \
+      --socket /tmp/agentvnc.sock \
+      --prompt "Summarize the files in the home directory"
+
+Key agent flags:
+
+* ``--windowed`` - Launch ``vncviewer`` with a visible window and
+  ``-AgentOverlay`` instead of ``-Headless``.
+* ``--collaborate`` - Launch with ``-AgentOverlay -AgentCollaborate`` and wait
+  for follow-up user instructions after task completion (pass ``--one-shot`` to
+  exit after the initial task).
+* ``--socket <path>`` - Connect to an existing ``-AgentSocket`` instead of
+  spawning ``vncviewer`` (FTP bridge URL is auto-discovered from
+  ``GET_STATUS``).
+* ``--model <name>``, ``--max-turns <n>``, ``--thinking-level <level>``,
+  ``--recovery-thinking-level <level>`` - Configure model behavior and adaptive
+  error recovery.
+* ``--ftp`` / ``--no-ftp`` / ``--ftp-url <url>`` - Control direct remote file
+  I/O tools (``file_list``, ``file_stat``, ``file_read``, ``file_write``,
+  ``file_mkdir``, ``file_delete``, ``file_rename``) backed by ``-FtpServer``.
+  Pass ``--ftp`` to require FTP file tools to be available, or ``--no-ftp`` to
+  disable them.
+* ``--no-custom-tools`` - Disable deterministic helper tools
+  (``clipboard_get``, ``clipboard_set``, ``paste_text_at``, ``click_and_type``,
+  ``get_desktop_status``, ``yield_to_user``).
+* ``--vncviewer-bin <path>`` - Path to the built ``vncviewer`` binary
+  (default: ``build/vncviewer/vncviewer``).
+
+Run ``python3 tools/test_agent_file_io.py`` for offline unit tests of the agent
+file I/O tools (or pass ``--live --vnc-host localhost:5901`` for a live VNC
+integration test).
+
+
+Integer-Factor HiDPI Scaling
+----------------------------
+
+``vncviewer`` supports integer display scaling from ``1x`` to ``8x`` across all
+platforms using crisp nearest-neighbor pixel duplication, avoiding blurry
+fractional scaling on HiDPI displays.
+
+* ``-ScaleFactor <1..8>`` - Set the integer scaling factor (default: ``1``).
+  Pointer coordinates are mapped back to unscaled remote framebuffer
+  coordinates, remote cursors are scaled automatically, and when
+  ``-RemoteResize`` is active the requested remote desktop dimensions are
+  computed by dividing the viewer window size by the scaling factor.  An
+  explicit ``-DesktopSize`` continues to specify unscaled remote framebuffer
+  dimensions.
+* **GUI configuration**: Open **Options -> Display -> Scaling** and choose a
+  **Scale factor** from ``1x`` to ``8x``.  The selection is saved in the viewer
+  configuration and updates the active window immediately.
+
+Example::
+
+  vncviewer -ScaleFactor 2 localhost:5900
+
+
+Embedded FTP Server Bridge (RFB File Transfer)
+----------------------------------------------
+
+On Unix platforms (Linux and macOS), ``vncviewer`` includes an embedded local
+FTP server that bridges standard FTP commands (including ``LIST``/``MLSD``,
+``RETR``, ``STOR``/``APPE``, ``REST``, ``SIZE``/``MDTM``, ``MKD``, ``RMD``,
+``DELE``, ``RNFR``/``RNTO``, and ``PASV``/``EPSV``/``PORT``/``EPRT``) onto the
+remote VNC server's RFB file transfer extension.  It supports TightVNC 2.x
+(``Tight2``), TightVNC 1.3.x (``Tight13``), and UltraVNC (``Ultra``) file
+transfer protocols and works in both GUI and ``-Headless`` modes.
+
+FTP Bridge Viewer Options
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+* ``-FtpServer`` - Enable the embedded FTP bridge (default: off).  Enable this
+  before connecting when the VNC server requires ``Tight`` capability
+  negotiation.
+* ``-FtpBindAddress <address>`` - Local address to bind to (default:
+  ``127.0.0.1``).
+* ``-FtpPort <port>`` - Local TCP listen port; ``0`` selects an ephemeral port
+  automatically (default: ``2121``).
+* ``-FtpUsername <username>`` / ``-FtpPassword <password>`` - Optional login
+  credentials required by the local FTP bridge (by default any login is
+  accepted).
+* ``-FtpProtocol <Auto|Tight2|Tight13|Ultra>`` - Preferred RFB file transfer
+  protocol (default: ``Auto``).
+
+GUI and CLI Usage
+~~~~~~~~~~~~~~~~~
+
+In windowed mode, you can toggle the bridge from the context menu (**FTP
+server**), configure persistent defaults under **Options -> Misc -> Enable FTP
+server bridge**, and check the active listening URL in **Connection info...**.
+
+Example::
+
+  # Start vncviewer with the embedded FTP bridge on localhost:2121
+  vncviewer -FtpServer -FtpPort 2121 localhost:5900
+
+  # Transfer files using any standard FTP client
+  curl ftp://127.0.0.1:2121/
+  curl -T local.txt ftp://127.0.0.1:2121/remote.txt
+
+
 Legal
 =====
 
