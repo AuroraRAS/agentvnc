@@ -780,6 +780,27 @@ void FileTransferClient::cancelUpload()
 
 void FileTransferClient::abortPendingOp()
 {
+  if (caps_.protocol == FileTransferProtocol::Tight2) {
+    // Tight replies have no request ID. Keep the connection busy until the
+    // old reply is consumed and any open remote handle has been released.
+    if (opState_ == OpState::Downloading) {
+      cancelDownload();
+      return;
+    }
+    if (opState_ == OpState::Uploading) {
+      cancelUpload();
+      return;
+    }
+    if (opState_ == OpState::DrainingCancel)
+      return;
+    if (tight2ReplyPending_ &&
+        (opState_ == OpState::Listing || opState_ == OpState::Command)) {
+      opState_ = OpState::DrainingCancel;
+      commandKind_ = CommandKind::NoneOp;
+      return;
+    }
+  }
+
   if (opState_ == OpState::Downloading && writer_ != nullptr) {
     if (caps_.protocol == FileTransferProtocol::Tight13)
       writer_->writeTight13FileDownloadCancel("Operation aborted");

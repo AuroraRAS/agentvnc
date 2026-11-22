@@ -437,6 +437,8 @@ void FtpServer::checkTimeout()
     }
     rfb::FileTransferClient* ft =
       backend_ != nullptr ? backend_->fileTransfer() : nullptr;
+    // Detach the expired operation before cancellation can call us back.
+    activeOp_ = QueuedOp();
     if (ft != nullptr) {
       ft->abortPendingOp();
       if (backend_ != nullptr)
@@ -1777,7 +1779,7 @@ void FtpServer::pumpQueue()
     opQueue_.pop_front();
 
     ClientSession* s = findSession(next.sessionId);
-    if (s == nullptr)
+    if (s == nullptr || s->closeAfterFlush)
       continue;
 
     if (backend_ == nullptr || !backend_->isConnected()) {
@@ -1792,6 +1794,13 @@ void FtpServer::pumpQueue()
       closeDataChannel(s);
       s->dataState = ClientSession::DataTransferState::Idle;
       sendReply(s, "550 File transfer not available.");
+      continue;
+    }
+
+    if (ft->isBusy()) {
+      closeDataChannel(s);
+      s->dataState = ClientSession::DataTransferState::Idle;
+      sendReply(s, "450 Waiting for the previous RFB operation to finish.");
       continue;
     }
 
@@ -2328,6 +2337,9 @@ void FtpServer::onCommandComplete(bool ok, const std::string& error)
 
 void FtpServer::onCancelComplete()
 {
+  if (activeOp_.kind == OpKind::Idle)
+    return;
+
   ClientSession* s = findSession(activeOp_.sessionId);
   if (s != nullptr &&
       s->dataState == ClientSession::DataTransferState::Canceling) {
