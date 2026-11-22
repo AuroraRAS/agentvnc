@@ -1293,6 +1293,7 @@ public:
     : viewOnly_(false), sock_(nullptr)
   {
     supportsFileTransfer = true;
+    preferTightForFileTransfer = true;
   }
 
   void attachSocket(network::TcpSocket* sock)
