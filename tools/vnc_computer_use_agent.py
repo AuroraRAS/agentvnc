@@ -2309,6 +2309,11 @@ def run_agent(args: argparse.Namespace) -> int:
                     else:
                         ftp_client.close()
                         ftp_client = None
+                        if args.ftp:
+                            raise RuntimeError(
+                                "Direct FTP file tools requested (--ftp), but the remote "
+                                "VNC server does not support RFB file transfer."
+                            )
                         print(
                             "[INFO] Remote VNC server does not support RFB file transfer; "
                             "direct file tools disabled."
