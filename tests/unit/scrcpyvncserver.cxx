@@ -21,6 +21,7 @@
 #endif
 
 #include <arpa/inet.h>
+#include <atomic>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -39,6 +40,7 @@
 #include <core/Configuration.h>
 #include <core/Rect.h>
 #include <network/TcpSocket.h>
+#include <network/UnixSocket.h>
 #include <rfb/PixelBuffer.h>
 #include <rfb/PixelFormat.h>
 #include <rfb/SecurityServer.h>
@@ -362,6 +364,38 @@ protected:
   }
 };
 
+void negotiateRfb(ScrcpyServer& server, int fd)
+{
+  char version[12];
+  readAllTimeout(fd, version, sizeof(version));
+  ASSERT_EQ(std::memcmp(version, "RFB 003.008\n", sizeof(version)), 0);
+  writeAll(fd, version, sizeof(version));
+  ASSERT_TRUE(server.step({}, 0));
+
+  uint8_t security[2];
+  readAllTimeout(fd, security, sizeof(security));
+  ASSERT_EQ(security[0], 1);
+  ASSERT_EQ(security[1], 1);
+  writeAll(fd, security + 1, 1);
+  ASSERT_TRUE(server.step({}, 0));
+}
+
+void initialiseRfb(ScrcpyServer& server, int fd)
+{
+  ASSERT_NO_FATAL_FAILURE(negotiateRfb(server, fd));
+  uint8_t result[4];
+  readAllTimeout(fd, result, sizeof(result));
+  ASSERT_EQ(readBe32(result), 0u);
+
+  uint8_t shared = 1;
+  writeAll(fd, &shared, 1);
+  ASSERT_TRUE(server.step({}, 0));
+  uint8_t header[24];
+  readAllTimeout(fd, header, sizeof(header));
+  std::vector<uint8_t> name(readBe32(header + 20));
+  readAllTimeout(fd, name.data(), name.size());
+}
+
 } // namespace
 
 TEST(H264SpsParserTest, Parses1080p1440pAndCropped2880x1620)
@@ -617,11 +651,11 @@ TEST(AdbClientTest, DirectTcpProtocolAndTcpNodelay)
 
   std::vector<uint8_t> pushedBytes;
   std::string pushedSpec;
-  bool stopMock = false;
+  std::atomic<bool> stopMock{false};
 
   auto readAdbCmd = [](int fd) -> std::string {
-    char hex[4];
-    readAllTimeout(fd, hex, 4);
+    char hex[5] = {};
+    readAllTimeout(fd, hex, sizeof(hex) - 1);
     unsigned len = 0;
     std::sscanf(hex, "%4x", &len);
     std::string cmd(len, '\0');
@@ -726,6 +760,9 @@ TEST(AdbClientTest, DirectTcpProtocolAndTcpNodelay)
   client.pushFile("192.168.240.112:5555", tmpl,
                   "/data/local/tmp/scrcpy-server.jar");
   ::unlink(tmpl);
+  stopMock = true;
+  mockAdb.join();
+  ::close(srv);
 
   EXPECT_EQ(pushedSpec, "/data/local/tmp/scrcpy-server.jar,33188");
   std::string gotStr(pushedBytes.begin(), pushedBytes.end());
@@ -735,10 +772,6 @@ TEST(AdbClientTest, DirectTcpProtocolAndTcpNodelay)
   EXPECT_EQ(AdbClient::detectVersionFromPath("/usr/share/scrcpy-server-3.3.4.jar"), "3.3.4");
   EXPECT_EQ(AdbClient::extractExpectedVersionFromError(
               "ERROR: The server version (5.0.1) does not match"), "5.0.1");
-
-  stopMock = true;
-  mockAdb.join();
-  ::close(srv);
 }
 
 TEST(ScrcpyControlTest, SerializesMessagesAndParsesClipboard)
@@ -780,12 +813,24 @@ TEST(ScrcpyControlTest, SerializesMessagesAndParsesClipboard)
   EXPECT_EQ(readBe32(msg3 + 28), 0u);
 
   EXPECT_EQ(scroll[0], 3);
-  EXPECT_GT(readBeS16(scroll + 15), 0);
+  EXPECT_EQ(readBeS16(scroll + 15), 2048);
 
   EXPECT_EQ(key1[0], 0);
   EXPECT_EQ(key1[1], 0); // ACTION_DOWN
   EXPECT_EQ(readBe32(key1 + 2), 29u); // AKEYCODE_A
   EXPECT_EQ(key2[1], 1); // ACTION_UP
+  EXPECT_EQ(rst[0], 17);
+
+  ctrl.setServerVersion("2.7");
+  ctrl.sendResetVideo();
+  ctrl.sendScrollEvent(150, 250, 1920, 1080, 0.0f, 1.0f, 0);
+  readAllTimeout(fds[1], scroll, sizeof(scroll));
+  EXPECT_EQ(scroll[0], 3);
+  EXPECT_EQ(readBeS16(scroll + 15), 32767);
+
+  ctrl.setServerVersion("3.3.0");
+  ctrl.sendResetVideo();
+  readAllTimeout(fds[1], rst, sizeof(rst));
   EXPECT_EQ(rst[0], 17);
 
   // Test device clipboard message parsing
@@ -799,12 +844,128 @@ TEST(ScrcpyControlTest, SerializesMessagesAndParsesClipboard)
   devMsg[0] = 0; // DEVICE_MSG_TYPE_CLIPBOARD
   writeBe32(devMsg + 1, 13);
   std::memcpy(devMsg + 5, text, 13);
-  writeAll(fds[1], devMsg, sizeof(devMsg));
+  writeAll(fds[1], devMsg, 3);
+  EXPECT_TRUE(ctrl.processReadable(cb));
+  EXPECT_TRUE(cb.clip.empty());
 
-  ctrl.processReadable(cb);
+  writeAll(fds[1], devMsg + 3, sizeof(devMsg) - 3);
+  ASSERT_EQ(::shutdown(fds[1], SHUT_WR), 0);
+  EXPECT_FALSE(ctrl.processReadable(cb));
   EXPECT_EQ(cb.clip, "hello-android");
 
   ::close(fds[1]);
+}
+
+TEST(ScrcpyVncEndToEndTest, RejectsUnsupportedViewerAndQueryConnections)
+{
+  rfb::SecurityServer::secTypes.setParam("None");
+
+  int video[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, video), 0);
+  network::UnixSocket source(video[1]);
+  ScrcpyServer server;
+  server.attachStreamsForTest(video[0], -1, ScrcpyProtocol::V2,
+                              1920, 1080, "Test");
+
+  int unsupported[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, unsupported), 0);
+  network::UnixSocket viewer(unsupported[1]);
+  ASSERT_TRUE(server.addSocket(new network::UnixSocket(unsupported[0])));
+  ASSERT_NO_FATAL_FAILURE(initialiseRfb(server, viewer.getFd()));
+
+  uint8_t noEncodings[] = {rfb::msgTypeSetEncodings, 0, 0, 0};
+  writeAll(viewer.getFd(), noEncodings, sizeof(noEncodings));
+  ASSERT_TRUE(server.step({}, 0));
+  uint8_t byte;
+  EXPECT_EQ(::recv(viewer.getFd(), &byte, 1, MSG_DONTWAIT), 0);
+
+  int query[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, query), 0);
+  network::UnixSocket queryViewer(query[1]);
+  auto* querySocket = new network::UnixSocket(query[0]);
+  querySocket->setRequiresQuery();
+  ASSERT_TRUE(server.addSocket(querySocket));
+  ASSERT_NO_FATAL_FAILURE(negotiateRfb(server, queryViewer.getFd()));
+  uint8_t securityResult[4];
+  readAllTimeout(queryViewer.getFd(), securityResult, sizeof(securityResult));
+  EXPECT_EQ(readBe32(securityResult), 1u);
+}
+
+TEST(ScrcpyVncEndToEndTest, ResyncsAfterSkippedFramesAndConfigChanges)
+{
+  rfb::SecurityServer::secTypes.setParam("None");
+  int video[2], connection[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, video), 0);
+  network::UnixSocket source(video[1]);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, connection), 0);
+  network::UnixSocket viewer(connection[1]);
+
+  ScrcpyServer server;
+  server.attachStreamsForTest(video[0], -1, ScrcpyProtocol::V2,
+                              1920, 1080, "Test");
+  ASSERT_TRUE(server.addSocket(new network::UnixSocket(connection[0])));
+  int fd = viewer.getFd();
+  ASSERT_NO_FATAL_FAILURE(initialiseRfb(server, fd));
+
+  uint8_t encodings[] = {rfb::msgTypeSetEncodings, 0, 0, 1, 0, 0, 0, 0};
+  writeBe32(encodings + 4, rfb::encodingH264);
+  writeAll(fd, encodings, sizeof(encodings));
+
+  uint8_t update[] = {rfb::msgTypeFramebufferUpdateRequest, 0, 0, 0, 0, 0,
+                      0, 0, 0, 0};
+  writeBe16(update + 6, 1920);
+  writeBe16(update + 8, 1080);
+  writeAll(fd, update, sizeof(update));
+
+  auto readIdr = [&](const uint8_t* expectedConfig) {
+    uint8_t header[24];
+    readAllTimeout(fd, header, sizeof(header));
+    ASSERT_EQ(header[0], rfb::msgTypeFramebufferUpdate);
+    ASSERT_EQ(readBeS32(header + 12), rfb::encodingH264);
+    ASSERT_EQ(readBe32(header + 16), sizeof(kFrame1080));
+    EXPECT_EQ(readBe32(header + 20), 1u);
+    uint8_t frame[sizeof(kFrame1080)];
+    readAllTimeout(fd, frame, sizeof(frame));
+    EXPECT_EQ(std::memcmp(frame, expectedConfig, kFrame1080SpsPpsLen), 0);
+  };
+
+  const uint64_t configFlag = UINT64_C(1) << 63;
+  const uint64_t keyFlag = UINT64_C(1) << 62;
+  const uint8_t* idr = kFrame1080 + kFrame1080SpsPpsLen;
+  const size_t idrLen = sizeof(kFrame1080) - kFrame1080SpsPpsLen;
+  sendScrcpyPacket(video[1], configFlag, kFrame1080, kFrame1080SpsPpsLen);
+  sendScrcpyPacket(video[1], keyFlag, idr, idrLen);
+  ASSERT_TRUE(server.step({}, 0));
+  ASSERT_NO_FATAL_FAILURE(readIdr(kFrame1080));
+
+  // An incremental viewer can miss frames between update requests.
+  const uint8_t delta[] = {0, 0, 1, 0x41, 0x80};
+  sendScrcpyPacket(video[1], 0, delta, sizeof(delta));
+  ASSERT_TRUE(server.step({}, 0));
+  update[1] = 1;
+  writeAll(fd, update, sizeof(update));
+  sendScrcpyPacket(video[1], 0, delta, sizeof(delta));
+  ASSERT_TRUE(server.step({}, 0));
+  struct pollfd pending = {fd, POLLIN, 0};
+  EXPECT_EQ(::poll(&pending, 1, 0), 0);
+  sendScrcpyPacket(video[1], keyFlag, idr, idrLen);
+  ASSERT_TRUE(server.step({}, 0));
+  ASSERT_NO_FATAL_FAILURE(readIdr(kFrame1080));
+
+  // A new config with unchanged dimensions invalidates the previous IDR.
+  uint8_t config[kFrame1080SpsPpsLen];
+  std::memcpy(config, kFrame1080, sizeof(config));
+  config[sizeof(config) - 1] ^= 1;
+  sendScrcpyPacket(video[1], configFlag, config, sizeof(config));
+  ASSERT_TRUE(server.step({}, 0));
+  update[1] = 0;
+  writeAll(fd, update, sizeof(update));
+  sendScrcpyPacket(video[1], 0, delta, sizeof(delta));
+  ASSERT_TRUE(server.step({}, 0));
+  EXPECT_EQ(::poll(&pending, 1, 0), 0);
+  sendScrcpyPacket(video[1], keyFlag, idr, idrLen);
+  ASSERT_TRUE(server.step({}, 0));
+  ASSERT_NO_FATAL_FAILURE(readIdr(config));
 }
 
 #ifdef HAVE_H264
@@ -827,7 +988,7 @@ TEST(ScrcpyVncEndToEndTest, HandshakeContinuousUpdatesResizeAndH264Decode)
   int port = listener.getMyPort();
   ASSERT_GT(port, 0);
 
-  volatile bool stopServer = false;
+  std::atomic<bool> stopServer{false};
   std::thread serverThread([&]() {
     while (!stopServer) {
       if (!server.step(listeners, 20))
@@ -1080,7 +1241,6 @@ TEST(ScrcpyVncEndToEndTest, HandshakeContinuousUpdatesResizeAndH264Decode)
   EXPECT_EQ(rflags, 3u);
 
   stopServer = true;
-  server.terminate();
   serverThread.join();
   ::close(videoFds[1]);
   ::close(ctrlFds[1]);

@@ -40,10 +40,9 @@ public:
 
   bool hasBufferedData() const;
 
-  // Atomically sends staged/pending bytes and scatter-gather iovecs via
-  // writev() without user-space memcpy of the payload. Returns false if the
-  // socket is currently backpressured so the caller can drop the frame and
-  // schedule an IDR resync.
+  // Sends a frame with scatter-gather I/O after any queued bytes. A partial
+  // write queues the unsent tail. Returns false if no frame bytes were sent
+  // due to backpressure, so the caller can drop it and resync at an IDR.
   bool writevFrame(const struct iovec* iov, int iovcnt);
 
 private:

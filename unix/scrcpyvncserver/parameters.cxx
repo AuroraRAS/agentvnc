@@ -64,10 +64,10 @@ core::StringParameter
                _("Path to scrcpy-server jar on the host"), "");
 core::StringParameter
   scrcpyVersion("ScrcpyVersion",
-                _("scrcpy-server version string (empty auto-detects)"), "");
+                _("scrcpy-server version (auto-detected when launching if empty)"), "");
 core::StringParameter
   scrcpySocket("ScrcpySocket",
-               _("Android abstract socket name for scrcpy"), "scrcpy");
+               _("Android abstract socket name in attach mode"), "scrcpy");
 core::IntParameter
   scid("Scid",
        _("scrcpy connection ID (-1 uses default socket name)"),

@@ -32,6 +32,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <poll.h>
 #include <stdexcept>
 #include <sys/socket.h>
 #include <sys/stat.h>
@@ -44,6 +45,9 @@
 static core::LogWriter vlog("AdbClient");
 
 namespace {
+
+static const int kAdbTimeoutMs = 5000;
+static const size_t kChunkMax = 65536;
 
 void writeAll(int fd, const uint8_t* data, size_t len)
 {
@@ -165,15 +169,32 @@ int AdbClient::connectDaemon() const
       continue;
     }
 
-    int ret;
-    do {
-      ret = ::connect(sock, p->ai_addr, p->ai_addrlen);
-    } while (ret < 0 && errno == EINTR);
-
-    if (ret == 0)
-      break;
-
-    lastErr = errno;
+    struct timeval timeout = { kAdbTimeoutMs / 1000, 0 };
+    int flags = ::fcntl(sock, F_GETFL, 0);
+    if (flags < 0 || ::fcntl(sock, F_SETFL, flags | O_NONBLOCK) < 0 ||
+        ::setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0 ||
+        ::setsockopt(sock, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout)) < 0) {
+      lastErr = errno;
+    } else {
+      int ret = ::connect(sock, p->ai_addr, p->ai_addrlen);
+      lastErr = ret == 0 ? 0 : errno;
+      if (lastErr == EINPROGRESS || lastErr == EINTR) {
+        struct pollfd pfd = { sock, POLLOUT, 0 };
+        ret = ::poll(&pfd, 1, kAdbTimeoutMs);
+        if (ret > 0) {
+          socklen_t len = sizeof(lastErr);
+          if (::getsockopt(sock, SOL_SOCKET, SO_ERROR, &lastErr, &len) < 0)
+            lastErr = errno;
+        } else {
+          lastErr = ret == 0 ? ETIMEDOUT : errno;
+        }
+      }
+      if (lastErr == 0) {
+        if (::fcntl(sock, F_SETFL, flags) == 0)
+          break;
+        lastErr = errno;
+      }
+    }
     ::close(sock);
     sock = -1;
   }
@@ -358,7 +379,7 @@ void AdbClient::pushFile(const std::string& serial,
                          const std::string& remotePath,
                          unsigned int mode) const
 {
-  int inFd = ::open(localPath.c_str(), O_RDONLY);
+  int inFd = ::open(localPath.c_str(), O_RDONLY | O_NONBLOCK | O_CLOEXEC);
   if (inFd < 0)
     throw core::posix_error(
       core::format("Failed to open local file '%s'", localPath.c_str()),
@@ -368,6 +389,8 @@ void AdbClient::pushFile(const std::string& serial,
   struct stat st;
   if (::fstat(inFd, &st) < 0)
     throw core::posix_error("fstat failed on local file", errno);
+  if (!S_ISREG(st.st_mode))
+    throw std::invalid_argument("scrcpy-server path must be a regular file");
 
   FdGuard fd(connectDaemon());
   selectTransport(fd.get(), serial);
@@ -390,7 +413,6 @@ void AdbClient::pushFile(const std::string& serial,
   writeAll(fd.get(), reinterpret_cast<const uint8_t*>(remoteSpec.data()),
            remoteSpec.size());
 
-  static const size_t kChunkMax = 65536;
   std::vector<uint8_t> buf(8 + kChunkMax);
   std::memcpy(buf.data(), "DATA", 4);
 
@@ -417,6 +439,8 @@ void AdbClient::pushFile(const std::string& serial,
   uint32_t respLen = getLe32(resp + 4);
 
   if (std::memcmp(resp, "FAIL", 4) == 0) {
+    if (respLen > kChunkMax)
+      throw std::runtime_error("Invalid ADB sync error message length");
     std::string failMsg(respLen, '\0');
     if (respLen > 0)
       readAll(fd.get(), reinterpret_cast<uint8_t*>(&failMsg[0]), respLen);
@@ -443,10 +467,6 @@ int AdbClient::startShell(const std::string& serial,
   if (!readStatus(fd.get(), &err))
     throw std::runtime_error(
       core::format("ADB shell command failed: %s", err.c_str()));
-
-  int flags = ::fcntl(fd.get(), F_GETFL, 0);
-  if (flags >= 0)
-    ::fcntl(fd.get(), F_SETFL, flags | O_NONBLOCK);
 
   return fd.release();
 }

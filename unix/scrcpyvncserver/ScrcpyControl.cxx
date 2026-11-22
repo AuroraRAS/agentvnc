@@ -24,6 +24,7 @@
 
 #include <algorithm>
 #include <cerrno>
+#include <cstdio>
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -46,7 +47,7 @@ static core::LogWriter vlog("ScrcpyControl");
 
 namespace {
 
-// Control message types (identical across scrcpy v2..v5)
+// Control message types
 enum ControlMsgType : uint8_t {
   kMsgInjectKeycode = 0,
   kMsgInjectText = 1,
@@ -106,6 +107,7 @@ static const uint64_t kPointerIdMouse = UINT64_C(-1);
 static const size_t kMaxTextLength = 300;
 static const size_t kMaxClipboardLength = (1u << 18) - 14u;
 static const size_t kMaxDeviceMsgSize = (1u << 18);
+static const size_t kMaxControlQueue = 4 * kMaxDeviceMsgSize;
 
 void writeBe16(uint8_t* p, uint16_t v)
 {
@@ -312,7 +314,9 @@ ScrcpyControl::ScrcpyControl()
     lastVncMask_(0),
     lastX_(0),
     lastY_(0),
-    metaState_(0)
+    metaState_(0),
+    supportsVideoReset_(true),
+    scrollRange_(16.0f)
 {
 }
 
@@ -330,6 +334,19 @@ void ScrcpyControl::attach(int fd)
   if (flags >= 0)
     ::fcntl(fd, F_SETFL, flags | O_NONBLOCK);
   fd_ = fd;
+}
+
+void ScrcpyControl::setServerVersion(const std::string& version)
+{
+  unsigned major = 0, minor = 0, patch = 0;
+  if (std::sscanf(version.c_str(), "%9u.%9u.%9u", &major, &minor, &patch) < 2)
+    return;
+
+  supportsVideoReset_ = major >= 3;
+  // scrcpy 3.3.1 expanded the range encoded by the scroll fields.
+  bool extendedScroll = major > 3 ||
+                        (major == 3 && (minor > 3 || (minor == 3 && patch >= 1)));
+  scrollRange_ = extendedScroll ? 16.0f : 1.0f;
 }
 
 void ScrcpyControl::close()
@@ -351,6 +368,12 @@ void ScrcpyControl::enqueue(const uint8_t* data, size_t len)
 {
   if (fd_ < 0 || len == 0)
     return;
+
+  if (len > kMaxControlQueue - (sendBuf_.size() - sendOffset_)) {
+    vlog.error("Control socket output queue is full");
+    close();
+    return;
+  }
 
   if (sendOffset_ == sendBuf_.size()) {
     size_t sent = 0;
@@ -375,6 +398,10 @@ void ScrcpyControl::enqueue(const uint8_t* data, size_t len)
     return;
   }
 
+  if (sendBuf_.size() + len > kMaxControlQueue) {
+    sendBuf_.erase(sendBuf_.begin(), sendBuf_.begin() + sendOffset_);
+    sendOffset_ = 0;
+  }
   sendBuf_.insert(sendBuf_.end(), data, data + len);
 }
 
@@ -412,8 +439,8 @@ bool ScrcpyControl::processReadable(Callbacks& cb)
     return false;
 
   uint8_t tmp[4096];
-  while (true) {
-    ssize_t n = ::recv(fd_, tmp, sizeof(tmp), 0);
+  for (int i = 0; i < 16; ++i) {
+    ssize_t n = ::recv(fd_, tmp, sizeof(tmp), MSG_DONTWAIT);
     if (n < 0) {
       if (errno == EINTR)
         continue;
@@ -428,8 +455,14 @@ bool ScrcpyControl::processReadable(Callbacks& cb)
       return false;
     }
     recvBuf_.insert(recvBuf_.end(), tmp, tmp + n);
+    if (!processDeviceMessages(cb))
+      return false;
   }
+  return true;
+}
 
+bool ScrcpyControl::processDeviceMessages(Callbacks& cb)
+{
   while (recvOffset_ < recvBuf_.size()) {
     const uint8_t* p = recvBuf_.data() + recvOffset_;
     size_t avail = recvBuf_.size() - recvOffset_;
@@ -504,8 +537,8 @@ void ScrcpyControl::sendScrollEvent(int32_t x, int32_t y,
                                     float hscroll, float vscroll,
                                     uint32_t buttons)
 {
-  float hNorm = std::max(-1.0f, std::min(1.0f, hscroll / 16.0f));
-  float vNorm = std::max(-1.0f, std::min(1.0f, vscroll / 16.0f));
+  float hNorm = std::max(-1.0f, std::min(1.0f, hscroll / scrollRange_));
+  float vNorm = std::max(-1.0f, std::min(1.0f, vscroll / scrollRange_));
 
   uint8_t buf[21];
   buf[0] = kMsgInjectScrollEvent;
@@ -561,6 +594,9 @@ void ScrcpyControl::sendSetClipboard(uint64_t sequence,
 
 void ScrcpyControl::sendResetVideo()
 {
+  if (!supportsVideoReset_)
+    return;
+
   uint8_t msg = kMsgResetVideo;
   enqueue(&msg, 1);
 }
@@ -648,8 +684,6 @@ void ScrcpyControl::handleVncPointer(int x, int y, uint16_t buttonMask,
 
 void ScrcpyControl::releasePointer(int screenW, int screenH)
 {
-  if (fd_ < 0 || androidButtons_ == 0 || screenW <= 0 || screenH <= 0)
-    return;
   handleVncPointer(lastX_, lastY_, 0, screenW, screenH);
 }
 

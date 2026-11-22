@@ -25,12 +25,14 @@
 #include "ScrcpyClient.h"
 #include "parameters.h"
 
-#include <algorithm>
 #include <cerrno>
+#include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <memory>
 #include <poll.h>
 #include <stdexcept>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
@@ -55,6 +57,19 @@ static const char* kDefaultFallbackVersion = "3.3.4";
 void sleepMs(int ms)
 {
   ::poll(nullptr, 0, ms);
+}
+
+std::string quoteShellArgument(const std::string& value)
+{
+  std::string quoted = "'";
+  for (char c : value) {
+    if (c == '\'')
+      quoted += "'\\''";
+    else
+      quoted += c;
+  }
+  quoted += '\'';
+  return quoted;
 }
 
 } // namespace
@@ -136,15 +151,14 @@ std::string ScrcpyServer::resolveServerPath() const
     "Cannot find scrcpy-server jar; pass -ScrcpyServer <path> or set SCRCPY_SERVER_PATH");
 }
 
-std::string ScrcpyServer::buildServerCommand(const std::string& version,
-                                             const std::string& /*socketName*/) const
+std::string ScrcpyServer::buildServerCommand(const std::string& version) const
 {
   std::string cmd = core::format(
     "CLASSPATH=%s app_process / com.genymobile.scrcpy.Server %s"
     " tunnel_forward=true audio=false video_codec=h264"
     " log_level=info control=%s video_bit_rate=%d",
     kDeviceServerPath,
-    version.c_str(),
+    quoteShellArgument(version).c_str(),
     static_cast<bool>(controlEnabled) ? "true" : "false",
     static_cast<int>(bitRate));
 
@@ -163,7 +177,7 @@ std::string ScrcpyServer::buildServerCommand(const std::string& version,
 
   std::string enc = static_cast<const char*>(videoEncoder);
   if (!enc.empty())
-    cmd += core::format(" video_encoder=%s", enc.c_str());
+    cmd += " " + quoteShellArgument("video_encoder=" + enc);
 
   if (static_cast<bool>(stayAwake))
     cmd += " stay_awake=true";
@@ -183,8 +197,8 @@ bool ScrcpyServer::drainShellOutput()
     return false;
 
   char buf[1024];
-  while (true) {
-    ssize_t n = ::recv(shellFd_, buf, sizeof(buf), 0);
+  for (int i = 0; i < 16; ++i) {
+    ssize_t n = ::recv(shellFd_, buf, sizeof(buf), MSG_DONTWAIT);
     if (n > 0) {
       shellOutput_.append(buf, static_cast<size_t>(n));
       size_t nl;
@@ -200,6 +214,8 @@ bool ScrcpyServer::drainShellOutput()
         }
         shellOutput_.erase(0, nl + 1);
       }
+      if (shellOutput_.size() > 16384)
+        shellOutput_.erase(0, shellOutput_.size() - 16384);
       continue;
     }
     if (n < 0 && errno == EINTR)
@@ -215,16 +231,19 @@ bool ScrcpyServer::drainShellOutput()
     }
     return false;
   }
+  return true;
 }
 
 void ScrcpyServer::startScrcpy()
 {
-  AdbClient adb(static_cast<const char*>(adbHost), static_cast<int>(adbPort));
-  std::string devSerial = adb.resolveSerial(static_cast<const char*>(serial));
-
   std::string socketName = static_cast<const char*>(scrcpySocket);
+  if (!attachMode && socketName != "scrcpy")
+    throw std::invalid_argument("ScrcpySocket requires -Attach; use -Scid when launching scrcpy-server");
   if (static_cast<int>(scid) >= 0)
     socketName = core::format("scrcpy_%08x", static_cast<int>(scid));
+
+  AdbClient adb(static_cast<const char*>(adbHost), static_cast<int>(adbPort));
+  std::string devSerial = adb.resolveSerial(static_cast<const char*>(serial));
 
   vlog.info("Using Android device '%s' via %s:%d (localabstract:%s)",
             devSerial.c_str(),
@@ -233,13 +252,12 @@ void ScrcpyServer::startScrcpy()
             socketName.c_str());
 
   if (static_cast<bool>(attachMode)) {
+    control_.setServerVersion(static_cast<const char*>(scrcpyVersion));
     int videoFd = adb.connectLocalAbstract(devSerial, socketName);
     try {
-      if (static_cast<bool>(sendDummyByte) && !stream_.readDummyByte(videoFd, 5000)) {
-        ::close(videoFd);
+      if (static_cast<bool>(sendDummyByte) && !stream_.readDummyByte(videoFd, 5000))
         throw std::runtime_error(
           "Attached scrcpy socket closed before sending dummy byte");
-      }
 
       if (static_cast<bool>(controlEnabled)) {
         try {
@@ -252,15 +270,12 @@ void ScrcpyServer::startScrcpy()
       }
 
       if (!stream_.readStreamHeader(videoFd,
-                                    static_cast<bool>(sendDeviceMeta), 5000)) {
-        ::close(videoFd);
+                                    static_cast<bool>(sendDeviceMeta), 5000))
         throw std::runtime_error(
           "Attached scrcpy socket closed before sending stream header");
-      }
     } catch (...) {
       control_.close();
-      if (stream_.fd() != videoFd)
-        ::close(videoFd);
+      ::close(videoFd);
       throw;
     }
   } else {
@@ -269,6 +284,7 @@ void ScrcpyServer::startScrcpy()
     adb.pushFile(devSerial, serverPath, kDeviceServerPath, 0100644);
 
     std::string version = static_cast<const char*>(scrcpyVersion);
+    const bool autoVersion = version.empty();
     if (version.empty())
       version = AdbClient::detectVersionFromPath(serverPath);
     if (version.empty())
@@ -276,7 +292,7 @@ void ScrcpyServer::startScrcpy()
 
     bool launched = false;
     for (int attempt = 0; attempt < 2 && !launched; ++attempt) {
-      std::string cmd = buildServerCommand(version, socketName);
+      std::string cmd = buildServerCommand(version);
       vlog.debug("Launching scrcpy-server: %s", cmd.c_str());
 
       shellOutput_.clear();
@@ -284,11 +300,13 @@ void ScrcpyServer::startScrcpy()
       shellFd_ = adb.startShell(devSerial, cmd);
 
       int videoFd = -1;
-      bool shellDead = false;
+      std::string connectionError;
+      auto deadline = std::chrono::steady_clock::now() +
+                      std::chrono::seconds(5);
 
-      for (int i = 0; i < 100; ++i) {
+      do {
         if (!drainShellOutput())
-          shellDead = true;
+          break;
 
         int candFd = -1;
         try {
@@ -312,18 +330,18 @@ void ScrcpyServer::startScrcpy()
             ::close(candFd);
             candFd = -1;
           }
-        } catch (std::exception&) {
+        } catch (const std::exception& e) {
           control_.close();
           if (candFd >= 0)
             ::close(candFd);
+          connectionError = e.what();
         }
 
-        if (shellDead)
-          break;
         sleepMs(50);
-      }
+      } while (std::chrono::steady_clock::now() < deadline);
 
       if (videoFd >= 0) {
+        control_.setServerVersion(version);
         launched = true;
         break;
       }
@@ -336,7 +354,7 @@ void ScrcpyServer::startScrcpy()
         shellFd_ = -1;
       }
 
-      if (attempt == 0 && !detectedShellVersion_.empty() &&
+      if (attempt == 0 && autoVersion && !detectedShellVersion_.empty() &&
           detectedShellVersion_ != version) {
         vlog.info("Retrying scrcpy-server with detected version %s",
                   detectedShellVersion_.c_str());
@@ -344,8 +362,12 @@ void ScrcpyServer::startScrcpy()
         continue;
       }
 
-      throw std::runtime_error(
-        "Failed to connect to scrcpy-server video stream (run with -Log *:stderr:100 or specify -ScrcpyVersion)");
+      std::string reason = "Failed to connect to scrcpy-server video stream";
+      if (!connectionError.empty())
+        reason += ": " + connectionError;
+      if (!detectedShellVersion_.empty())
+        reason += " (server version " + detectedShellVersion_ + ")";
+      throw std::runtime_error(reason);
     }
   }
 
@@ -373,6 +395,12 @@ void ScrcpyServer::attachStreamsForTest(int videoFd, int controlFd,
 bool ScrcpyServer::addSocket(network::Socket* sock,
                              rfb::AccessRights accessRights)
 {
+  // The standard RFB socket streams use select() internally.
+  if (sock->getFd() >= FD_SETSIZE) {
+    connectionsLog.error(_("Client socket exceeds the descriptor limit"));
+    return false;
+  }
+
   const char* address = sock->getPeerAddress();
   if (blacklist_.isBlackmarked(address)) {
     connectionsLog.error(_("Blacklisted: %s"), address);
@@ -406,10 +434,10 @@ bool ScrcpyServer::addSocket(network::Socket* sock,
   connectionsLog.info(_("Accepted: %s"), sock->getPeerEndpoint());
 
   try {
-    ScrcpyClient* client = new ScrcpyClient(this, sock, accessRights);
-    clients_.push_front(client);
-    if (!client->init())
-      return true; // sock is shut down; removed cleanly in next loop tick
+    std::unique_ptr<ScrcpyClient> client(new ScrcpyClient(this, sock, accessRights));
+    client->init();
+    clients_.push_front(client.get());
+    client.release();
   } catch (std::exception& e) {
     connectionsLog.error(_("Error accepting client: %s"), e.what());
     return false;
@@ -429,7 +457,6 @@ void ScrcpyServer::removeSocket(network::Socket* sock)
       }
       if (clipboardClient_ == c)
         clientClipboardAnnounce(c, false);
-      clipboardRequestors_.remove(c);
 
       std::string peer(c->getPeerEndpoint());
       delete c;
@@ -439,7 +466,7 @@ void ScrcpyServer::removeSocket(network::Socket* sock)
 
       if (authClientCount() == 0) {
         connectTimer_.stop();
-        if (rfb::Server::maxDisconnectionTime)
+        if (rfb::Server::maxDisconnectionTime && !disconnectTimer_.isStarted())
           disconnectTimer_.start(
             core::secsToMillis(rfb::Server::maxDisconnectionTime));
       }
@@ -538,8 +565,10 @@ void ScrcpyServer::clientPointerEvent(ScrcpyClient* client,
       (now - pointerClientTime_) < 10)
     return;
 
+  if (pointerClient_ != nullptr && pointerClient_ != client)
+    control_.releasePointer(width(), height());
   pointerClientTime_ = now;
-  pointerClient_ = buttonMask ? client : nullptr;
+  pointerClient_ = (buttonMask & 0x0187u) ? client : nullptr;
 
   control_.handleVncPointer(x, y, buttonMask, width(), height());
 }
@@ -560,7 +589,7 @@ void ScrcpyServer::clientClipboardRequest(ScrcpyClient* client)
   if (!rfb::Server::sendCutText)
     return;
   if (!deviceClipboard_.empty())
-    client->sendClipboardDataOrClose(deviceClipboard_.c_str());
+    client->sendClipboardData(deviceClipboard_.c_str());
 }
 
 void ScrcpyServer::clientClipboardAnnounce(ScrcpyClient* client, bool available)
@@ -596,6 +625,8 @@ void ScrcpyServer::onResize(int newWidth, int newHeight)
 
 void ScrcpyServer::onConfig(const std::vector<uint8_t>& /*spsPps*/)
 {
+  lastIdrValid_ = false;
+  lastIdrFrame_.clear();
   vlog.debug("Cached H.264 SPS/PPS config (%u bytes)",
              static_cast<unsigned>(stream_.spsPps().size()));
   for (ScrcpyClient* c : clients_)
@@ -651,6 +682,10 @@ void ScrcpyServer::terminate()
 bool ScrcpyServer::step(const std::list<network::SocketListener*>& listeners,
                         int timeoutMs)
 {
+  core::Timer::checkTimeouts();
+  if (terminateRequested_)
+    return false;
+
   // Reap closed client sockets
   std::vector<network::Socket*> toRemove;
   for (ScrcpyClient* c : clients_) {
@@ -714,7 +749,7 @@ bool ScrcpyServer::step(const std::list<network::SocketListener*>& listeners,
     pfds.push_back(pfd);
   }
 
-  int nextTimeout = core::Timer::checkTimeouts();
+  int nextTimeout = core::Timer::getNextTimeout();
   int effectiveTimeout = timeoutMs;
   if (nextTimeout >= 0 && (effectiveTimeout < 0 || nextTimeout < effectiveTimeout))
     effectiveTimeout = nextTimeout;
@@ -728,11 +763,21 @@ bool ScrcpyServer::step(const std::list<network::SocketListener*>& listeners,
   }
 
   core::Timer::checkTimeouts();
+  if (terminateRequested_)
+    return false;
 
   // Accept incoming VNC connections
   for (size_t i = 0; i < listenerOrder.size(); ++i) {
     if (pfds[i].revents & POLLIN) {
-      network::Socket* sock = listenerOrder[i]->accept();
+      network::Socket* sock;
+      try {
+        sock = listenerOrder[i]->accept();
+      } catch (const core::socket_error& e) {
+        if (e.err == EINTR || e.err == EAGAIN || e.err == EWOULDBLOCK ||
+            e.err == ECONNABORTED)
+          continue;
+        throw;
+      }
       if (sock) {
         if (!addSocket(sock))
           delete sock;
@@ -746,8 +791,6 @@ bool ScrcpyServer::step(const std::list<network::SocketListener*>& listeners,
   size_t clientBase = listenerOrder.size();
   for (size_t i = 0; i < clientOrder.size(); ++i) {
     ScrcpyClient* c = clientOrder[i];
-    if (std::find(clients_.begin(), clients_.end(), c) == clients_.end())
-      continue;
     short revents = pfds[clientBase + i].revents;
     if (revents & (POLLIN | POLLERR | POLLHUP))
       c->processSocketReadEvent();
@@ -789,10 +832,11 @@ bool ScrcpyServer::step(const std::list<network::SocketListener*>& listeners,
 }
 
 void ScrcpyServer::run(const std::list<network::SocketListener*>& listeners,
-                       volatile bool* caughtSignal)
+                       const volatile sig_atomic_t* caughtSignal)
 {
   while (!terminateRequested_ && !(caughtSignal && *caughtSignal)) {
-    if (!step(listeners, -1))
+    // Bound the wait if a signal arrives between the flag check and poll().
+    if (!step(listeners, caughtSignal ? 1000 : -1))
       break;
   }
 }

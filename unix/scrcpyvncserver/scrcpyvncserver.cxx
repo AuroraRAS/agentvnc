@@ -21,20 +21,24 @@
 #endif
 
 #include <errno.h>
+#include <fcntl.h>
 #include <locale.h>
 #include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include <sys/stat.h>
 
+#include <fstream>
 #include <list>
+#include <stdexcept>
 
 #include <core/Configuration.h>
+#include <core/Exception.h>
 #include <core/LogWriter.h>
 #include <core/Logger_stdio.h>
 #include <core/i18n.h>
+#include <core/string.h>
 #include <network/TcpSocket.h>
 #include <network/UnixSocket.h>
 
@@ -47,39 +51,48 @@
 
 static core::LogWriter vlog("Main");
 
-static volatile bool caughtSignal = false;
+static volatile sig_atomic_t caughtSignal = 0;
 char* programName = nullptr;
 
 static void CleanupSignalHandler(int /*sig*/)
 {
-  caughtSignal = true;
+  caughtSignal = 1;
 }
 
 static bool hasSystemdListeners()
 {
 #ifdef HAVE_LIBSYSTEMD
-  return sd_listen_fds(0) != 0;
+  return sd_listen_fds(0) > 0;
 #else
   return false;
 #endif
 }
 
-static int createSystemdListeners(std::list<network::SocketListener*>* listeners)
+static int createSystemdListeners(std::list<network::SocketListener*>* listeners,
+                                  network::ConnectionFilter* filter)
 {
 #ifdef HAVE_LIBSYSTEMD
-  int count = sd_listen_fds(0);
-  if (count < 0) {
-    vlog.error(_("Error getting listening sockets from systemd: %s"),
-               strerror(-count));
-    return count;
-  }
+  int count = sd_listen_fds(1);
+  if (count < 0)
+    throw std::runtime_error(
+      core::format(_("Error getting listening sockets from systemd: %s"),
+                   strerror(-count)));
 
-  for (int i = 0; i < count; ++i)
-    listeners->push_back(new network::TcpListener(SD_LISTEN_FDS_START + i));
+  for (int i = 0; i < count; ++i) {
+    int fd = SD_LISTEN_FDS_START + i;
+    if (sd_is_socket(fd, AF_UNSPEC, SOCK_STREAM, 1) <= 0)
+      throw std::runtime_error(_("Expected a listening stream socket from systemd"));
+
+    auto* listener = new network::TcpListener(fd);
+    listeners->push_back(listener);
+    if (filter && sd_is_socket_inet(fd, AF_UNSPEC, SOCK_STREAM, 1, 0) > 0)
+      listener->setFilter(filter);
+  }
 
   return count;
 #else
   (void)listeners;
+  (void)filter;
   return 0;
 #endif
 }
@@ -87,16 +100,8 @@ static int createSystemdListeners(std::list<network::SocketListener*>* listeners
 class FileTcpFilter : public network::TcpFilter {
 public:
   explicit FileTcpFilter(const char* fname)
-    : TcpFilter("-"), fileName_(nullptr), lastModTime_(0)
+    : TcpFilter("-"), fileName_(fname)
   {
-    if (fname != nullptr)
-      fileName_ = strdup(fname);
-  }
-
-  ~FileTcpFilter() override
-  {
-    if (fileName_ != nullptr)
-      free(fileName_);
   }
 
   bool verifyConnection(network::Socket* s) override
@@ -104,8 +109,6 @@ public:
     if (!reloadRules()) {
       vlog.error(_("Could not read IP filtering rules, "
                    "rejecting all clients"));
-      filter.clear();
-      filter.push_back(parsePattern("-"));
       return false;
     }
     return TcpFilter::verifyConnection(s);
@@ -114,54 +117,35 @@ public:
 private:
   bool reloadRules()
   {
-    if (fileName_ == nullptr)
-      return true;
-
-    struct stat st;
-    if (stat(fileName_, &st) != 0)
+    std::ifstream rules(fileName_);
+    if (!rules)
       return false;
 
-    if (st.st_mtime != lastModTime_) {
-      FILE* fp = fopen(fileName_, "r");
-      if (fp == nullptr)
-        return false;
-
-      filter.clear();
-
-      char buf[64];
-      while (readLine(buf, sizeof(buf), fp)) {
-        if (buf[0] && strchr("+-?", buf[0]))
-          filter.push_back(parsePattern(buf));
+    std::list<Pattern> patterns;
+    try {
+      std::string line;
+      while (std::getline(rules, line)) {
+        size_t last = line.find_last_not_of(" \t\r");
+        if (last == std::string::npos)
+          continue;
+        line.erase(last + 1);
+        if (line.find('\0') != std::string::npos)
+          return false;
+        if (strchr("+-?", line[0]) != nullptr)
+          patterns.push_back(parsePattern(line.c_str()));
       }
-
-      fclose(fp);
-      lastModTime_ = st.st_mtime;
+    } catch (const std::exception& e) {
+      vlog.error("%s: %s", fileName_.c_str(), e.what());
+      return false;
     }
+    if (rules.bad() || !rules.eof())
+      return false;
+
+    filter.swap(patterns);
     return true;
   }
 
-  bool readLine(char* buf, int bufSize, FILE* fp)
-  {
-    if (fp == nullptr || buf == nullptr || bufSize == 0)
-      return false;
-
-    if (fgets(buf, bufSize, fp) == nullptr)
-      return false;
-
-    char* p = strchr(buf, '\n');
-    if (p != nullptr) {
-      *p = '\0';
-    } else if (!feof(fp)) {
-      int c;
-      do {
-        c = getc(fp);
-      } while (c != '\n' && c != EOF);
-    }
-    return true;
-  }
-
-  char* fileName_;
-  time_t lastModTime_;
+  std::string fileName_;
 };
 
 static void printVersion(FILE* fp)
@@ -256,14 +240,9 @@ int main(int argc, char** argv)
 
     FileTcpFilter fileTcpFilter(hostsFile);
 
-    if (createSystemdListeners(&listeners) > 0)
+    network::ConnectionFilter* filter = strlen(hostsFile) ? &fileTcpFilter : nullptr;
+    if (createSystemdListeners(&listeners, filter) > 0)
       vlog.info(_("Listening for VNC connections on systemd sockets"));
-
-    if (rfbunixpath.getValueStr()[0] != '\0') {
-      listeners.push_back(new network::UnixListener(rfbunixpath, rfbunixmode));
-      vlog.info(_("Listening for VNC connections on %s (mode %04o)"),
-                (const char*)rfbunixpath, (int)rfbunixmode);
-    }
 
     if ((int)rfbport != -1) {
       std::list<network::SocketListener*> tcpListeners;
@@ -277,6 +256,8 @@ int main(int argc, char** argv)
         network::createTcpListeners(&tcpListeners, addr, (int)rfbport);
 
       if (!tcpListeners.empty()) {
+        for (network::SocketListener* listener : tcpListeners)
+          listener->setFilter(filter);
         listeners.splice(listeners.end(), tcpListeners);
         if (localhostOnly) {
           vlog.info(_("Listening for VNC connections on local "
@@ -288,15 +269,24 @@ int main(int argc, char** argv)
         }
       }
 
-      if (strlen(hostsFile) != 0) {
-        for (network::SocketListener* listener : listeners)
-          listener->setFilter(&fileTcpFilter);
-      }
+    }
+
+    if (rfbunixpath.getValueStr()[0] != '\0') {
+      listeners.push_back(new network::UnixListener(rfbunixpath, rfbunixmode));
+      vlog.info(_("Listening for VNC connections on %s (mode %04o)"),
+                (const char*)rfbunixpath, (int)rfbunixmode);
     }
 
     if (listeners.empty()) {
       vlog.error(_("No path or port configured for incoming connections"));
       return 1;
+    }
+
+    for (network::SocketListener* listener : listeners) {
+      int fd = listener->getFd();
+      int flags = fcntl(fd, F_GETFL, 0);
+      if (flags < 0 || fcntl(fd, F_SETFL, flags | O_NONBLOCK) < 0)
+        throw core::posix_error(_("Could not set listener to nonblocking mode"), errno);
     }
 
     server.run(listeners, &caughtSignal);

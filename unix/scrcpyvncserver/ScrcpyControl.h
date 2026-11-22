@@ -37,6 +37,7 @@ public:
   ~ScrcpyControl();
 
   void attach(int fd);
+  void setServerVersion(const std::string& version);
   void close();
   int fd() const { return fd_; }
 
@@ -64,6 +65,7 @@ public:
 
 private:
   void enqueue(const uint8_t* data, size_t len);
+  bool processDeviceMessages(Callbacks& cb);
   uint32_t vncButtonsToAndroid(uint16_t mask) const;
 
   ScrcpyControl(const ScrcpyControl&) = delete;
@@ -80,6 +82,8 @@ private:
   int lastX_;
   int lastY_;
   uint32_t metaState_;
+  bool supportsVideoReset_;
+  float scrollRange_;
 };
 
 #endif // __SCRCPYVNCSERVER_SCRCPYCONTROL_H__

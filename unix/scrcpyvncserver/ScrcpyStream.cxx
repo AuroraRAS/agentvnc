@@ -23,7 +23,10 @@
 #include "ScrcpyStream.h"
 #include "H264SpsParser.h"
 
+#include <algorithm>
 #include <cerrno>
+#include <chrono>
+#include <climits>
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -43,6 +46,14 @@ namespace {
 
 static const uint32_t kCodecIdH264 = 0x68323634u; // "h264"
 static const uint32_t kMaxPacketSize = 16u * 1024u * 1024u;
+using Clock = std::chrono::steady_clock;
+
+Clock::time_point handshakeDeadline(int timeoutMs)
+{
+  if (timeoutMs < 0)
+    return Clock::time_point::max();
+  return Clock::now() + std::chrono::milliseconds(timeoutMs);
+}
 
 uint32_t readBe32(const uint8_t* p)
 {
@@ -59,7 +70,8 @@ uint64_t readBe64(const uint8_t* p)
 }
 
 // Returns bytes read (0 only if EOF before any byte read), throws on timeout/error/partial EOF.
-size_t readExactTimeout(int fd, uint8_t* buf, size_t len, int timeoutMs,
+size_t readExactTimeout(int fd, uint8_t* buf, size_t len,
+                        Clock::time_point deadline,
                         bool allowInitialEof)
 {
   size_t off = 0;
@@ -69,23 +81,28 @@ size_t readExactTimeout(int fd, uint8_t* buf, size_t len, int timeoutMs,
     pfd.events = POLLIN;
     pfd.revents = 0;
 
-    int pr;
-    do {
-      pr = ::poll(&pfd, 1, timeoutMs);
-    } while (pr < 0 && errno == EINTR);
+    int timeoutMs = -1;
+    if (deadline != Clock::time_point::max()) {
+      auto remaining = deadline - Clock::now();
+      if (remaining <= Clock::duration::zero())
+        throw std::runtime_error("Timed out waiting for scrcpy video handshake");
+      timeoutMs = std::min<int64_t>(
+        std::chrono::duration_cast<std::chrono::milliseconds>(remaining).count() + 1,
+        INT_MAX);
+    }
 
-    if (pr < 0)
+    int pr = ::poll(&pfd, 1, timeoutMs);
+    if (pr < 0) {
+      if (errno == EINTR)
+        continue;
       throw core::socket_error("poll failed during scrcpy handshake", errno);
+    }
     if (pr == 0)
       throw std::runtime_error("Timed out waiting for scrcpy video handshake");
 
-    ssize_t n;
-    do {
-      n = ::recv(fd, buf + off, len - off, 0);
-    } while (n < 0 && errno == EINTR);
-
+    ssize_t n = ::recv(fd, buf + off, len - off, MSG_DONTWAIT);
     if (n < 0) {
-      if (errno == EAGAIN || errno == EWOULDBLOCK)
+      if (errno == EINTR || errno == EAGAIN || errno == EWOULDBLOCK)
         continue;
       throw core::socket_error("recv failed during scrcpy handshake", errno);
     }
@@ -144,15 +161,18 @@ void ScrcpyStream::close()
 bool ScrcpyStream::readDummyByte(int fd, int timeoutMs)
 {
   uint8_t dummy = 0;
-  size_t r = readExactTimeout(fd, &dummy, 1, timeoutMs, true);
+  size_t r = readExactTimeout(fd, &dummy, 1, handshakeDeadline(timeoutMs), true);
+  if (r != 0 && dummy != 0)
+    throw std::runtime_error("Invalid scrcpy video dummy byte");
   return r == 1;
 }
 
 bool ScrcpyStream::readStreamHeader(int fd, bool expectDeviceMeta, int timeoutMs)
 {
+  auto deadline = handshakeDeadline(timeoutMs);
   if (expectDeviceMeta) {
     uint8_t nameBuf[64];
-    size_t r = readExactTimeout(fd, nameBuf, sizeof(nameBuf), timeoutMs, true);
+    size_t r = readExactTimeout(fd, nameBuf, sizeof(nameBuf), deadline, true);
     if (r == 0)
       return false;
     size_t nameLen = 0;
@@ -160,11 +180,11 @@ bool ScrcpyStream::readStreamHeader(int fd, bool expectDeviceMeta, int timeoutMs
       nameLen++;
     deviceName_.assign(reinterpret_cast<const char*>(nameBuf), nameLen);
   } else {
-    deviceName_ = "Android";
+    deviceName_.clear();
   }
 
   uint8_t codecBuf[4];
-  size_t r = readExactTimeout(fd, codecBuf, sizeof(codecBuf), timeoutMs,
+  size_t r = readExactTimeout(fd, codecBuf, sizeof(codecBuf), deadline,
                               !expectDeviceMeta);
   if (r == 0)
     return false;
@@ -183,17 +203,17 @@ bool ScrcpyStream::readStreamHeader(int fd, bool expectDeviceMeta, int timeoutMs
   // Distinguish scrcpy v2/v3 (8-byte width+height) from v4/v5 (12-byte session
   // packet whose MSB is 1).
   uint8_t probe[4];
-  readExactTimeout(fd, probe, sizeof(probe), timeoutMs, false);
+  readExactTimeout(fd, probe, sizeof(probe), deadline, false);
 
   if ((probe[0] & 0x80u) != 0) {
     uint8_t rest[8];
-    readExactTimeout(fd, rest, sizeof(rest), timeoutMs, false);
+    readExactTimeout(fd, rest, sizeof(rest), deadline, false);
     protocol_ = ScrcpyProtocol::V4;
     width_ = static_cast<int>(readBe32(rest));
     height_ = static_cast<int>(readBe32(rest + 4));
   } else {
     uint8_t rest[4];
-    readExactTimeout(fd, rest, sizeof(rest), timeoutMs, false);
+    readExactTimeout(fd, rest, sizeof(rest), deadline, false);
     protocol_ = ScrcpyProtocol::V2;
     width_ = static_cast<int>(readBe32(probe));
     height_ = static_cast<int>(readBe32(rest));
@@ -206,7 +226,6 @@ bool ScrcpyStream::readStreamHeader(int fd, bool expectDeviceMeta, int timeoutMs
   }
 
   setNonBlockingAndNoDelay(fd);
-  fd_ = fd;
   state_ = ReadState::Header;
   hdrRead_ = 0;
   packetSize_ = 0;
@@ -216,6 +235,7 @@ bool ScrcpyStream::readStreamHeader(int fd, bool expectDeviceMeta, int timeoutMs
   vlog.info("Connected to scrcpy video stream (%s): '%s' %dx%d",
             protocol_ == ScrcpyProtocol::V4 ? "v4+" : "v2/v3",
             deviceName_.c_str(), width_, height_);
+  fd_ = fd;
   return true;
 }
 
@@ -248,7 +268,8 @@ bool ScrcpyStream::processReadable(Callbacks& cb)
   if (fd_ < 0)
     return false;
 
-  while (true) {
+  // Let the server service viewers even if the video socket stays readable.
+  for (int packets = 0; packets < 8; ++packets) {
     if (state_ == ReadState::Header) {
       while (hdrRead_ < sizeof(hdrBuf_)) {
         ssize_t n = ::recv(fd_, hdrBuf_ + hdrRead_,
@@ -280,6 +301,7 @@ bool ScrcpyStream::processReadable(Callbacks& cb)
         }
 
         if (newW != width_ || newH != height_) {
+          spsPps_.clear();
           width_ = newW;
           height_ = newH;
           cb.onResize(width_, height_);
@@ -366,4 +388,5 @@ bool ScrcpyStream::processReadable(Callbacks& cb)
                  effectiveKeyFrame, hasInlineSpsPps);
     }
   }
+  return true;
 }

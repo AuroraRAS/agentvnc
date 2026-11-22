@@ -26,7 +26,6 @@
 #include <cstring>
 #include <stdexcept>
 #include <sys/socket.h>
-#include <unistd.h>
 
 #include <core/Exception.h>
 
@@ -185,22 +184,30 @@ bool ZeroCopyOutStream::writevFrame(const struct iovec* iov, int iovcnt)
     return false;
 
   size_t totalBytes = 0;
-  for (int i = 0; i < iovcnt; ++i)
+  for (int i = 0; i < iovcnt; ++i) {
+    if (iov[i].iov_len > kMaxPendingSize - totalBytes)
+      throw std::runtime_error("Frame exceeds maximum output buffer size");
     totalBytes += iov[i].iov_len;
+  }
 
   if (totalBytes == 0)
     return true;
 
+  struct msghdr msg = {};
+  msg.msg_iov = const_cast<struct iovec*>(iov);
+  msg.msg_iovlen = iovcnt;
   ssize_t written;
   do {
-    written = ::writev(fd_, iov, iovcnt);
+    written = ::sendmsg(fd_, &msg, MSG_DONTWAIT | MSG_NOSIGNAL);
   } while (written < 0 && errno == EINTR);
 
   if (written < 0) {
     if (errno == EAGAIN || errno == EWOULDBLOCK)
       return false;
-    throw core::socket_error("writev", errno);
+    throw core::socket_error("sendmsg", errno);
   }
+  if (written == 0)
+    return false;
 
   bytesSent_ += static_cast<size_t>(written);
 
@@ -210,9 +217,6 @@ bool ZeroCopyOutStream::writevFrame(const struct iovec* iov, int iovcnt)
   // Socket accepted a prefix of the frame; buffer only the unsent tail so
   // the RFB framing remains intact and will drain on POLLOUT.
   size_t remaining = totalBytes - static_cast<size_t>(written);
-  if (remaining > kMaxPendingSize)
-    throw std::runtime_error("Partial frame tail exceeds maximum buffer size");
-
   pending_.reserve(remaining);
   size_t skip = static_cast<size_t>(written);
   for (int i = 0; i < iovcnt; ++i) {

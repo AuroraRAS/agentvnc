@@ -1,4 +1,4 @@
-.TH SCRCPYVNC 1 "" "TigerVNC" "TigerVNC Manual"
+.TH SCRCPYVNCSERVER 1 "" "TigerVNC" "TigerVNC Manual"
 .SH NAME
 scrcpyvncserver \- TigerVNC server bridging scrcpy H.264 streams with zero transcoding
 .SH SYNOPSIS
@@ -16,17 +16,37 @@ host-side decoding, color-space conversion, or re-encoding.
 It connects directly to the local ADB daemon (127.0.0.1:5037 by default)
 via \fBhost:transport:<serial>\fP and \fBlocalabstract:scrcpy\fP with
 \fBTCP_NODELAY\fP enabled, strips scrcpy's 12-byte packet header, and uses
-scatter-gather I/O (\fBwritev\fP) to prepend RFB Open H.264 headers directly
+scatter-gather I/O to prepend RFB Open H.264 headers directly
 to the raw Annex-B NAL payload.
 .PP
-Connecting viewers must support Open H.264 encoding (50), ContinuousUpdates
-(\-313), and DesktopSize (\-223) or ExtendedDesktopSize (\-308). When using
-\fBvncviewer\fP(1), pass \fB\-AutoSelect=0 \-PreferredEncoding=H.264\fP
-to prevent falling back to Tight encoding.
+Viewers must support Open H.264 encoding (50). To follow Android display
+resizes, they must also support DesktopSize (\-223) or ExtendedDesktopSize
+(\-308). ContinuousUpdates (\-313) lets the server stream frames without
+waiting for individual update requests. With an H.264-enabled
+\fBvncviewer\fP(1), use \fB\-AutoSelect=0 \-PreferredEncoding=H.264\fP.
 .SH OPTIONS
 Parameters can be specified as \fB\-\fIParam\fR, \fB\-\fIParam\fP=0\fR,
 or \fB\-\fIParam\fP=\fIvalue\fR. Run \fBscrcpyvncserver \-h\fP for the full
 parameter list.
+.TP
+.BI \-ScrcpyServer " path"
+Use this server JAR when launching scrcpy on the selected Android device.
+If omitted, the server checks \fBSCRCPY_SERVER_PATH\fP and standard
+installation paths.
+.TP
+.BI \-ScrcpyVersion " version"
+Specify the server version. In attach mode, specify this for versions
+older than 3.3.1 to select the correct control protocol.
+.TP
+.B \-Attach
+Connect to an existing scrcpy server configured with forward tunneling,
+H.264 video, audio disabled, and codec and frame metadata enabled. Match
+its control, dummy byte, and device metadata settings. Use
+\fB\-ScrcpySocket\fP or \fB\-Scid\fP to select its socket.
+.TP
+.BI \-HostsFile " path"
+Apply IP access rules to TCP listeners, including systemd-activated
+listeners. Connections that require interactive approval are rejected.
 .SH SEE ALSO
 .BR vncviewer (1),
 .BR x0vncserver (1),

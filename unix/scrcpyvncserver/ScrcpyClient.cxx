@@ -23,7 +23,7 @@
 #include "ScrcpyClient.h"
 #include "ScrcpyServer.h"
 
-#include <cassert>
+#include <algorithm>
 #include <cstring>
 #include <fcntl.h>
 #include <netinet/in.h>
@@ -76,10 +76,10 @@ ScrcpyClient::ScrcpyClient(ScrcpyServer* server, network::Socket* s,
     continuousUpdates_(false),
     updateRequested_(false),
     pendingKeyFrameRequest_(false),
+    retryVideoOnWritable_(false),
     needsKeyFrame_(true),
     needsReset_(true),
     needsResetAll_(false),
-    needsSpsPps_(true),
     idleTimer_(&idleCb_),
     idleCb_(this)
 {
@@ -102,15 +102,13 @@ ScrcpyClient::~ScrcpyClient()
   }
 }
 
-bool ScrcpyClient::init()
+void ScrcpyClient::init()
 {
   try {
     initialiseProtocol();
   } catch (std::exception& e) {
     close(e.what());
-    return false;
   }
-  return true;
 }
 
 bool ScrcpyClient::accessCheck(rfb::AccessRights ar) const
@@ -120,18 +118,21 @@ bool ScrcpyClient::accessCheck(rfb::AccessRights ar) const
 
 void ScrcpyClient::close(const char* reason)
 {
-  if (closeReason_.empty())
-    closeReason_ = reason ? reason : "";
-  else
-    vlog.debug("Second close: %s (%s)", getPeerEndpoint(),
-               reason ? reason : "");
+  if (state() == RFBSTATE_CLOSING)
+    return;
+
+  closeReason_ = reason ? reason : "";
+  idleTimer_.stop();
+  for (const auto& key : pressedKeys_)
+    server_->clientKeyEvent(key.second, 0, false);
+  pressedKeys_.clear();
 
   // Drain any pending data in ZeroCopyOutStream before SConnection::close()
   // shuts down the write half of the socket.
   try {
     if (getOutStream())
-      getOutStream()->flush();
-    zeroCopyOs_.flush();
+      getOutStream()->cork(false);
+    zeroCopyOs_.cork(false);
   } catch (std::exception&) {
   }
 
@@ -140,21 +141,22 @@ void ScrcpyClient::close(const char* reason)
 
 bool ScrcpyClient::hasBufferedWriteData()
 {
-  return zeroCopyOs_.hasBufferedData();
+  return state() != RFBSTATE_CLOSING &&
+         (zeroCopyOs_.hasBufferedData() ||
+          (retryVideoOnWritable_ && readyForVideo()));
 }
 
 void ScrcpyClient::processSocketReadEvent()
 {
   if (state() == RFBSTATE_CLOSING) {
-    assert(getSock()->isShutdownWrite());
-
     if (getSock()->isShutdownRead())
       return;
 
+    rdr::InStream& in = getSock()->inStream();
     while (true) {
       try {
-        getInStream()->skip(getInStream()->avail());
-        if (!getInStream()->hasData(1))
+        in.skip(in.avail());
+        if (!in.hasData(1))
           break;
       } catch (std::exception&) {
         getSock()->shutdownRead();
@@ -168,18 +170,16 @@ void ScrcpyClient::processSocketReadEvent()
     inProcessMessages_ = true;
     getOutStream()->cork(true);
 
-    while (processMsg())
+    while (state() != RFBSTATE_CLOSING && processMsg())
       continue;
 
-    getOutStream()->cork(false);
     inProcessMessages_ = false;
+    if (state() == RFBSTATE_CLOSING)
+      return;
 
+    getOutStream()->cork(false);
     flushNoDataUpdateIfReady();
-
-    if (pendingKeyFrameRequest_) {
-      pendingKeyFrameRequest_ = false;
-      server_->clientRequestsKeyFrame(this);
-    }
+    requestPendingKeyFrame();
   } catch (rdr::end_of_stream&) {
     inProcessMessages_ = false;
     close(_("Clean disconnection"));
@@ -199,6 +199,11 @@ void ScrcpyClient::processSocketWriteEvent()
     if (getOutStream() != &zeroCopyOs_)
       zeroCopyOs_.flush();
     flushNoDataUpdateIfReady();
+    if (retryVideoOnWritable_ && !zeroCopyOs_.hasBufferedData()) {
+      retryVideoOnWritable_ = false;
+      if (readyForVideo() && needsKeyFrame_)
+        server_->clientRequestsKeyFrame(this);
+    }
   } catch (std::exception& e) {
     close(e.what());
   }
@@ -218,7 +223,10 @@ void ScrcpyClient::authSuccess()
 
 void ScrcpyClient::queryConnection()
 {
-  approveConnection(true);
+  bool needsApproval = getSock()->requiresQuery() &&
+                       !accessCheck(rfb::AccessNoQuery);
+  approveConnection(!needsApproval,
+                    _("This server cannot approve connection queries"));
 }
 
 void ScrcpyClient::clientReady(bool shared)
@@ -246,13 +254,17 @@ void ScrcpyClient::clientReady(bool shared)
 
 void ScrcpyClient::setEncodings(int nEncodings, const int32_t* encodings)
 {
+  if (nEncodings == 0 ||
+      std::find(encodings, encodings + nEncodings, rfb::encodingH264) ==
+      encodings + nEncodings) {
+    throw rfb::protocol_error(_("Client does not support Open H.264 encoding (50)"));
+  }
+
   rfb::SConnection::setEncodings(nEncodings, encodings);
   receivedEncodings_ = true;
-
-  if (!client.supportsEncoding(rfb::encodingH264)) {
-    vlog.error("Client %s does not advertise Open H.264 encoding (50)",
-               getPeerEndpoint());
-    close(_("Client does not support Open H.264 encoding (50)"));
+  if (!client.supportsContinuousUpdates() && continuousUpdates_) {
+    continuousUpdates_ = false;
+    requireKeyFrame();
   }
 }
 
@@ -267,11 +279,6 @@ void ScrcpyClient::supportsContinuousUpdates()
   writer()->writeEndOfContinuousUpdates();
 }
 
-void ScrcpyClient::setPixelFormat(const rfb::PixelFormat& pf)
-{
-  rfb::SConnection::setPixelFormat(pf);
-}
-
 void ScrcpyClient::framebufferUpdateRequest(const core::Rect& r,
                                             bool incremental)
 {
@@ -283,14 +290,10 @@ void ScrcpyClient::framebufferUpdateRequest(const core::Rect& r,
   if (!incremental || !continuousUpdates_)
     updateRequested_ = true;
 
-  if (!incremental) {
-    needsKeyFrame_ = true;
-    needsReset_ = true;
-    needsSpsPps_ = true;
+  if (!incremental)
+    requireKeyFrame();
+  if (needsKeyFrame_)
     pendingKeyFrameRequest_ = true;
-  } else if (needsKeyFrame_) {
-    pendingKeyFrameRequest_ = true;
-  }
 }
 
 void ScrcpyClient::setDesktopSize(int /*fb_width*/, int /*fb_height*/,
@@ -326,6 +329,7 @@ void ScrcpyClient::enableContinuousUpdates(bool enable, int /*x*/, int /*y*/,
     if (needsKeyFrame_)
       pendingKeyFrameRequest_ = true;
   } else {
+    requireKeyFrame();
     writer()->writeEndOfContinuousUpdates();
   }
 }
@@ -343,8 +347,25 @@ void ScrcpyClient::keyEvent(uint32_t keysym, uint32_t keycode, bool down)
 {
   if (rfb::Server::idleTimeout)
     idleTimer_.start(core::secsToMillis(rfb::Server::idleTimeout));
-  if (!accessCheck(rfb::AccessKeyEvents))
+  if (!accessCheck(rfb::AccessKeyEvents) || !rfb::Server::acceptKeyEvents)
     return;
+
+  auto lookup = std::make_pair(keycode != 0, keycode ? keycode : keysym);
+  auto key = pressedKeys_.find(lookup);
+  if (down) {
+    if (key != pressedKeys_.end())
+      keysym = key->second;
+    else if (pressedKeys_.size() < 256)
+      pressedKeys_.emplace(lookup, keysym);
+    else
+      return;
+  } else {
+    if (key == pressedKeys_.end())
+      return;
+    keysym = key->second;
+    pressedKeys_.erase(key);
+  }
+
   server_->clientKeyEvent(keysym, keycode, down);
 }
 
@@ -372,6 +393,22 @@ bool ScrcpyClient::readyForVideo()
   return continuousUpdates_ || updateRequested_;
 }
 
+void ScrcpyClient::requireKeyFrame()
+{
+  needsKeyFrame_ = true;
+  needsReset_ = true;
+}
+
+void ScrcpyClient::requestPendingKeyFrame()
+{
+  if (!pendingKeyFrameRequest_)
+    return;
+
+  pendingKeyFrameRequest_ = false;
+  if (readyForVideo())
+    server_->clientRequestsKeyFrame(this);
+}
+
 void ScrcpyClient::flushNoDataUpdateIfReady()
 {
   if (inProcessMessages_ || state() != RFBSTATE_NORMAL)
@@ -385,12 +422,12 @@ void ScrcpyClient::flushNoDataUpdateIfReady()
 
   if (writer()->needNoDataUpdate()) {
     writer()->writeNoDataUpdate();
-    if (!continuousUpdates_)
-      updateRequested_ = false;
   } else {
     writer()->writeFramebufferUpdateStart(0);
     writer()->writeFramebufferUpdateEnd();
   }
+  if (!continuousUpdates_)
+    updateRequested_ = false;
 }
 
 void ScrcpyClient::onDesktopResize(int width, int height)
@@ -409,10 +446,8 @@ void ScrcpyClient::onDesktopResize(int width, int height)
     }
 
     writer()->writeDesktopSize(rfb::reasonServer);
-    needsKeyFrame_ = true;
-    needsReset_ = true;
+    requireKeyFrame();
     needsResetAll_ = true;
-    needsSpsPps_ = true;
 
     flushNoDataUpdateIfReady();
   } catch (std::exception& e) {
@@ -422,22 +457,7 @@ void ScrcpyClient::onDesktopResize(int width, int height)
 
 void ScrcpyClient::onConfigUpdated()
 {
-  needsSpsPps_ = true;
-  needsReset_ = true;
-}
-
-void ScrcpyClient::setDesktopNameOrClose(const char* name)
-{
-  try {
-    client.setName(name);
-    if (state() == RFBSTATE_NORMAL &&
-        client.supportsEncoding(rfb::pseudoEncodingDesktopName)) {
-      writer()->writeSetDesktopName();
-      flushNoDataUpdateIfReady();
-    }
-  } catch (std::exception& e) {
-    close(e.what());
-  }
+  requireKeyFrame();
 }
 
 void ScrcpyClient::announceClipboardOrClose(bool available)
@@ -451,42 +471,36 @@ void ScrcpyClient::announceClipboardOrClose(bool available)
   }
 }
 
-void ScrcpyClient::sendClipboardDataOrClose(const char* data)
-{
-  try {
-    if (state() != RFBSTATE_NORMAL)
-      return;
-    sendClipboardData(data);
-  } catch (std::exception& e) {
-    close(e.what());
-  }
-}
-
 bool ScrcpyClient::sendH264Frame(int width, int height,
                                  const std::vector<uint8_t>& spsPps,
                                  const uint8_t* nalData, size_t nalLen,
                                  bool isKeyFrame, bool hasInlineSpsPps)
 {
-  if (!readyForVideo() || !nalData || nalLen == 0)
+  if (!readyForVideo()) {
+    requireKeyFrame();
+    return false;
+  }
+  if (!nalData || nalLen == 0)
     return false;
 
   try {
     if (writer()->needFakeUpdate()) {
       if (zeroCopyOs_.hasBufferedData()) {
-        needsKeyFrame_ = true;
-        needsReset_ = true;
-        needsSpsPps_ = true;
+        requireKeyFrame();
+        retryVideoOnWritable_ = true;
         return false;
       }
       flushNoDataUpdateIfReady();
-      if (!continuousUpdates_ && !updateRequested_)
+      if (!continuousUpdates_ && !updateRequested_) {
+        requireKeyFrame();
         return false;
+      }
     }
 
     if (needsKeyFrame_ && !isKeyFrame)
       return false;
 
-    bool prependSpsPps = (needsSpsPps_ || needsReset_) && !hasInlineSpsPps;
+    bool prependSpsPps = needsReset_ && !hasInlineSpsPps;
     if (prependSpsPps && spsPps.empty())
       return false;
 
@@ -535,18 +549,16 @@ bool ScrcpyClient::sendH264Frame(int width, int height,
 
       if (!zeroCopyOs_.writevFrame(iov, iovcnt)) {
         // Socket is congested: drop frame cleanly and resync at next IDR.
-        needsKeyFrame_ = true;
-        needsReset_ = true;
-        needsSpsPps_ = true;
+        requireKeyFrame();
+        retryVideoOnWritable_ = true;
         return false;
       }
     } else {
       // Encrypted stream (TLS / RSA-AES): check socket congestion first.
       zeroCopyOs_.flush();
       if (zeroCopyOs_.hasBufferedData()) {
-        needsKeyFrame_ = true;
-        needsReset_ = true;
-        needsSpsPps_ = true;
+        requireKeyFrame();
+        retryVideoOnWritable_ = true;
         return false;
       }
       rdr::OutStream* out = getOutStream();
@@ -560,7 +572,7 @@ bool ScrcpyClient::sendH264Frame(int width, int height,
     needsKeyFrame_ = false;
     needsReset_ = false;
     needsResetAll_ = false;
-    needsSpsPps_ = false;
+    retryVideoOnWritable_ = false;
     if (!continuousUpdates_)
       updateRequested_ = false;
 

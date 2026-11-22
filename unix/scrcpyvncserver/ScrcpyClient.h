@@ -25,6 +25,8 @@
 #include <string>
 #include <vector>
 
+#include <map>
+
 #include <rfb/SConnection.h>
 
 #include "ZeroCopyOutStream.h"
@@ -39,7 +41,7 @@ public:
                rfb::AccessRights accessRights);
   ~ScrcpyClient() override;
 
-  bool init();
+  void init();
   void processSocketReadEvent();
   void processSocketWriteEvent();
 
@@ -48,16 +50,11 @@ public:
   void close(const char* reason) override;
   bool accessCheck(rfb::AccessRights ar) const override;
 
-  const std::string& closeReason() const { return closeReason_; }
-
   bool readyForVideo();
-  bool needsKeyFrame() const { return needsKeyFrame_; }
 
   void onDesktopResize(int width, int height);
   void onConfigUpdated();
-  void setDesktopNameOrClose(const char* name);
   void announceClipboardOrClose(bool available);
-  void sendClipboardDataOrClose(const char* data);
 
   // Zero-copy RFB Open H.264 frame delivery. Returns true if a frame was
   // written (or already satisfied), false if skipped/dropped.
@@ -73,7 +70,6 @@ protected:
   void setEncodings(int nEncodings, const int32_t* encodings) override;
   void supportsFence() override;
   void supportsContinuousUpdates() override;
-  void setPixelFormat(const rfb::PixelFormat& pf) override;
   void framebufferUpdateRequest(const core::Rect& r,
                                 bool incremental) override;
   void setDesktopSize(int fb_width, int fb_height,
@@ -88,6 +84,8 @@ protected:
   void handleClipboardData(const char* data) override;
 
 private:
+  void requireKeyFrame();
+  void requestPendingKeyFrame();
   void flushNoDataUpdateIfReady();
 
   ScrcpyServer* server_;
@@ -97,10 +95,11 @@ private:
   bool continuousUpdates_;
   bool updateRequested_;
   bool pendingKeyFrameRequest_;
+  bool retryVideoOnWritable_;
   bool needsKeyFrame_;
   bool needsReset_;
   bool needsResetAll_;
-  bool needsSpsPps_;
+  std::map<std::pair<bool, uint32_t>, uint32_t> pressedKeys_;
 
   core::Timer idleTimer_;
   std::string closeReason_;

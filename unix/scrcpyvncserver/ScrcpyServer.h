@@ -19,6 +19,7 @@
 #ifndef __SCRCPYVNCSERVER_SCRCPYSERVER_H__
 #define __SCRCPYVNCSERVER_SCRCPYSERVER_H__
 
+#include <signal.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <sys/time.h>
@@ -61,7 +62,7 @@ public:
   // Main poll() event loop. Runs until caughtSignal becomes true or
   // terminate() is called.
   void run(const std::list<network::SocketListener*>& listeners,
-           volatile bool* caughtSignal);
+           const volatile sig_atomic_t* caughtSignal);
 
   // Processes one poll() iteration; exposed for deterministic unit tests.
   bool step(const std::list<network::SocketListener*>& listeners,
@@ -104,8 +105,7 @@ public:
 private:
   int authClientCount() const;
   std::string resolveServerPath() const;
-  std::string buildServerCommand(const std::string& version,
-                                 const std::string& socketName) const;
+  std::string buildServerCommand(const std::string& version) const;
   void requestVideoReset();
   bool drainShellOutput();
   void shutdownScrcpy();
@@ -115,7 +115,6 @@ private:
   ScrcpyClient* pointerClient_;
   time_t pointerClientTime_;
   ScrcpyClient* clipboardClient_;
-  std::list<ScrcpyClient*> clipboardRequestors_;
 
   ScrcpyStream stream_;
   ScrcpyControl control_;

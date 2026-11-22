@@ -136,7 +136,7 @@ bool skipScalingList(BitReader& br, int sizeOfScalingList)
   for (int j = 0; j < sizeOfScalingList; ++j) {
     if (nextScale != 0) {
       int32_t deltaScale = br.readSE();
-      if (br.overflow())
+      if (br.overflow() || deltaScale < -128 || deltaScale > 127)
         return false;
       nextScale = (lastScale + deltaScale + 256) % 256;
     }
@@ -239,9 +239,9 @@ bool parseSpsNal(const uint8_t* nal, size_t nalLen, int* width, int* height)
   int64_t rawW = static_cast<int64_t>(picWidthInMbsMinus1 + 1) * 16;
   int64_t rawH = static_cast<int64_t>(2 - frameMbsOnlyFlag) *
                  static_cast<int64_t>(picHeightInMapUnitsMinus1 + 1) * 16;
-  int64_t trimW = static_cast<int64_t>(cropLeft + cropRight) *
+  int64_t trimW = (static_cast<int64_t>(cropLeft) + cropRight) *
                   static_cast<int64_t>(cropUnitX);
-  int64_t trimH = static_cast<int64_t>(cropTop + cropBottom) *
+  int64_t trimH = (static_cast<int64_t>(cropTop) + cropBottom) *
                   static_cast<int64_t>(cropUnitY);
 
   int64_t w = rawW - trimW;

@@ -722,8 +722,8 @@ TcpFilter::Pattern TcpFilter::parsePattern(const char* p) {
     // Take out brackets, if present
     if (parts[0][0] == '[') {
       parts[0].erase(0, 1);
-      if (!parts[0].empty() && parts[0][parts.size()-1] == ']')
-        parts[0].erase(parts.size()-1, 1);
+      if (!parts[0].empty() && parts[0].back() == ']')
+        parts[0].pop_back();
     }
 
     if ((result = getaddrinfo (parts[0].c_str(), nullptr, &hints, &ai)) != 0) {
@@ -744,7 +744,13 @@ TcpFilter::Pattern TcpFilter::parsePattern(const char* p) {
             "instead"));
       }
 
-      pattern.prefixlen = (unsigned int) atoi(parts[1].c_str());
+      if (parts[1].empty() || parts[1].find_first_not_of("0123456789") != std::string::npos)
+        throw std::runtime_error(_("Invalid prefix length for filter"));
+
+      unsigned long prefixlen = strtoul(parts[1].c_str(), nullptr, 10);
+      if (prefixlen > 128)
+        throw std::runtime_error(_("Invalid prefix length for filter"));
+      pattern.prefixlen = prefixlen;
     } else {
       switch (family) {
       case AF_INET:
@@ -773,7 +779,7 @@ TcpFilter::Pattern TcpFilter::parsePattern(const char* p) {
   case AF_INET:
     mask = 0;
     for (unsigned int i=0; i<pattern.prefixlen; i++)
-      mask |= 1<<(31-i);
+      mask |= 1u<<(31-i);
     pattern.mask.u.sin.sin_addr.s_addr = htonl(mask);
     break;
 
