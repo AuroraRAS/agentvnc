@@ -213,7 +213,8 @@ Default is \fBAuto\fP.
 .TP
 .B \-FtpServer
 Enable an embedded FTP server inside \fBvncviewer\fP that bridges FTP commands
-to the remote server's RFB file transfer extension. Default is off.
+to the remote server's RFB file transfer extension on Unix. Default is off.
+Enable it before connecting if the server requires Tight capability negotiation.
 .
 .TP
 .B \-FtpUsername \fIusername\fP

@@ -365,6 +365,7 @@ namespace rfb {
     bool supportsLEDState;
     bool supportsAudio;
     bool supportsFileTransfer;
+    bool preferTightForFileTransfer;
 
   private:
     bool processVersionMsg();

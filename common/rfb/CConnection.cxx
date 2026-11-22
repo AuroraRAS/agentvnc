@@ -75,6 +75,7 @@ CConnection::CConnection()
     supportsLocalCursor(false), supportsCursorPosition(false),
     supportsDesktopResize(false), supportsLEDState(false),
     supportsAudio(false), supportsFileTransfer(false),
+    preferTightForFileTransfer(false),
     is(nullptr), os(nullptr), reader_(nullptr), writer_(nullptr),
     shared(false),
     state_(RFBSTATE_UNINITIALISED),
@@ -310,7 +311,7 @@ bool CConnection::processSecurityTypesMsg()
     // Prefer Tight security type when the server offers it alongside
     // None or VncAuth on RFB >= 3.7 so Tight InteractionCaps (needed for
     // TightVNC 1.3 and 2.x file transfer) are negotiated.
-    if (supportsFileTransfer && serverOffersTight &&
+    if (preferTightForFileTransfer && serverOffersTight &&
         !server.beforeVersion(3, 7) &&
         (secType == secTypeNone || secType == secTypeVncAuth) &&
         std::find(secTypes.begin(), secTypes.end(),

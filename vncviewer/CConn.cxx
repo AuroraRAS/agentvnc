@@ -69,13 +69,16 @@
 #include "AudioOutput.h"
 #include "AuthDialog.h"
 #include "CConn.h"
+#ifndef WIN32
 #include "FtpServer.h"
+#endif
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
 #include "PlatformPixelBuffer.h"
 #include "parameters.h"
 #include "vncviewer.h"
 
+#ifndef WIN32
 namespace {
 
 class FltkFtpEventLoop : public FtpEventLoop {
@@ -157,6 +160,7 @@ private:
 };
 
 }
+#endif
 
 std::string CConn::savedUsername;
 std::string CConn::savedPassword;
@@ -180,7 +184,9 @@ CConn::CConn()
   : serverPort(0), sock(nullptr),
     msgTimer(this, &CConn::processNextMsg), desktop(nullptr),
     audioOutput(nullptr),
+#ifndef WIN32
     ftpLoop(nullptr), ftpBackend(nullptr), ftpServer(nullptr),
+#endif
     updateCount(0), pixelCount(0),
     lastServerEncoding((unsigned int)-1), bpsEstimate(20000000)
 {
@@ -190,7 +196,10 @@ CConn::CConn()
   supportsCursorPosition = true;
   supportsDesktopResize = true;
   supportsLEDState = true;
+#ifndef WIN32
   supportsFileTransfer = true;
+  preferTightForFileTransfer = ::ftpServer;
+#endif
 
 #ifdef HAVE_AUDIO
   // Only ask the server to send audio if there is a device that can
@@ -207,6 +216,7 @@ CConn::CConn()
 
   setQualityLevel(::qualityLevel);
 
+#ifndef WIN32
   if (::ftpProtocol == "Tight2")
     fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Tight2);
   else if (::ftpProtocol == "Tight13")
@@ -219,12 +229,14 @@ CConn::CConn()
   ftpLoop = new FltkFtpEventLoop();
   ftpBackend = new CConnFtpBackend(this);
   ftpServer = new FtpServer(ftpLoop, ftpBackend);
+#endif
 
   OptionsDialog::addCallback(handleOptions, this);
 }
 
 CConn::~CConn()
 {
+#ifndef WIN32
   stopFtpServer();
   delete ftpServer;
   ftpServer = nullptr;
@@ -232,6 +244,7 @@ CConn::~CConn()
   ftpBackend = nullptr;
   delete ftpLoop;
   ftpLoop = nullptr;
+#endif
 
   close();
 
@@ -360,11 +373,13 @@ std::string CConn::connectionInfo()
                            rfb::secTypeName(csecurity->getType()));
   infoText += "\n";
 
+#ifndef WIN32
   if (ftpServer != nullptr && ftpServer->isRunning()) {
     infoText += core::format(_("FTP server: %s"),
                              ftpServer->url().c_str());
     infoText += "\n";
   }
+#endif
 
   return infoText;
 }
@@ -415,8 +430,10 @@ void CConn::processNextMsg(core::Timer*)
   try {
     // We might have been called to flush unwritten socket data
     sock->outStream().flush();
+#ifndef WIN32
     if (ftpServer != nullptr)
       ftpServer->onBackendOutputDrained();
+#endif
 
     again = processMsg();
   } catch (rdr::end_of_stream& e) {
@@ -551,7 +568,9 @@ void CConn::initDone()
   updateEncoding();
   updatePixelFormat();
 
+#ifndef WIN32
   updateFtpServer();
+#endif
 }
 
 bool CConn::verifyCertificate(unsigned int status,
@@ -1174,7 +1193,9 @@ void CConn::handleOptions(void *data)
   self->updateCompressLevel();
   self->updateQualityLevel();
   self->updatePixelFormat();
+#ifndef WIN32
   self->updateFtpServer();
+#endif
 }
 
 void CConn::handleUpdateTimeout(void *data)
@@ -1188,6 +1209,7 @@ void CConn::handleUpdateTimeout(void *data)
   Fl::repeat_timeout(1.0, handleUpdateTimeout, data);
 }
 
+#ifndef WIN32
 bool CConn::startFtpServer(std::string* errorMsg)
 {
   if (ftpServer == nullptr)
@@ -1284,3 +1306,4 @@ bool CConn::isOutputCongested() const
     dynamic_cast<rdr::BufferedOutStream*>(&sock->outStream());
   return bos != nullptr && bos->bufferedSize() >= 262144;
 }
+#endif

@@ -30,9 +30,11 @@ namespace network { class Socket; }
 
 class AudioOutput;
 class DesktopWindow;
+#ifndef WIN32
 class FtpEventLoop;
 class FtpBackend;
 class FtpServer;
+#endif
 
 class CConn : public rfb::CConnection
 {
@@ -44,6 +46,7 @@ public:
 
   std::string connectionInfo();
 
+#ifndef WIN32
   bool startFtpServer(std::string* errorMsg=nullptr);
   void stopFtpServer();
   void updateFtpServer();
@@ -51,6 +54,7 @@ public:
   std::string ftpServerUrl() const;
   void flushOutput();
   bool isOutputCongested() const;
+#endif
 
   unsigned getUpdateCount();
   unsigned getPixelCount();
@@ -123,9 +127,11 @@ private:
 
   AudioOutput *audioOutput;
 
+#ifndef WIN32
   FtpEventLoop *ftpLoop;
   FtpBackend *ftpBackend;
   FtpServer *ftpServer;
+#endif
 
   unsigned updateCount;
   unsigned pixelCount;
