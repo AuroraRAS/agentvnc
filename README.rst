@@ -43,8 +43,8 @@ Compared to upstream TigerVNC, AgentVNC adds three main feature sets to
 
 1. An external AI agent IPC bridge with headless mode, a live action overlay,
    and human-agent collaborative takeover.
-2. Integer-factor HiDPI screen scaling (``1x`` to ``8x``) with crisp
-   nearest-neighbor rendering.
+2. Automatic HiDPI scaling for the viewer interface and independent integer
+   scaling (``1x`` to ``8x``) for the remote desktop.
 3. An embedded FTP server bridge that exposes RFB file transfer extensions
    (TightVNC 2.x, TightVNC 1.3.x, and UltraVNC) over standard FTP.
 
@@ -67,7 +67,8 @@ Agent Viewer Options
   single ``poll()`` event loop.  Unix platforms only.
 * ``-AgentOverlay`` - Draw a live HUD on the viewer showing the agent's status
   and intent, click reticles with pulse feedback, and drag vectors.  Overlay
-  coordinates automatically scale with ``-ScaleFactor``.
+  points use remote framebuffer coordinates and stay aligned with the desktop
+  as the local display scale or ``-ScaleFactor`` changes.
 * ``-AgentCollaborate`` - Enable collaborative mode (implies ``-AgentOverlay``)
   where local mouse or keyboard input automatically pauses agent input for
   immediate human takeover.
@@ -168,23 +169,28 @@ file I/O tools (or pass ``--live --vnc-host localhost:5901`` for a live VNC
 integration test).
 
 
-Integer-Factor HiDPI Scaling
-----------------------------
+HiDPI and Remote Desktop Scaling
+--------------------------------
 
-``vncviewer`` supports integer display scaling from ``1x`` to ``8x`` across all
-platforms using crisp nearest-neighbor pixel duplication, avoiding blurry
-fractional scaling on HiDPI displays.
+The viewer interface follows the local display scale automatically, including
+fractional scaling and macOS Retina displays.  On Linux, the graphical viewer
+uses X11 and runs through XWayland in a Wayland session.  It updates the
+interface scale when the X11 ``Xft.dpi`` resource changes.
 
-* ``-ScaleFactor <1..8>`` - Set the integer scaling factor (default: ``1``).
-  Pointer coordinates are mapped back to unscaled remote framebuffer
-  coordinates, remote cursors are scaled automatically, and when
-  ``-RemoteResize`` is active the requested remote desktop dimensions are
-  computed by dividing the viewer window size by the scaling factor.  An
-  explicit ``-DesktopSize`` continues to specify unscaled remote framebuffer
-  dimensions.
-* **GUI configuration**: Open **Options -> Display -> Scaling** and choose a
-  **Scale factor** from ``1x`` to ``8x``.  The selection is saved in the viewer
-  configuration and updates the active window immediately.
+``-ScaleFactor <1..8>`` controls how the remote desktop is drawn.  At the
+default of ``1``, each remote framebuffer pixel uses one physical pixel in the
+viewer, even when the viewer interface is scaled.  Higher factors enlarge
+the desktop using nearest-neighbor pixel duplication.  Pointer input maps
+back to remote framebuffer coordinates.
+
+To change the factor in the viewer, open **Options -> Display -> Scaling** and
+choose a **Scale factor**.  The setting updates the active session and is
+saved in the viewer configuration.
+
+When ``-RemoteResize`` is enabled and supported by the server, the viewer
+requests a remote desktop size based on the window's physical client area
+divided by ``-ScaleFactor``.  Use ``-DesktopSize WIDTHxHEIGHT`` to request an
+explicit initial size in remote framebuffer pixels.
 
 Example::
 
@@ -274,6 +280,10 @@ All versions of AgentVNC contain the following programs:
               allows you to interact with the remote desktop being displayed by
               the VNC server.  The VNC server can be running on a Windows or a
               Unix/Linux machine.
+
+Building ``vncviewer`` requires FLTK 1.4 or a newer 1.x release.  On Unix
+platforms other than macOS, FLTK must include X11 support.  See
+`BUILDING.txt <BUILDING.txt>`_ for build instructions.
 
 
 Windows-specific
