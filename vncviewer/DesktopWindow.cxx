@@ -1327,12 +1327,10 @@ void DesktopWindow::remoteResize()
   if (!sentDesktopSize && (strcmp(desktopSize, "") != 0)) {
     // An explicit size has been requested
 
-    if ((sscanf(desktopSize, "%dx%d", &width, &height) != 2) ||
-        (width <= 0) || (height <= 0))
-      return;
-
     sentDesktopSize = true;
-    explicitDesktopSize = true;
+    explicitDesktopSize = parseRemoteDesktopSize(desktopSize, &width, &height);
+    if (!explicitDesktopSize)
+      vlog.error(_("Invalid desktop size: %s"), (const char*)desktopSize);
   }
 
   if (!fullscreen_active() || (width * factor > w()) || (height * factor > h())) {

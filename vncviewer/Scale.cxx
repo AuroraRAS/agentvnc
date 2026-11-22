@@ -1,15 +1,15 @@
 /* Copyright 2026 TigerVNC team
- * 
+ *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
- * 
+ *
  * This software is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with this software; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307,
@@ -21,6 +21,7 @@
 #endif
 
 #include <assert.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
@@ -62,6 +63,23 @@ core::Rect scaleRectFromFramebuffer(const core::Rect& fbRect, int scale)
 
   return core::Rect(fbRect.tl.x * scale, fbRect.tl.y * scale,
                     fbRect.br.x * scale, fbRect.br.y * scale);
+}
+
+bool parseRemoteDesktopSize(const char* spec, int* width, int* height)
+{
+  char* end;
+  long w = strtol(spec, &end, 10);
+  if (end == spec || *end != 'x' || w < 1 || w > UINT16_MAX)
+    return false;
+
+  const char* heightStart = end + 1;
+  long h = strtol(heightStart, &end, 10);
+  if (end == heightStart || *end != '\0' || h < 1 || h > UINT16_MAX)
+    return false;
+
+  *width = (int)w;
+  *height = (int)h;
+  return true;
 }
 
 core::Point computeRemoteDesktopSize(int winWidth, int winHeight, int scale)
