@@ -1,15 +1,15 @@
 /* Copyright 2026 TigerVNC team
- * 
+ *
  * This is free software; you can redistribute it and/or modify
  * it under the terms of the GNU General Public License as published by
  * the Free Software Foundation; either version 2 of the License, or
  * (at your option) any later version.
- * 
+ *
  * This software is distributed in the hope that it will be useful,
  * but WITHOUT ANY WARRANTY; without even the implied warranty of
  * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
  * GNU General Public License for more details.
- * 
+ *
  * You should have received a copy of the GNU General Public License
  * along with this software; if not, write to the Free Software
  * Foundation, Inc., 59 Temple Place - Suite 330, Boston, MA  02111-1307,
@@ -89,6 +89,22 @@ TEST(Scale, scaleRectFromFramebuffer)
   EXPECT_EQ(scaleRectFromFramebuffer(r, 1), core::Rect(10, 20, 30, 50));
   EXPECT_EQ(scaleRectFromFramebuffer(r, 2), core::Rect(20, 40, 60, 100));
   EXPECT_EQ(scaleRectFromFramebuffer(r, 3), core::Rect(30, 60, 90, 150));
+}
+
+TEST(Scale, parseRemoteDesktopSize)
+{
+  int width = 0, height = 0;
+  ASSERT_TRUE(parseRemoteDesktopSize("65535x1", &width, &height));
+  EXPECT_EQ(width, 65535);
+  EXPECT_EQ(height, 1);
+
+  for (const char* invalid : {"", "640", "0x480", "640x-1", "65536x1",
+                              "1x65536", "999999999999999999999x1",
+                              "640x480junk"}) {
+    EXPECT_FALSE(parseRemoteDesktopSize(invalid, &width, &height)) << invalid;
+    EXPECT_EQ(width, 65535);
+    EXPECT_EQ(height, 1);
+  }
 }
 
 TEST(Scale, computeRemoteDesktopSize)
