@@ -7,6 +7,7 @@ add_subdirectory(common)
 add_subdirectory(vncconfig)
 add_subdirectory(vncpasswd)
 add_subdirectory(x0vncserver)
+add_subdirectory(scrcpyvncserver)
 
 if(PAM_FOUND)
   add_subdirectory(vncserver)
