@@ -38,8 +38,9 @@ TigerVNC ``master`` branch, ensuring that no fixes from upstream are missed.
 AgentVNC Features and Usage
 ===========================
 
-Compared to upstream TigerVNC, AgentVNC adds three main feature sets to
-``vncviewer`` (plus supporting Python tools in ``tools/``):
+Compared to upstream TigerVNC, AgentVNC adds four main feature sets across
+``vncviewer`` (plus supporting Python tools in ``tools/``) and the Unix/Linux
+``scrcpyvncserver`` server:
 
 1. An external AI agent IPC bridge with headless mode, a live action overlay,
    and human-agent collaborative takeover.
@@ -47,6 +48,8 @@ Compared to upstream TigerVNC, AgentVNC adds three main feature sets to
    scaling (``1x`` to ``8x``) for the remote desktop.
 3. An embedded FTP server bridge that exposes RFB file transfer extensions
    (TightVNC 2.x, TightVNC 1.3.x, and UltraVNC) over standard FTP.
+4. ``scrcpyvncserver`` - a zero-transcoding VNC server bridging Android
+   ``scrcpy-server`` H.264 streams over ADB to RFB Open H.264 viewers.
 
 
 Agent IPC Bridge, Headless Mode, and Collaborative Control
@@ -241,6 +244,87 @@ Example::
   curl -T local.txt ftp://127.0.0.1:2121/remote.txt
 
 
+Android scrcpy VNC Server (scrcpyvncserver)
+-------------------------------------------
+
+On Unix/Linux platforms (excluding macOS), ``scrcpyvncserver`` exposes an
+Android device running ``scrcpy-server`` as a VNC server using zero-transcoding
+passthrough over RFB Open H.264 encoding (``50``).  Eliminating host-side
+decoding, color-space conversion, and re-encoding keeps bridge-induced latency
+minimal.
+
+It connects directly over TCP to the local ADB daemon (``127.0.0.1:5037`` by
+default) using ``host:transport:<serial>`` and ``localabstract:<socket>`` with
+``TCP_NODELAY`` enabled, strips scrcpy's packet header, and uses
+scatter-gather ``writev()`` I/O to prepend RFB ``FramebufferUpdate`` and Open
+H.264 headers directly onto raw H.264 Annex-B NAL payloads.  The server caches
+SPS/PPS parameters, manages decoder reset and recovery flags across new
+clients, non-incremental refreshes, encoder reconfigurations, and congestion
+or skipped frames, pushes updates with ``ContinuousUpdates`` (``-313``),
+forwards rotation or resolution changes via ``ExtendedDesktopSize`` (``-308``)
+or ``DesktopSize`` (``-223``), and relays pointer, keyboard, and clipboard
+input over the scrcpy control channel.
+
+scrcpyvncserver Options
+~~~~~~~~~~~~~~~~~~~~~~~
+
+* ``-Serial <serial>`` - Select the Android device serial (empty auto-selects
+  when a single device is connected).
+* ``-AdbHost <host>`` / ``-AdbPort <port>`` - ADB daemon address and TCP port
+  (default: ``127.0.0.1:5037``).
+* ``-ScrcpyServer <path>`` - Path to the ``scrcpy-server`` JAR on the host;
+  when omitted, checks ``SCRCPY_SERVER_PATH`` and standard installation paths.
+* ``-ScrcpyVersion <version>`` - Override the ``scrcpy-server`` version string
+  (auto-detected when launching; in ``-Attach`` mode, specify this for
+  versions older than ``3.3.1`` to select the matching control protocol).
+* ``-Attach`` - Attach directly to an already-running forward-tunneled H.264
+  ``scrcpy-server`` configured with audio disabled and codec/frame metadata
+  enabled.  Match ``-Control``, ``-SendDummyByte``, and ``-SendDeviceMeta``,
+  and select the socket with ``-ScrcpySocket`` or ``-Scid``.
+* ``-MaxSize <px>``, ``-MaxFps <fps>``, ``-BitRate <bps>`` (default:
+  ``8000000``), ``-IFrameInterval <sec>`` (default: ``2``), and
+  ``-VideoEncoder <name>`` - Configure Android H.264 capture and encoding.
+* ``-Control`` / ``-StayAwake`` - Enable the scrcpy input/clipboard control
+  channel (default: on) and keep the device awake while connected
+  (default: off).
+* ``-rfbport <port>`` (default: ``5900``), ``-rfbunixpath <path>``,
+  ``-localhost``, ``-SecurityTypes <list>`` (default: ``TLSVnc,VncAuth``),
+  ``-PasswordFile <path>``, and ``-HostsFile <path>`` - Listener, security, and
+  IP access filtering (``-HostsFile`` applies to TCP listeners including
+  systemd-activated sockets; connections requiring interactive approval are
+  rejected).
+
+Run ``scrcpyvncserver -h`` or see ``scrcpyvncserver(1)`` for the complete
+parameter list.
+
+Viewer Requirements and Usage
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Viewers must support RFB Open H.264 encoding (``50``), plus
+``ExtendedDesktopSize`` (``-308``) or ``DesktopSize`` (``-223``) for Android
+display resizes and ``ContinuousUpdates`` (``-313``) for immediate frame
+push delivery.  With an H.264-enabled ``vncviewer``, explicitly set
+``-AutoSelect=0 -PreferredEncoding=H.264`` so it stays on Open H.264.
+
+Example::
+
+  # Ensure the local ADB daemon is connected to the Android target
+  adb connect 192.168.240.112:5555
+
+  # Launch scrcpyvncserver on localhost port 5900 (or use -PasswordFile)
+  scrcpyvncserver -Serial 192.168.240.112:5555 \
+      -ScrcpyServer /path/to/scrcpy-server -MaxSize 1920 \
+      -rfbport 5900 -localhost -SecurityTypes None
+
+  # Or attach to an already-running forward-tunneled scrcpy-server socket
+  scrcpyvncserver -Attach=1 -Serial 192.168.240.112:5555 \
+      -rfbport 5900 -localhost -SecurityTypes None
+
+  # Connect with TigerVNC/AgentVNC viewer (supports -Headless / -AgentSocket)
+  vncviewer -AutoSelect=0 -PreferredEncoding=H.264 -SecurityTypes=None \
+      127.0.0.1::5900
+
+
 Legal
 =====
 
@@ -323,6 +407,10 @@ The Unix/Linux version of AgentVNC contains the following programs:
 
 * w0vncserver - a VNC server for Wayland compositors which gives control
                 over your local Wayland session.
+
+* scrcpyvncserver - a zero-transcoding VNC server that bridges Android
+                    ``scrcpy-server`` H.264 streams over ADB to RFB Open H.264
+                    viewers.
 
 It also contains the following systemd service:
 
