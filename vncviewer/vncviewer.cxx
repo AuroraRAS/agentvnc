@@ -874,5 +874,5 @@ int main(int argc, char** argv)
   mainloop(vncServerName.c_str(), sock);
   inMainloop = false;
 
-  return 0;
+  return (fatalError || (headless && !exitError.empty())) ? EXIT_FAILURE : EXIT_SUCCESS;
 }
