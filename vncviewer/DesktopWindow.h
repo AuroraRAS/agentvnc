@@ -133,6 +133,7 @@ private:
 
   void rebuildAgentHudSurface();
   void rebuildAgentMarkerSurface(float rippleProgress);
+  core::Point scaledAgentOverlayPoint(int x, int y) const;
   void rebuildAgentDragSurface();
   static void animateAgentOverlay(void *data);
 

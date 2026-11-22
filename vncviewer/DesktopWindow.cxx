@@ -413,6 +413,8 @@ void DesktopWindow::resizeFramebuffer(int new_w, int new_h)
   viewport->resizeFramebuffer(new_w, new_h);
 
   repositionWidgets();
+  if (cc->hasAgentBridge() && cc->isAgentOverlayEnabled())
+    rebuildAgentDragSurface();
 }
 
 
@@ -539,8 +541,7 @@ void DesktopWindow::draw()
     }
 
     if (agentMarkerSurface && ov.hasPoint) {
-      core::Point localPt = scaleFromFramebuffer({ov.x, ov.y},
-                                                 viewport->getScaleFactor());
+      core::Point localPt = scaledAgentOverlayPoint(ov.x, ov.y);
       int bx = localPt.x + viewport->x() - agentMarkerSurface->width() / 2;
       int by = localPt.y + viewport->y() - agentMarkerSurface->height() / 2;
       int cx, cy, cw, ch;
@@ -2183,6 +2184,15 @@ void DesktopWindow::rebuildAgentMarkerSurface(float rippleProgress)
   delete [] buf;
 }
 
+core::Point DesktopWindow::scaledAgentOverlayPoint(int x, int y) const
+{
+  // Pointer events are clamped to the framebuffer by the RFB writer.
+  // Apply the same bounds before scaling overlay coordinates.
+  x = std::max(0, std::min(x, viewport->framebufferWidth() - 1));
+  y = std::max(0, std::min(y, viewport->framebufferHeight() - 1));
+  return scaleFromFramebuffer({x, y}, viewport->getScaleFactor());
+}
+
 void DesktopWindow::rebuildAgentDragSurface()
 {
   delete agentDragSurface;
@@ -2195,9 +2205,8 @@ void DesktopWindow::rebuildAgentDragSurface()
   if (!ov.hasPoint || !ov.hasEndPoint)
     return;
 
-  int scale = viewport->getScaleFactor();
-  core::Point startPt = scaleFromFramebuffer({ov.x, ov.y}, scale);
-  core::Point endPt = scaleFromFramebuffer({ov.endX, ov.endY}, scale);
+  core::Point startPt = scaledAgentOverlayPoint(ov.x, ov.y);
+  core::Point endPt = scaledAgentOverlayPoint(ov.endX, ov.endY);
 
   const int pad = 12;
   int minX = std::min(startPt.x, endPt.x) - pad;
