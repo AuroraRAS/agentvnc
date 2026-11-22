@@ -35,6 +35,7 @@
 #include <core/i18n.h>
 
 #include "MonitorIndicesParameter.h"
+#include "Scale.h"
 
 static core::LogWriter vlog("MonitorIndicesParameter");
 
@@ -102,14 +103,17 @@ std::vector<MonitorIndicesParameter::Monitor> MonitorIndicesParameter::fetchMoni
         Monitor monitor;
         bool match;
 
-        // Get the properties of the monitor at the current index;
-        Fl::screen_xywh(
-            monitor.x,
-            monitor.y,
-            monitor.w,
-            monitor.h,
-            i
-        );
+        // Get the properties of the monitor at the current index in physical pixels
+        int lx, ly, lw, lh;
+        Fl::screen_xywh(lx, ly, lw, lh, i);
+        float s = Fl::screen_scale(i);
+        if (s <= 0.0f)
+            s = 1.0f;
+        core::Rect pr = scaleScreenRectToPhysical(core::Rect(lx, ly, lx + lw, ly + lh), s);
+        monitor.x = pr.tl.x;
+        monitor.y = pr.tl.y;
+        monitor.w = pr.width();
+        monitor.h = pr.height();
 
         // Only keep a single entry for mirrored screens
         match = false;

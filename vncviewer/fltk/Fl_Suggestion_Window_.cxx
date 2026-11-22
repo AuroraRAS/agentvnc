@@ -41,6 +41,8 @@ Fl_Suggestion_Window_::Fl_Suggestion_Window_(Fl_Suggestion_Input *_widget)
 
 void Fl_Suggestion_Window_::show()
 {
+    screen_num(widget->window()->screen_num());
+
     // Place the dropdown below the input
     int x = widget->x();
     int y = widget->y() + widget->h();
@@ -62,7 +64,7 @@ void Fl_Suggestion_Window_::size(const int w, const int h)
 {
     int work_x, work_y, work_w, work_h;
     Fl::screen_work_area(work_x, work_y, work_w, work_h,
-                         Fl::screen_num(x(), y()));
+                         widget->window()->screen_num());
 
     // Make sure the window isn't taller than fits in the work area
     int root_y = widget->window()->y() + widget->y() + widget->h();

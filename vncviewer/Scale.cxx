@@ -21,10 +21,14 @@
 #endif
 
 #include <assert.h>
+#include <ctype.h>
+#include <math.h>
 #include <stdlib.h>
 #include <string.h>
 
 #include <algorithm>
+#include <cmath>
+#include <string>
 
 #include "Scale.h"
 
@@ -38,6 +42,168 @@ int floorDiv(int a, int b)
   int q = a / b;
   int r = a % b;
   return (r != 0) ? (q - 1) : q;
+}
+
+int logicalToPhysical(int v, float uiScale)
+{
+  assert(uiScale > 0.0f);
+
+  return (int)lroundf((float)v * uiScale);
+}
+
+int physicalToLogicalSize(int phys, float uiScale)
+{
+  assert(uiScale > 0.0f);
+
+  if (phys <= 0)
+    return 0;
+
+  return std::max(1, (int)lroundf((float)phys / uiScale));
+}
+
+core::Rect logicalRectToPhysical(const core::Rect& logicalRect,
+                                 float uiScale, int maxW, int maxH)
+{
+  assert(uiScale > 0.0f);
+
+  if (logicalRect.is_empty() || (maxW <= 0) || (maxH <= 0))
+    return core::Rect();
+
+  int x0 = std::max(0, std::min(maxW, (int)floorf((float)logicalRect.tl.x * uiScale)));
+  int y0 = std::max(0, std::min(maxH, (int)floorf((float)logicalRect.tl.y * uiScale)));
+  int x1 = std::max(0, std::min(maxW, (int)ceilf((float)logicalRect.br.x * uiScale)));
+  int y1 = std::max(0, std::min(maxH, (int)ceilf((float)logicalRect.br.y * uiScale)));
+
+  if ((x1 <= x0) || (y1 <= y0))
+    return core::Rect();
+
+  return core::Rect(x0, y0, x1, y1);
+}
+
+core::Rect physicalRectToLogical(const core::Rect& physRect, float uiScale)
+{
+  assert(uiScale > 0.0f);
+
+  if (physRect.is_empty())
+    return core::Rect();
+
+  int x0 = (int)floorf((float)physRect.tl.x / uiScale);
+  int y0 = (int)floorf((float)physRect.tl.y / uiScale);
+  int x1 = (int)ceilf((float)physRect.br.x / uiScale);
+  int y1 = (int)ceilf((float)physRect.br.y / uiScale);
+
+  return core::Rect(x0, y0, x1, y1);
+}
+
+core::Rect scaleScreenRectToPhysical(const core::Rect& logicalRect,
+                                     float uiScale)
+{
+  assert(uiScale > 0.0f);
+
+  if (logicalRect.is_empty())
+    return core::Rect();
+
+  int px = logicalToPhysical(logicalRect.tl.x, uiScale);
+  int py = logicalToPhysical(logicalRect.tl.y, uiScale);
+  int pw = logicalToPhysical(logicalRect.width(), uiScale);
+  int ph = logicalToPhysical(logicalRect.height(), uiScale);
+
+  return core::Rect(px, py, px + pw, py + ph);
+}
+
+bool screenRectMatchesPhysical(const core::Rect& logicalRect,
+                               float uiScale,
+                               const core::Rect& osPhysRect)
+{
+  core::Rect p = scaleScreenRectToPhysical(logicalRect, uiScale);
+  if (p.is_empty() || osPhysRect.is_empty())
+    return false;
+
+  int tol = std::max(1, (int)ceilf(uiScale));
+  return (abs(p.tl.x - osPhysRect.tl.x) <= tol) &&
+         (abs(p.tl.y - osPhysRect.tl.y) <= tol) &&
+         (abs(p.width() - osPhysRect.width()) <= tol) &&
+         (abs(p.height() - osPhysRect.height()) <= tol);
+}
+
+bool parseXftDpiFromResources(const char* resources, float* dpi)
+{
+  assert(dpi != nullptr);
+
+  if (resources == nullptr)
+    return false;
+
+  bool found = false;
+  float lastDpi = 0.0f;
+  const char* p = resources;
+
+  while (*p != '\0') {
+    const char* lineEnd = strchr(p, '\n');
+    size_t len = lineEnd ? (size_t)(lineEnd - p) : strlen(p);
+    const char* next = lineEnd ? (lineEnd + 1) : (p + len);
+
+    if ((len > 0) && (p[len - 1] == '\r'))
+      len--;
+
+    const char* cur = p;
+    const char* end = p + len;
+    while ((cur < end) && isspace((unsigned char)*cur))
+      cur++;
+
+    if ((cur < end) && (*cur != '!')) {
+      const char* colon = (const char*)memchr(cur, ':', (size_t)(end - cur));
+      if (colon != nullptr) {
+        const char* keyEnd = colon;
+        while ((keyEnd > cur) && isspace((unsigned char)keyEnd[-1]))
+          keyEnd--;
+
+        size_t keyLen = (size_t)(keyEnd - cur);
+        bool keyMatches =
+          ((keyLen == 7) && (strncmp(cur, "Xft.dpi", 7) == 0)) ||
+          ((keyLen == 8) && (strncmp(cur, "*Xft.dpi", 8) == 0)) ||
+          ((keyLen == 9) && (strncmp(cur, "*.Xft.dpi", 9) == 0));
+
+        if (keyMatches) {
+          const char* valStart = colon + 1;
+          while ((valStart < end) && isspace((unsigned char)*valStart))
+            valStart++;
+
+          if (valStart < end) {
+            std::string valStr(valStart, (size_t)(end - valStart));
+            char* parseEnd = nullptr;
+            float parsed = strtof(valStr.c_str(), &parseEnd);
+            if (parseEnd != valStr.c_str()) {
+              while ((*parseEnd != '\0') && isspace((unsigned char)*parseEnd))
+                parseEnd++;
+              if ((*parseEnd == '\0') && std::isfinite(parsed) && (parsed > 0.0f)) {
+                found = true;
+                lastDpi = parsed;
+              }
+            }
+          }
+        }
+      }
+    }
+
+    p = next;
+  }
+
+  if (found)
+    *dpi = lastDpi;
+
+  return found;
+}
+
+float computeUIScaleFromDpi(float dpi, float envMultiplier)
+{
+  if (!std::isfinite(dpi) || (dpi <= 0.0f))
+    return 1.0f;
+
+  if (!std::isfinite(envMultiplier) || (envMultiplier <= 0.0f))
+    envMultiplier = 1.0f;
+
+  float s = (dpi / 96.0f) * envMultiplier;
+  return std::max(0.5f, std::min(10.0f, s));
 }
 
 core::Point scaleToFramebuffer(const core::Point& localPos, int scale)

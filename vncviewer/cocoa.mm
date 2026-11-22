@@ -22,9 +22,10 @@
 
 #include <assert.h>
 #include <dlfcn.h>
+#include <math.h>
 
 #include <FL/Fl_Window.H>
-#include <FL/x.H>
+#include <FL/platform.H>
 
 #import <Cocoa/Cocoa.h>
 #import <ApplicationServices/ApplicationServices.h>
@@ -263,10 +264,107 @@ void cocoa_event_delay(double seconds)
   CFRelease(event);
 }
 
-void cocoa_set_cursor_pos(int x, int y)
+float cocoa_backing_scale(Fl_Window *win)
 {
-  CGPoint new_pos;
-  new_pos.x = x;
-  new_pos.y = y;
-  CGWarpMouseCursorPosition(new_pos);
+  if (win && win->shown()) {
+    NSWindow *nsw = (NSWindow*)fl_xid(win);
+    if (nsw)
+      return (float)[nsw backingScaleFactor];
+  }
+
+  NSScreen *screen = [NSScreen mainScreen];
+  if (screen)
+    return (float)[screen backingScaleFactor];
+
+  return 1.0f;
+}
+
+void cocoa_win_get_physical_size(Fl_Window *win, int *w, int *h)
+{
+  assert(w);
+  assert(h);
+
+  if (win && win->shown()) {
+    NSWindow *nsw = (NSWindow*)fl_xid(win);
+    if (nsw && [nsw contentView]) {
+      NSRect backing = [nsw convertRectToBacking:[[nsw contentView] bounds]];
+      *w = (int)lround(backing.size.width);
+      *h = (int)lround(backing.size.height);
+      return;
+    }
+  }
+
+  float s = cocoa_backing_scale(win);
+  *w = win ? (int)lroundf((float)win->w() * s) : 0;
+  *h = win ? (int)lroundf((float)win->h() * s) : 0;
+}
+
+bool cocoa_event_physical_pos(Fl_Window *win, int *x, int *y)
+{
+  assert(x);
+  assert(y);
+
+  if (!win || !win->shown())
+    return false;
+
+  NSWindow *nsw = (NSWindow*)fl_xid(win);
+  NSEvent *ev = [NSApp currentEvent];
+  if (!nsw || !ev || ([ev window] != nsw))
+    return false;
+
+  switch ([ev type]) {
+  case NSEventTypeLeftMouseDown:
+  case NSEventTypeLeftMouseUp:
+  case NSEventTypeRightMouseDown:
+  case NSEventTypeRightMouseUp:
+  case NSEventTypeOtherMouseDown:
+  case NSEventTypeOtherMouseUp:
+  case NSEventTypeMouseMoved:
+  case NSEventTypeLeftMouseDragged:
+  case NSEventTypeRightMouseDragged:
+  case NSEventTypeOtherMouseDragged:
+  case NSEventTypeMouseEntered:
+  case NSEventTypeMouseExited:
+  case NSEventTypeScrollWheel: {
+    NSView *view = [nsw contentView];
+    if (!view)
+      return false;
+    NSPoint viewPt = [view convertPoint:[ev locationInWindow] fromView:nil];
+    NSPoint backPt = [view convertPointToBacking:viewPt];
+    *x = (int)lround(backPt.x);
+    if ([view isFlipped]) {
+      *y = (int)lround(backPt.y);
+    } else {
+      NSRect backRect = [view convertRectToBacking:[view bounds]];
+      *y = (int)lround(backRect.size.height - backPt.y);
+    }
+    return true;
+  }
+  default:
+    return false;
+  }
+}
+
+void cocoa_win_warp_pointer(Fl_Window *win, int x, int y)
+{
+  if (win && win->shown()) {
+    float s = cocoa_backing_scale(win);
+    NSWindow *nsw = (NSWindow*)fl_xid(win);
+    NSView *view = nsw ? [nsw contentView] : nil;
+    if (nsw && view && (s > 0.0f)) {
+      CGFloat ptX = (CGFloat)x / s;
+      CGFloat ptY = (CGFloat)y / s;
+      NSPoint viewPt = [view isFlipped]
+        ? NSMakePoint(ptX, ptY)
+        : NSMakePoint(ptX, [view bounds].size.height - ptY);
+      NSPoint winPt = [view convertPoint:viewPt toView:nil];
+      NSPoint screenPt = [nsw convertPointToScreen:winPt];
+      NSScreen *primary = [[NSScreen screens] firstObject];
+      CGFloat primaryH = primary ? [primary frame].size.height : 0.0;
+      CGWarpMouseCursorPosition(CGPointMake(screenPt.x, primaryH - screenPt.y));
+      return;
+    }
+  }
+
+  CGWarpMouseCursorPosition(CGPointMake(x, y));
 }

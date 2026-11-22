@@ -28,14 +28,20 @@ void x11_win_maximize(Fl_Window* win);
 bool x11_win_is_maximized(Fl_Window* win);
 
 void x11_win_get_coords(Fl_Window* win, int* x, int* y, int* w, int* h);
+void x11_win_get_physical_size(Fl_Window* win, int* w, int* h);
 
 void x11_win_may_grab(Fl_Window* win);
 
 bool x11_grab_keyboard(Fl_Window* win);
 void x11_ungrab_keyboard();
 
-void x11_warp_pointer(unsigned x, unsigned y);
+void x11_win_warp_pointer(Fl_Window* win, int x, int y);
+
+bool x11_event_physical_pos(Fl_Window* win, int* x, int* y);
 
 bool x11_is_pointer_on_same_screen(Fl_Window* win);
+
+void x11_sync_screen_scale();
+void x11_init_scale_sync();
 
 #endif

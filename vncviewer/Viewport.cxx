@@ -22,9 +22,11 @@
 #endif
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
 #include <string.h>
 
+#include <algorithm>
 #include <stdexcept>
 
 #include <core/Configuration.h>
@@ -65,7 +67,7 @@
 
 #include <FL/Fl_Menu.H>
 #include <FL/Fl_Menu_Button.H>
-#include <FL/x.H>
+#include <FL/platform.H>
 
 #if defined(WIN32)
 #include "KeyboardWin32.h"
@@ -98,6 +100,7 @@ static const int FAKE_KEY_CODE = 0xffff;
 Viewport::Viewport(int w, int h, CConn* cc_)
   : Fl_Widget(0, 0, w * (int)scaleFactor, h * (int)scaleFactor),
     cc(cc_), frameBuffer(nullptr), scale((int)scaleFactor),
+    physX(0), physY(0),
     lastPointerPos(0, 0), lastButtonMask(0),
     keyboard(nullptr), shortcutBypass(false), shortcutActive(false),
     firstLEDState(true), pendingClientClipboard(false),
@@ -185,7 +188,16 @@ void Viewport::updateWindow()
   core::Rect r;
 
   r = scaleRectFromFramebuffer(frameBuffer->getDamage(), scale);
-  damage(FL_DAMAGE_USER1, r.tl.x + x(), r.tl.y + y(), r.width(), r.height());
+  if (r.is_empty())
+    return;
+
+  DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window());
+  float ui = dw ? dw->uiScale() : 1.0f;
+  core::Rect ld = physicalRectToLogical(
+    core::Rect(r.tl.x + physX, r.tl.y + physY,
+               r.br.x + physX, r.br.y + physY),
+    ui);
+  damage(FL_DAMAGE_USER1, ld.tl.x, ld.tl.y, ld.width(), ld.height());
 }
 
 void Viewport::resizeFramebuffer(int fb_w, int fb_h)
@@ -199,7 +211,8 @@ void Viewport::resizeFramebuffer(int fb_w, int fb_h)
     cc->setFramebuffer(frameBuffer);
   }
 
-  Fl_Widget::size(fb_w * scale, fb_h * scale);
+  DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window());
+  syncLogicalGeometry(dw ? dw->uiScale() : 1.0f);
 }
 
 void Viewport::setScaleFactor(int factor)
@@ -211,7 +224,8 @@ void Viewport::setScaleFactor(int factor)
     return;
 
   scale = factor;
-  Fl_Widget::size(frameBuffer->width() * scale, frameBuffer->height() * scale);
+  DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window());
+  syncLogicalGeometry(dw ? dw->uiScale() : 1.0f);
   setCursor();
   redraw();
 }
@@ -224,6 +238,31 @@ int Viewport::framebufferWidth() const
 int Viewport::framebufferHeight() const
 {
   return frameBuffer->height();
+}
+
+int Viewport::phys_w() const
+{
+  return frameBuffer->width() * scale;
+}
+
+int Viewport::phys_h() const
+{
+  return frameBuffer->height() * scale;
+}
+
+void Viewport::setPhysicalPosition(int px, int py, float uiScale)
+{
+  physX = px;
+  physY = py;
+  syncLogicalGeometry(uiScale);
+}
+
+void Viewport::syncLogicalGeometry(float uiScale)
+{
+  core::Rect lr = physicalRectToLogical(
+    core::Rect(physX, physY, physX + phys_w(), physY + phys_h()),
+    uiScale);
+  Fl_Widget::resize(lr.tl.x, lr.tl.y, lr.width(), lr.height());
 }
 
 static const char * dotcursor_xpm[] = {
@@ -301,6 +340,21 @@ void Viewport::setCursor()
 
   if (Fl::belowmouse() == this)
     showCursor();
+
+#ifdef __APPLE__
+  if (cursor != nullptr) {
+    float bs = cocoa_backing_scale(window());
+    if (bs > 1.0f) {
+      int logicalW = std::max(1, (int)lroundf((float)cursor->data_w() / bs));
+      int logicalH = std::max(1, (int)lroundf((float)cursor->data_h() / bs));
+      cursor->scale(logicalW, logicalH, 0, 1);
+      cursorHotspot.x = std::max(0, std::min((int)lroundf((float)cursorHotspot.x / bs),
+                                             cursor->w() - 1));
+      cursorHotspot.y = std::max(0, std::min((int)lroundf((float)cursorHotspot.y / bs),
+                                             cursor->h() - 1));
+    }
+  }
+#endif
 }
 
 void Viewport::showCursor()
@@ -434,29 +488,85 @@ void Viewport::pushLEDState()
 }
 
 
-void Viewport::draw(Surface* dst)
+void Viewport::draw(Surface* dst, int clipX, int clipY, int clipW, int clipH)
 {
-  int X, Y, W, H;
-
-  // Check what actually needs updating
-  fl_clip_box(x(), y(), w(), h(), X, Y, W, H);
-  if ((W == 0) || (H == 0))
+  core::Rect clipRect(clipX, clipY, clipX + clipW, clipY + clipH);
+  core::Rect vpRect(physX, physY, physX + phys_w(), physY + phys_h());
+  core::Rect inter = clipRect.intersect(vpRect);
+  if (inter.is_empty())
     return;
 
-  frameBuffer->draw(dst, X - x(), Y - y(), X, Y, W, H, scale);
+  frameBuffer->draw(dst, inter.tl.x - physX, inter.tl.y - physY,
+                    inter.tl.x, inter.tl.y,
+                    inter.width(), inter.height(), scale);
+}
+
+
+void Viewport::draw(int clipX, int clipY, int clipW, int clipH)
+{
+  core::Rect clipRect(clipX, clipY, clipX + clipW, clipY + clipH);
+  core::Rect vpRect(physX, physY, physX + phys_w(), physY + phys_h());
+  core::Rect inter = clipRect.intersect(vpRect);
+  if (inter.is_empty())
+    return;
+
+  frameBuffer->draw(inter.tl.x - physX, inter.tl.y - physY,
+                    inter.tl.x, inter.tl.y,
+                    inter.width(), inter.height(), scale);
+}
+
+
+void Viewport::draw(Surface* dst)
+{
+  int cx, cy, cw, ch;
+
+  // Check what actually needs updating
+  fl_clip_box(x(), y(), w(), h(), cx, cy, cw, ch);
+  if ((cw == 0) || (ch == 0))
+    return;
+
+  DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window());
+  float ui = dw ? dw->uiScale() : 1.0f;
+  int maxW = physX + phys_w();
+  int maxH = physY + phys_h();
+  if (dw)
+    dw->getPhysicalSize(&maxW, &maxH);
+
+  core::Rect physClip = logicalRectToPhysical(
+    core::Rect(cx, cy, cx + cw, cy + ch), ui, maxW, maxH);
+  if (physClip.is_empty())
+    return;
+
+  draw(dst, physClip.tl.x, physClip.tl.y,
+       physClip.width(), physClip.height());
 }
 
 
 void Viewport::draw()
 {
-  int X, Y, W, H;
+  int cx, cy, cw, ch;
 
   // Check what actually needs updating
-  fl_clip_box(x(), y(), w(), h(), X, Y, W, H);
-  if ((W == 0) || (H == 0))
+  fl_clip_box(x(), y(), w(), h(), cx, cy, cw, ch);
+  if ((cw == 0) || (ch == 0))
     return;
 
-  frameBuffer->draw(X - x(), Y - y(), X, Y, W, H, scale);
+  DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window());
+  float ui = dw ? dw->uiScale() : 1.0f;
+  int maxW = physX + phys_w();
+  int maxH = physY + phys_h();
+  if (dw)
+    dw->getPhysicalSize(&maxW, &maxH);
+
+  core::Rect physClip = logicalRectToPhysical(
+    core::Rect(cx, cy, cx + cw, cy + ch), ui, maxW, maxH);
+  if (physClip.is_empty())
+    return;
+
+  fl_push_no_clip();
+  draw(physClip.tl.x, physClip.tl.y,
+       physClip.width(), physClip.height());
+  fl_pop_clip();
 }
 
 
@@ -498,17 +608,25 @@ int Viewport::handle(int event)
     // Yes, we would like some pointer events please!
     return 1;
 
-  case FL_LEAVE:
+  case FL_LEAVE: {
+    DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window());
+    core::Point evPos = dw ? dw->getEventPhysicalPos()
+                           : core::Point(Fl::event_x(), Fl::event_y());
     window()->cursor(FL_CURSOR_DEFAULT);
     // We want a last move event to help trigger edge stuff
-    handlePointerEvent({Fl::event_x() - x(), Fl::event_y() - y()}, 0);
+    handlePointerEvent({evPos.x - physX, evPos.y - physY}, 0);
     return 1;
+  }
 
   case FL_PUSH:
   case FL_RELEASE:
   case FL_DRAG:
   case FL_MOVE:
-  case FL_MOUSEWHEEL:
+  case FL_MOUSEWHEEL: {
+    DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window());
+    core::Point evPos = dw ? dw->getEventPhysicalPos()
+                           : core::Point(Fl::event_x(), Fl::event_y());
+
     buttonMask = 0;
     if (Fl::event_button1())
       buttonMask |= 1 << 0;
@@ -517,13 +635,7 @@ int Viewport::handle(int event)
     if (Fl::event_button3())
       buttonMask |= 1 << 2;
 
-  // The back/forward buttons are not supported by FTLK 1.3 and require
-  // a patch which adds these buttons to the FLTK API. These buttons
-  // will be part of the upcoming 1.4 API:
-  //   * https://github.com/fltk/fltk/pull/1081
-  //
-  // A backport for branch-1.3 is available here:
-  //   * https://github.com/fltk/fltk/pull/1083
+    // FLTK 1.4+ provides native FL_BUTTON4 and FL_BUTTON5 support
 #if defined(FL_BUTTON4) && defined(FL_BUTTON5)
     if (Fl::event_button4())
       buttonMask |= 1 << 7;
@@ -544,12 +656,13 @@ int Viewport::handle(int event)
 
       // A quick press of the wheel "button", followed by a immediate
       // release below
-      handlePointerEvent({Fl::event_x() - x(), Fl::event_y() - y()},
+      handlePointerEvent({evPos.x - physX, evPos.y - physY},
                          buttonMask | wheelMask);
-    } 
+    }
 
-    handlePointerEvent({Fl::event_x() - x(), Fl::event_y() - y()}, buttonMask);
+    handlePointerEvent({evPos.x - physX, evPos.y - physY}, buttonMask);
     return 1;
+  }
 
   case FL_FOCUS:
     flushPendingClipboard();
@@ -1059,7 +1172,7 @@ void Viewport::popupContextMenu()
   case ID_RESIZE:
     if (window()->fullscreen_active())
       break;
-    window()->size(w(), h());
+    ((DesktopWindow*)window())->resizeWindowToSession();
     break;
   case ID_CTRL:
     if (m->value())

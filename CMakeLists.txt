@@ -318,9 +318,16 @@ if(BUILD_VIEWER)
     set(CMAKE_REQUIRED_INCLUDES ${FLTK_INCLUDE_DIR})
     set(CMAKE_REQUIRED_LIBRARIES ${FLTK_LIBRARIES})
 
-    check_cxx_source_compiles("#include <FL/Fl.H>\n#if FL_MAJOR_VERSION != 1 || FL_MINOR_VERSION != 3\n#error Wrong FLTK version\n#endif\nint main(int, char**) { return 0; }" OK_FLTK_VERSION)
+    check_cxx_source_compiles("#include <FL/Fl.H>\n#if FL_MAJOR_VERSION != 1 || FL_MINOR_VERSION != 4\n#error Wrong FLTK version\n#endif\nint main(int, char**) { return 0; }" OK_FLTK_VERSION)
     if(NOT OK_FLTK_VERSION)
       message(FATAL_ERROR "Incompatible version of FLTK")
+    endif()
+
+    if(UNIX AND NOT APPLE)
+      check_cxx_source_compiles("#include <FL/fl_config.h>\n#if !defined(FLTK_USE_X11) || !FLTK_USE_X11\n#error FLTK must be built with X11 support\n#endif\nint main(int, char**) { return 0; }" OK_FLTK_X11)
+      if(NOT OK_FLTK_X11)
+        message(FATAL_ERROR "FLTK must be built with X11 support")
+      endif()
     endif()
 
     set(CMAKE_REQUIRED_FLAGS)

@@ -83,7 +83,16 @@ public:
   void grabKeyboard();
   void ungrabKeyboard();
 
+  // Display / DPI helpers
+  int currentScreenNum() const;
+  float uiScale() const;
+  void getPhysicalSize(int* physW, int* physH) const;
+  void getWindowPhysicalRect(int* wx, int* wy, int* ww, int* wh) const;
+  core::Point getEventPhysicalPos() const;
+  void resizeWindowToSession();
+
 private:
+  core::Rect getScreenPhysicalRect(int idx) const;
   void addOverlayTip(const char *text, ...)
     __attribute__((__format__ (__printf__, 2, 3)));
   void addOverlayError(const char *text, ...)
@@ -150,6 +159,9 @@ private:
   bool mouseGrabbed;
 
   bool regrabOnFocus;
+
+  float lastUIScale;
+  int lastPhysW, lastPhysH;
 
   struct statsEntry {
     unsigned ups;

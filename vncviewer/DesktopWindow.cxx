@@ -22,9 +22,12 @@
 #endif
 
 #include <algorithm>
+#include <cmath>
 
 #include <assert.h>
+#include <math.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <time.h>
 #include <sys/time.h>
@@ -53,6 +56,7 @@
 #include <FL/Fl_Image_Surface.H>
 #include <FL/Fl_Scrollbar.H>
 #include <FL/fl_draw.H>
+#include <FL/platform.H>
 
 #if defined(WIN32)
 #include "win32.h"
@@ -85,17 +89,70 @@ static core::LogWriter vlog("DesktopWindow");
 static std::set<DesktopWindow *> instances;
 
 DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
-  : Fl_Window(w * (int)scaleFactor, h * (int)scaleFactor), cc(cc_), offscreen(nullptr),
+  : Fl_Window(100, 100), cc(cc_), offscreen(nullptr),
     firstUpdate(true),
     delayedFullscreen(false), sentDesktopSize(false),
     pendingRemoteResize(false), lastResize({0, 0}),
     keyboardGrabbed(false), mouseGrabbed(false), regrabOnFocus(false),
+    lastUIScale(1.0f), lastPhysW(0), lastPhysH(0),
     statsLastUpdates(0), statsLastPixels(0), statsLastPosition(0),
     statsGraph(nullptr)
 {
   Fl_Group* group;
-  int win_w = w * (int)scaleFactor;
-  int win_h = h * (int)scaleFactor;
+
+  // Support for -geometry option. Note that although we do support
+  // negative coordinates, we do not support -XOFF-YOFF (ie
+  // coordinates relative to the right edge / bottom edge) at this
+  // time.
+  int geom_x = 0, geom_y = 0;
+  int geom_w = 0, geom_h = 0;
+  bool hasGeomSize = false;
+  if (strcmp(geometry, "") != 0) {
+    int matched;
+    matched = sscanf((const char*)geometry, "+%d+%d", &geom_x, &geom_y);
+    if (matched == 2) {
+      force_position(1);
+    } else {
+      matched = sscanf((const char*)geometry, "%dx%d+%d+%d", &geom_w, &geom_h, &geom_x, &geom_y);
+      switch (matched) {
+      case 4:
+        force_position(1);
+        /* fall through */
+      case 2:
+        hasGeomSize = true;
+        break;
+      default:
+        geom_x = geom_y = 0;
+        vlog.error(_("Invalid geometry specified!"));
+      }
+    }
+  }
+
+  int targetScreen;
+  if (force_position()) {
+    targetScreen = Fl::screen_num(geom_x, geom_y);
+  } else {
+    int mx, my;
+
+    // If we don't explicitly request a position then we don't know which
+    // monitor the window manager might place us on. Assume the popular
+    // behaviour of following the cursor.
+
+    Fl::get_mouse(mx, my);
+    targetScreen = Fl::screen_num(mx, my);
+  }
+  screen_num(targetScreen);
+
+#ifdef __APPLE__
+  float initScale = cocoa_backing_scale(nullptr);
+#else
+  float initScale = Fl::screen_scale(targetScreen);
+#endif
+  if (initScale <= 0.0f)
+    initScale = 1.0f;
+
+  int win_w = hasGeomSize ? geom_w : physicalToLogicalSize(w * (int)scaleFactor, initScale);
+  int win_h = hasGeomSize ? geom_h : physicalToLogicalSize(h * (int)scaleFactor, initScale);
 
   // Dummy group to prevent FLTK from moving our widgets around
   group = new Fl_Group(0, 0, win_w, win_h);
@@ -127,49 +184,10 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
   // Hack. See below...
   fl_add_event_dispatch(fltkDispatch, this);
 
-  // Support for -geometry option. Note that although we do support
-  // negative coordinates, we do not support -XOFF-YOFF (ie
-  // coordinates relative to the right edge / bottom edge) at this
-  // time.
-  int geom_x = 0, geom_y = 0;
-  if (strcmp(geometry, "") != 0) {
-    int matched;
-    matched = sscanf((const char*)geometry, "+%d+%d", &geom_x, &geom_y);
-    if (matched == 2) {
-      force_position(1);
-    } else {
-      int geom_w, geom_h;
-      matched = sscanf((const char*)geometry, "%dx%d+%d+%d", &geom_w, &geom_h, &geom_x, &geom_y);
-      switch (matched) {
-      case 4:
-        force_position(1);
-        /* fall through */
-      case 2:
-        win_w = geom_w;
-        win_h = geom_h;
-        break;
-      default:
-        geom_x = geom_y = 0;
-        vlog.error(_("Invalid geometry specified!"));
-      }
-    }
-  }
-
   // Many window managers don't properly resize overly large windows,
   // so we'll have to do some sanity checks ourselves here
   int sx, sy, sw, sh;
-  if (force_position()) {
-    Fl::screen_work_area(sx, sy, sw, sh, geom_x, geom_y);
-  } else {
-    int mx, my;
-
-    // If we don't explicitly request a position then we don't know which
-    // monitor the window manager might place us on. Assume the popular
-    // behaviour of following the cursor.
-
-    Fl::get_mouse(mx, my);
-    Fl::screen_work_area(sx, sy, sw, sh, mx, my);
-  }
+  Fl::screen_work_area(sx, sy, sw, sh, targetScreen);
   if ((win_w > sw) || (win_h > sh)) {
     vlog.info(_("Reducing window size to fit on current monitor"));
     if (win_w > sw)
@@ -183,7 +201,7 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
   // window is showned. Other platforms handled further down...
   if (::maximize) {
     int dummy;
-    Fl::screen_work_area(dummy, dummy, win_w, win_h, geom_x, geom_y);
+    Fl::screen_work_area(dummy, dummy, win_w, win_h, targetScreen);
   }
 #endif
 
@@ -192,6 +210,8 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
   } else {
     size(win_w, win_h);
   }
+
+  viewport->syncLogicalGeometry(initScale);
 
   if (fullScreen) {
     // Hack: Window managers seem to be rather crappy at respecting
@@ -224,6 +244,9 @@ DesktopWindow::DesktopWindow(int w, int h, CConn* cc_)
     maximizeWindow();
   }
 #endif
+
+  lastUIScale = uiScale();
+  getPhysicalSize(&lastPhysW, &lastPhysH);
 
   // Adjust layout now that we're visible and know our final size
   repositionWidgets();
@@ -352,6 +375,127 @@ void DesktopWindow::updateWindow()
 }
 
 
+int DesktopWindow::currentScreenNum() const
+{
+  int count = Fl::screen_count();
+  DesktopWindow* self = const_cast<DesktopWindow*>(this);
+  int n = self->shown() ? self->screen_num()
+                        : Fl::screen_num(x(), y(), w(), h());
+  if ((count > 0) && ((n < 0) || (n >= count)))
+    return 0;
+  return n;
+}
+
+
+float DesktopWindow::uiScale() const
+{
+#ifdef __APPLE__
+  float s = cocoa_backing_scale(const_cast<DesktopWindow*>(this));
+#else
+  float s = Fl::screen_scale(currentScreenNum());
+#endif
+  return (s > 0.0f) ? s : 1.0f;
+}
+
+
+void DesktopWindow::getPhysicalSize(int* physW, int* physH) const
+{
+  assert(physW != nullptr);
+  assert(physH != nullptr);
+
+  DesktopWindow* self = const_cast<DesktopWindow*>(this);
+  if (self->shown()) {
+#if defined(WIN32)
+    win32_win_get_physical_size(self, physW, physH);
+#elif defined(__APPLE__)
+    cocoa_win_get_physical_size(self, physW, physH);
+#else
+    x11_win_get_physical_size(self, physW, physH);
+#endif
+    return;
+  }
+
+  float s = uiScale();
+  *physW = logicalToPhysical(w(), s);
+  *physH = logicalToPhysical(h(), s);
+}
+
+
+void DesktopWindow::getWindowPhysicalRect(int* wx, int* wy,
+                                          int* ww, int* wh) const
+{
+  assert(wx != nullptr);
+  assert(wy != nullptr);
+  assert(ww != nullptr);
+  assert(wh != nullptr);
+
+  DesktopWindow* self = const_cast<DesktopWindow*>(this);
+  if (self->shown()) {
+#if defined(WIN32)
+    win32_win_get_coords(self, wx, wy, ww, wh);
+#elif defined(__APPLE__)
+    float s = uiScale();
+    *wx = logicalToPhysical(x(), s);
+    *wy = logicalToPhysical(y(), s);
+    cocoa_win_get_physical_size(self, ww, wh);
+#else
+    x11_win_get_coords(self, wx, wy, ww, wh);
+#endif
+    return;
+  }
+
+  float s = uiScale();
+  *wx = logicalToPhysical(x(), s);
+  *wy = logicalToPhysical(y(), s);
+  *ww = logicalToPhysical(w(), s);
+  *wh = logicalToPhysical(h(), s);
+}
+
+
+core::Point DesktopWindow::getEventPhysicalPos() const
+{
+  int px = 0, py = 0;
+
+#if defined(WIN32)
+  if (win32_event_physical_pos(const_cast<DesktopWindow*>(this), &px, &py))
+    return core::Point(px, py);
+#elif defined(__APPLE__)
+  if (cocoa_event_physical_pos(const_cast<DesktopWindow*>(this), &px, &py))
+    return core::Point(px, py);
+#else
+  if (x11_event_physical_pos(const_cast<DesktopWindow*>(this), &px, &py))
+    return core::Point(px, py);
+#endif
+
+  float s = uiScale();
+  return core::Point(logicalToPhysical(Fl::event_x(), s),
+                     logicalToPhysical(Fl::event_y(), s));
+}
+
+
+core::Rect DesktopWindow::getScreenPhysicalRect(int idx) const
+{
+  int sx, sy, sw, sh;
+  Fl::screen_xywh(sx, sy, sw, sh, idx);
+#ifdef __APPLE__
+  float s = uiScale();
+#else
+  float s = Fl::screen_scale(idx);
+  if (s <= 0.0f)
+    s = 1.0f;
+#endif
+  return scaleScreenRectToPhysical(core::Rect(sx, sy, sx + sw, sy + sh), s);
+}
+
+
+void DesktopWindow::resizeWindowToSession()
+{
+  float s = uiScale();
+  size(physicalToLogicalSize(viewport->phys_w(), s),
+       physicalToLogicalSize(viewport->phys_h(), s));
+}
+
+
 void DesktopWindow::resizeFramebuffer(int new_w, int new_h)
 {
   int factor = viewport->getScaleFactor();
@@ -360,20 +504,26 @@ void DesktopWindow::resizeFramebuffer(int new_w, int new_h)
 
   if ((new_w == viewport->framebufferWidth()) &&
       (new_h == viewport->framebufferHeight()) &&
-      (scaled_w == viewport->w()) &&
-      (scaled_h == viewport->h()))
+      (scaled_w == viewport->phys_w()) &&
+      (scaled_h == viewport->phys_h()))
     return;
+
+  float ui = uiScale();
+  int physW, physH;
+  getPhysicalSize(&physW, &physH);
+  int tol = std::max(1, (int)ceilf(ui));
 
   // If we're letting the viewport match the window perfectly, then
   // keep things that way for the new size, otherwise just keep things
   // like they are.
   if (!fullscreen_active() && !isMaximized() && !pendingRemoteResize &&
       !Fl::has_timeout(handleResizeTimeout, this)) {
-    if ((w() == viewport->w()) && (h() == viewport->h())) {
+    if ((abs(physW - viewport->phys_w()) <= tol) &&
+        (abs(physH - viewport->phys_h()) <= tol)) {
       int sx, sy, sw, sh;
-      Fl::screen_work_area(sx, sy, sw, sh, Fl::screen_num(x(), y(), w(), h()));
-      int win_w = std::min(scaled_w, sw);
-      int win_h = std::min(scaled_h, sh);
+      Fl::screen_work_area(sx, sy, sw, sh, currentScreenNum());
+      int win_w = std::min(physicalToLogicalSize(scaled_w, ui), sw);
+      int win_h = std::min(physicalToLogicalSize(scaled_h, ui), sh);
       size(win_w, win_h);
     }
   }
@@ -408,16 +558,15 @@ void DesktopWindow::setCursorPos(const core::Point& pos)
   }
 
   core::Point localPos = scaleFromFramebuffer(pos, viewport->getScaleFactor());
+  int winX = localPos.x + viewport->phys_x();
+  int winY = localPos.y + viewport->phys_y();
 
 #if defined(WIN32)
-  SetCursorPos(localPos.x + x_root() + viewport->x(),
-               localPos.y + y_root() + viewport->y());
+  win32_win_warp_pointer(this, winX, winY);
 #elif defined(__APPLE__)
-  cocoa_set_cursor_pos(localPos.x + x_root() + viewport->x(),
-                       localPos.y + y_root() + viewport->y());
+  cocoa_win_warp_pointer(this, winX, winY);
 #else // Assume this is Xlib
-  x11_warp_pointer(localPos.x + x_root() + viewport->x(),
-                   localPos.y + y_root() + viewport->y());
+  x11_win_warp_pointer(this, winX, winY);
 #endif
 }
 
@@ -435,80 +584,106 @@ void DesktopWindow::show()
 
 void DesktopWindow::draw()
 {
-  bool redraw;
+  bool fullRedraw;
+  int physW, physH;
+  float ui;
 
-  int X, Y, W, H;
+  getPhysicalSize(&physW, &physH);
+  ui = uiScale();
 
   // X11 needs an off screen buffer for compositing to avoid flicker,
   // and alpha blending doesn't work for windows on Win32
 #if !defined(__APPLE__)
 
   // Adjust offscreen surface dimensions
-  if ((offscreen == nullptr) ||
-      (offscreen->width() != w()) || (offscreen->height() != h())) {
+  if ((physW > 0) && (physH > 0) &&
+      ((offscreen == nullptr) ||
+       (offscreen->width() != physW) || (offscreen->height() != physH))) {
     delete offscreen;
-    offscreen = new Surface(w(), h());
+    offscreen = new Surface(physW, physH);
   }
 
 #endif
 
-  // Active area inside scrollbars
-  W = w() - (vscroll->visible() ? vscroll->w() : 0);
-  H = h() - (hscroll->visible() ? hscroll->h() : 0);
+  // Active area inside scrollbars (logical and physical)
+  int activeLogW = w() - (vscroll->visible() ? vscroll->w() : 0);
+  int activeLogH = h() - (hscroll->visible() ? hscroll->h() : 0);
+  int activePhysW = vscroll->visible()
+    ? std::max(0, std::min(physW, (int)floorf((float)vscroll->x() * ui)))
+    : physW;
+  int activePhysH = hscroll->visible()
+    ? std::max(0, std::min(physH, (int)floorf((float)hscroll->y() * ui)))
+    : physH;
 
   // Full redraw?
-  redraw = (damage() & ~FL_DAMAGE_CHILD);
+  fullRedraw = (damage() & ~FL_DAMAGE_CHILD);
 
   // Simplify the clip region to a simple rectangle in order to
   // properly draw all the layers even if they only partially overlap
-  if (redraw)
-    X = Y = 0;
-  else
-    fl_clip_box(0, 0, W, H, X, Y, W, H);
-  fl_push_no_clip();
-  fl_push_clip(X, Y, W, H);
-
-  // Redraw background only on full redraws
-  if (redraw) {
-    if (offscreen)
-      offscreen->clear(40, 40, 40);
-    else
-      fl_rectf(0, 0, W, H, 40, 40, 40);
+  core::Rect physClip;
+  if (fullRedraw) {
+    physClip.setXYWH(0, 0, activePhysW, activePhysH);
+  } else {
+    int cx, cy, cw, ch;
+    fl_clip_box(0, 0, activeLogW, activeLogH, cx, cy, cw, ch);
+    physClip = logicalRectToPhysical(core::Rect(cx, cy, cx + cw, cy + ch),
+                                     ui, activePhysW, activePhysH);
   }
 
-  if (offscreen) {
-    viewport->draw(offscreen);
-    viewport->clear_damage();
-  } else {
-    if (redraw)
-      draw_child(*viewport);
-    else
-      update_child(*viewport);
+  // Redraw background only on full redraws
+  if (fullRedraw) {
+    if (offscreen)
+      offscreen->clear(40, 40, 40);
+    else {
+      fl_push_no_clip();
+      fl_push_clip(0, 0, activeLogW, activeLogH);
+      fl_rectf(0, 0, activeLogW, activeLogH, 40, 40, 40);
+      fl_pop_clip();
+      fl_pop_clip();
+    }
+  }
+
+  if (!physClip.is_empty()) {
+    if (offscreen) {
+      viewport->draw(offscreen, physClip.tl.x, physClip.tl.y,
+                     physClip.width(), physClip.height());
+      viewport->clear_damage();
+    } else {
+      fl_push_no_clip();
+      viewport->draw(physClip.tl.x, physClip.tl.y,
+                     physClip.width(), physClip.height());
+      viewport->clear_damage();
+      fl_pop_clip();
+    }
   }
 
   // Debug graph (if active)
-  if (statsGraph) {
-    int ox, oy, ow, oh;
+  if (statsGraph && !physClip.is_empty()) {
+    int margin = logicalToPhysical(30, ui);
+    int gx = physW - statsGraph->width() - margin;
+    int gy = physH - statsGraph->height() - margin;
+    core::Rect dstRect(gx, gy,
+                       gx + statsGraph->width(), gy + statsGraph->height());
+    core::Rect inter = dstRect.intersect(physClip);
 
-    ox = X = w() - statsGraph->width() - 30;
-    oy = Y = h() - statsGraph->height() - 30;
-    ow = statsGraph->width();
-    oh = statsGraph->height();
-
-    fl_clip_box(ox, oy, ow, oh, ox, oy, ow, oh);
-
-    if ((ow != 0) && (oh != 0)) {
+    if (!inter.is_empty()) {
       if (offscreen)
-        statsGraph->blend(offscreen, ox - X, oy - Y, ox, oy, ow, oh, 204);
-      else
-        statsGraph->blend(ox - X, oy - Y, ox, oy, ow, oh, 204);
+        statsGraph->blend(offscreen, inter.tl.x - gx, inter.tl.y - gy,
+                          inter.tl.x, inter.tl.y,
+                          inter.width(), inter.height(), 204);
+      else {
+        fl_push_no_clip();
+        statsGraph->blend(inter.tl.x - gx, inter.tl.y - gy,
+                          inter.tl.x, inter.tl.y,
+                          inter.width(), inter.height(), 204);
+        fl_pop_clip();
+      }
     }
   }
 
   // Overlay (if active)
-  if (!overlays.empty()) {
-    int ox, oy, ow, oh;
-    int sx, sy, sw, sh;
+  if (!overlays.empty() && !physClip.is_empty()) {
+    int sx, sy, sw;
     struct Overlay overlay;
 
     overlay = overlays.front();
@@ -518,17 +693,20 @@ void DesktopWindow::draw()
     if (fullscreen_active()) {
       assert(Fl::screen_count() >= 1);
 
-      core::Rect windowRect, screenRect;
-      windowRect.setXYWH(x(), y(), w(), h());
+      int wx, wy, ww, wh;
+      getWindowPhysicalRect(&wx, &wy, &ww, &wh);
+      int tol = std::max(1, (int)ceilf(ui));
+      core::Rect windowRect(wx - tol, wy - tol, wx + ww + tol, wy + wh + tol);
 
+      core::Rect chosen;
       bool foundEnclosedScreen = false;
       for (int idx = 0; idx < Fl::screen_count(); idx++) {
-        Fl::screen_xywh(sx, sy, sw, sh, idx);
+        core::Rect screenRect = getScreenPhysicalRect(idx);
 
         // The screen with the smallest index that are enclosed by
         // the viewport will be used for showing the overlay.
-        screenRect.setXYWH(sx, sy, sw, sh);
         if (screenRect.enclosed_by(windowRect)) {
+          chosen = screenRect;
           foundEnclosedScreen = true;
           break;
         }
@@ -537,47 +715,53 @@ void DesktopWindow::draw()
       // If no monitor inside the viewport was found,
       // use the one primary instead.
       if (!foundEnclosedScreen)
-        Fl::screen_xywh(sx, sy, sw, sh, 0);
+        chosen = getScreenPhysicalRect(0);
 
       // Adjust the coordinates so they are relative to the viewport.
-      sx -= x();
-      sy -= y();
+      sx = chosen.tl.x - wx;
+      sy = chosen.tl.y - wy;
+      sw = chosen.width();
 
     } else {
       sx = 0;
       sy = 0;
-      sw = w();
+      sw = physW;
     }
 
-    ox = X = sx + (sw - overlay.surface->width()) / 2;
-    oy = Y = sy + 50;
-    ow = overlay.surface->width();
-    oh = overlay.surface->height();
+    int ox = sx + (sw - overlay.surface->width()) / 2;
+    int oy = sy + logicalToPhysical(50, ui);
+    core::Rect dstRect(ox, oy,
+                       ox + overlay.surface->width(),
+                       oy + overlay.surface->height());
+    core::Rect inter = dstRect.intersect(physClip);
 
-    fl_clip_box(ox, oy, ow, oh, ox, oy, ow, oh);
-
-    if ((ow != 0) && (oh != 0)) {
+    if (!inter.is_empty()) {
       if (offscreen)
-        overlay.surface->blend(offscreen, ox - X, oy - Y,
-                               ox, oy, ow, oh, overlay.alpha);
-      else
-        overlay.surface->blend(ox - X, oy - Y,
-                               ox, oy, ow, oh, overlay.alpha);
+        overlay.surface->blend(offscreen, inter.tl.x - ox, inter.tl.y - oy,
+                               inter.tl.x, inter.tl.y,
+                               inter.width(), inter.height(), overlay.alpha);
+      else {
+        fl_push_no_clip();
+        overlay.surface->blend(inter.tl.x - ox, inter.tl.y - oy,
+                               inter.tl.x, inter.tl.y,
+                               inter.width(), inter.height(), overlay.alpha);
+        fl_pop_clip();
+      }
     }
   }
 
   // Flush offscreen surface to screen
-  if (offscreen) {
-    fl_clip_box(0, 0, w(), h(), X, Y, W, H);
-    offscreen->draw(X, Y, X, Y, W, H);
+  if (offscreen && !physClip.is_empty()) {
+    fl_push_no_clip();
+    offscreen->draw(physClip.tl.x, physClip.tl.y,
+                    physClip.tl.x, physClip.tl.y,
+                    physClip.width(), physClip.height());
+    fl_pop_clip();
   }
-
-  fl_pop_clip();
-  fl_pop_clip();
 
   // Finally the scrollbars
 
-  if (redraw) {
+  if (fullRedraw) {
     draw_child(*hscroll);
     draw_child(*vscroll);
   } else {
@@ -611,12 +795,12 @@ void DesktopWindow::handleClipboardData(const char* data)
 
 void DesktopWindow::resize(int x, int y, int w, int h)
 {
-  bool moving, resizing;
+  bool moving, resizing, rescale;
 
 #if ! (defined(WIN32) || defined(__APPLE__))
   // X11 window managers will treat a resize to cover the entire
   // monitor as a request to go full screen. Make sure we avoid this.
-  if (!fullscreen_active()) {
+  if (!fullscreen_active() && !Fl_Window::is_a_rescale()) {
     bool resize_req;
 
     // If there is no X11 window, then this must be a resize request,
@@ -627,11 +811,16 @@ void DesktopWindow::resize(int x, int y, int w, int h)
       // Otherwise we need to get the real window coordinates to tell
       // the difference
       int wx, wy, ww, wh;
+      float ui = uiScale();
+      int tol = std::max(1, (int)ceilf(ui));
 
       x11_win_get_coords(this, &wx, &wy, &ww, &wh);
 
       // Actual resize request?
-      if ((wx != x) || (wy != y) || (ww != w) || (wh != h))
+      if ((abs(wx - logicalToPhysical(x, ui)) > tol) ||
+          (abs(wy - logicalToPhysical(y, ui)) > tol) ||
+          (abs(ww - logicalToPhysical(w, ui)) > tol) ||
+          (abs(wh - logicalToPhysical(h, ui)) > tol))
         resize_req = true;
       else
         resize_req = false;
@@ -664,18 +853,36 @@ void DesktopWindow::resize(int x, int y, int w, int h)
     moving = true;
   if ((this->w() != w) || (this->h() != h))
     resizing = true;
+  rescale = Fl_Window::is_a_rescale();
 
   Fl_Window::resize(x, y, w, h);
 
-  if (moving) {
+  float curScale = uiScale();
+  int physW, physH;
+  getPhysicalSize(&physW, &physH);
+
+  bool scaleChanged = (fabsf(curScale - lastUIScale) > 0.001f);
+  bool physChanged = (physW != lastPhysW) || (physH != lastPhysH);
+
+  lastUIScale = curScale;
+  lastPhysW = physW;
+  lastPhysH = physH;
+
+  if (moving)
     // We might be overlapping a different set of monitors now, even if
     // our size is the same
     remoteResize();
-  }
-  if (resizing) {
-    remoteResize();
+
+  if (resizing || rescale || scaleChanged || physChanged) {
+    if (!moving)
+      remoteResize();
 
     repositionWidgets();
+  }
+
+  if (rescale || scaleChanged) {
+    viewport->setCursor();
+    redraw();
   }
 }
 
@@ -741,22 +948,20 @@ void DesktopWindow::addOverlay(const char *text)
 
   struct Overlay overlay;
 
-#if !defined(WIN32) && !defined(__APPLE__)
-  // FLTK < 1.3.5 crashes if fl_gc is unset
-  if (!fl_gc)
-    fl_gc = XDefaultGC(fl_display, 0);
-#endif
+  if (shown())
+    make_current();
 
   fl_font(FL_HELVETICA, fontsize);
   w = 0;
+  h = 0;
   fl_measure(text, w, h);
 
   // Margins
   w += margin * 2 * 2;
   h += margin * 2;
 
-  surface = new Fl_Image_Surface(w, h);
-  surface->set_current();
+  surface = new Fl_Image_Surface(w, h, 1);
+  Fl_Surface_Device::push_current(surface);
 
   fl_rectf(0, 0, w, h, 0, 0, 0);
 
@@ -765,15 +970,17 @@ void DesktopWindow::addOverlay(const char *text)
   fl_draw(text, 0, 0, w, h, FL_ALIGN_CENTER);
 
   imageText = surface->image();
+  Fl_Surface_Device::pop_current();
   delete surface;
 
-  Fl_Display_Device::display_device()->set_current();
+  int iw = imageText->data_w();
+  int ih = imageText->data_h();
 
-  buffer = new unsigned char[w * h * 4];
-  image = new Fl_RGB_Image(buffer, w, h, 4);
+  buffer = new unsigned char[iw * ih * 4];
+  image = new Fl_RGB_Image(buffer, iw, ih, 4);
 
   a = buffer;
-  for (x = 0;x < image->w() * image->h();x++) {
+  for (x = 0;x < image->data_w() * image->data_h();x++) {
     a[0] = a[1] = a[2] = 0x40;
     a[3] = 0xcc;
     a += 4;
@@ -781,8 +988,8 @@ void DesktopWindow::addOverlay(const char *text)
 
   a = buffer;
   b = (const unsigned char*)imageText->data()[0];
-  for (y = 0;y < h;y++) {
-    for (x = 0;x < w;x++) {
+  for (y = 0;y < ih;y++) {
+    for (x = 0;x < iw;x++) {
       unsigned char alpha;
       alpha = *b;
       a[0] = (unsigned)a[0] * (255 - alpha) / 255 + alpha;
@@ -793,7 +1000,7 @@ void DesktopWindow::addOverlay(const char *text)
       b += imageText->d();
     }
     if (imageText->ld() != 0)
-      b += imageText->ld() - w * imageText->d();
+      b += imageText->ld() - iw * imageText->d();
   }
 
   delete imageText;
@@ -904,11 +1111,15 @@ int DesktopWindow::handle(int event)
       /* fall through */
   case FL_LEAVE:
   case FL_DRAG:
-  case FL_MOVE:
+  case FL_MOVE: {
+    int physW, physH;
+    getPhysicalSize(&physW, &physH);
+    core::Point evPos = getEventPhysicalPos();
+
     if (mouseGrabbed) {
       // We don't get FL_LEAVE with a grabbed pointer, so check manually
-      if ((Fl::event_x() < 0) || (Fl::event_x() >= w()) ||
-          (Fl::event_y() < 0) || (Fl::event_y() >= h())) {
+      if ((evPos.x < 0) || (evPos.x >= physW) ||
+          (evPos.y < 0) || (evPos.y >= physH)) {
         ungrabPointer();
       }
 #if !defined(WIN32) && !defined(__APPLE__)
@@ -919,19 +1130,20 @@ int DesktopWindow::handle(int event)
     }
     if (fullscreen_active()) {
       // calculate width of "edge" regions
-      edge_scroll_size_x = w() / EDGE_SCROLL_SIZE;
-      edge_scroll_size_y = h() / EDGE_SCROLL_SIZE;
+      edge_scroll_size_x = physW / EDGE_SCROLL_SIZE;
+      edge_scroll_size_y = physH / EDGE_SCROLL_SIZE;
       // if cursor is near the edge of the window, scroll
-      if (((viewport->x() < 0) && (Fl::event_x() < edge_scroll_size_x)) ||
-          ((viewport->x() + viewport->w() >= w()) && (Fl::event_x() >= w() - edge_scroll_size_x)) ||
-          ((viewport->y() < 0) && (Fl::event_y() < edge_scroll_size_y)) ||
-          ((viewport->y() + viewport->h() >= h()) && (Fl::event_y() >= h() - edge_scroll_size_y))) {
+      if (((viewport->phys_x() < 0) && (evPos.x < edge_scroll_size_x)) ||
+          ((viewport->phys_x() + viewport->phys_w() >= physW) && (evPos.x >= physW - edge_scroll_size_x)) ||
+          ((viewport->phys_y() < 0) && (evPos.y < edge_scroll_size_y)) ||
+          ((viewport->phys_y() + viewport->phys_h() >= physH) && (evPos.y >= physH - edge_scroll_size_y))) {
         if (!Fl::has_timeout(handleEdgeScroll, this))
           Fl::add_timeout(EDGE_SCROLL_SECONDS_PER_FRAME, handleEdgeScroll, this);
       }
     }
     // Continue processing so that the viewport also gets mouse events
     break;
+  }
   }
 
   return Fl_Window::handle(event);
@@ -1023,11 +1235,9 @@ void DesktopWindow::fullscreen_on()
 #endif
 
   if (not selectedMonitors and not allMonitors) {
-    top = bottom = left = right = Fl::screen_num(x(), y(), w(), h());
+    top = bottom = left = right = currentScreenNum();
   } else {
     int top_y, bottom_y, left_x, right_x;
-
-    int sx, sy, sw, sh;
 
     std::set<int> monitors;
 
@@ -1042,7 +1252,7 @@ void DesktopWindow::fullscreen_on()
     // If no monitors were found in the selected monitors case, we want
     // to explicitly use the window's current monitor.
     if (monitors.size() == 0) {
-      monitors.insert(Fl::screen_num(x(), y(), w(), h()));
+      monitors.insert(currentScreenNum());
     }
 
     // If there are monitors selected, calculate the dimensions
@@ -1050,36 +1260,36 @@ void DesktopWindow::fullscreen_on()
     // limits it.
     std::set<int>::iterator it = monitors.begin();
 
-    // Get first monitor dimensions.
-    Fl::screen_xywh(sx, sy, sw, sh, *it);
+    // Get first monitor dimensions (in physical pixels for mixed-DPI setups).
+    core::Rect firstRect = getScreenPhysicalRect(*it);
     top = bottom = left = right = *it;
-    top_y = sy;
-    bottom_y = sy + sh;
-    left_x = sx;
-    right_x = sx + sw;
+    top_y = firstRect.tl.y;
+    bottom_y = firstRect.br.y;
+    left_x = firstRect.tl.x;
+    right_x = firstRect.br.x;
 
     // Keep going through the rest of the monitors.
     for (; it != monitors.end(); it++) {
-      Fl::screen_xywh(sx, sy, sw, sh, *it);
+      core::Rect r = getScreenPhysicalRect(*it);
 
-      if (sy < top_y) {
+      if (r.tl.y < top_y) {
         top = *it;
-        top_y = sy;
+        top_y = r.tl.y;
       }
 
-      if ((sy + sh) > bottom_y) {
+      if (r.br.y > bottom_y) {
         bottom = *it;
-        bottom_y = sy + sh;
+        bottom_y = r.br.y;
       }
 
-      if (sx < left_x) {
+      if (r.tl.x < left_x) {
         left = *it;
-        left_x = sx;
+        left_x = r.tl.x;
       }
 
-      if ((sx + sw) > right_x) {
+      if (r.br.x > right_x) {
         right = *it;
-        right_x = sx + sw;
+        right_x = r.br.x;
       }
     }
 
@@ -1318,8 +1528,11 @@ void DesktopWindow::remoteResize()
     return;
   }
 
+  int physW, physH;
+  getPhysicalSize(&physW, &physH);
+
   int factor = viewport->getScaleFactor();
-  core::Point remoteSize = computeRemoteDesktopSize(w(), h(), factor);
+  core::Point remoteSize = computeRemoteDesktopSize(physW, physH, factor);
   width = remoteSize.x;
   height = remoteSize.y;
 
@@ -1333,7 +1546,7 @@ void DesktopWindow::remoteResize()
       vlog.error(_("Invalid desktop size: %s"), (const char*)desktopSize);
   }
 
-  if (!fullscreen_active() || (width * factor > w()) || (height * factor > h())) {
+  if (!fullscreen_active() || (width * factor > physW) || (height * factor > physH)) {
     // In windowed mode (or the framebuffer is so large that we need
     // to scroll) we just report a single virtual screen that covers
     // the entire framebuffer.
@@ -1366,16 +1579,18 @@ void DesktopWindow::remoteResize()
     layout.begin()->dimensions.br.y = height;
   } else {
     uint32_t id;
-    int sx, sy, sw, sh;
+    int wx, wy, ww, wh;
     core::Rect ref_rect, screen_rect;
 
     // In full screen we report all screens that are fully covered.
 
+    getWindowPhysicalRect(&wx, &wy, &ww, &wh);
+
     if (!explicitDesktopSize) {
-      ref_rect.setXYWH(x(), y(), w(), h());
+      ref_rect.setXYWH(wx, wy, ww, wh);
     } else {
-      ref_rect.setXYWH(x() + (w() - width * factor) / 2,
-                       y() + (h() - height * factor) / 2,
+      ref_rect.setXYWH(wx + (ww - width * factor) / 2,
+                       wy + (wh - height * factor) / 2,
                        width * factor, height * factor);
     }
 
@@ -1386,13 +1601,23 @@ void DesktopWindow::remoteResize()
     //        a resized one.
     //
     for (int idx = 0;idx < Fl::screen_count();idx++) {
-      Fl::screen_xywh(sx, sy, sw, sh, idx);
+      screen_rect = getScreenPhysicalRect(idx);
+#ifdef __APPLE__
+      float scrScale = uiScale();
+#else
+      float scrScale = Fl::screen_scale(idx);
+      if (scrScale <= 0.0f)
+        scrScale = 1.0f;
+#endif
+      int tol = std::max(1, (int)ceilf(scrScale));
+      core::Rect expandedRef(ref_rect.tl.x - tol, ref_rect.tl.y - tol,
+                             ref_rect.br.x + tol, ref_rect.br.y + tol);
 
       // Check that the screen is fully inside the framebuffer
-      screen_rect.setXYWH(sx, sy, sw, sh);
-      if (!screen_rect.enclosed_by(ref_rect))
+      if (!screen_rect.enclosed_by(expandedRef))
         continue;
 
+      screen_rect = screen_rect.intersect(ref_rect);
       core::Rect r = scaleScreenRectToRemote(screen_rect, ref_rect,
                                              width, height, factor);
       if (r.is_empty())
@@ -1500,38 +1725,45 @@ void DesktopWindow::remoteResize()
 
 void DesktopWindow::repositionWidgets()
 {
+  int physW, physH;
+  float ui;
   int new_x, new_y;
+
+  getPhysicalSize(&physW, &physH);
+  ui = uiScale();
 
   // Viewport position
 
-  new_x = viewport->x();
-  new_y = viewport->y();
+  new_x = viewport->phys_x();
+  new_y = viewport->phys_y();
 
-  if (w() > viewport->w())
-    new_x = (w() - viewport->w()) / 2;
+  if (physW > viewport->phys_w())
+    new_x = (physW - viewport->phys_w()) / 2;
   else {
-    if (viewport->x() > 0)
+    if (viewport->phys_x() > 0)
       new_x = 0;
-    else if (w() > (viewport->x() + viewport->w()))
-      new_x = w() - viewport->w();
+    else if (physW > (viewport->phys_x() + viewport->phys_w()))
+      new_x = physW - viewport->phys_w();
   }
 
   // Same thing for y axis
-  if (h() > viewport->h())
-    new_y = (h() - viewport->h()) / 2;
+  if (physH > viewport->phys_h())
+    new_y = (physH - viewport->phys_h()) / 2;
   else {
-    if (viewport->y() > 0)
+    if (viewport->phys_y() > 0)
       new_y = 0;
-    else if (h() > (viewport->y() + viewport->h()))
-      new_y = h() - viewport->h();
+    else if (physH > (viewport->phys_y() + viewport->phys_h()))
+      new_y = physH - viewport->phys_h();
   }
 
-  if ((new_x != viewport->x()) || (new_y != viewport->y())) {
-    viewport->position(new_x, new_y);
+  if ((new_x != viewport->phys_x()) || (new_y != viewport->phys_y())) {
+    viewport->setPhysicalPosition(new_x, new_y, ui);
     damage(FL_DAMAGE_SCROLL);
+  } else {
+    viewport->syncLogicalGeometry(ui);
   }
 
-  // Scrollbars visbility
+  // Scrollbars visibility
 
   if (fullscreen_active()) {
     hscroll->hide();
@@ -1552,18 +1784,20 @@ void DesktopWindow::repositionWidgets()
     // then neither does; so we don't need to recurse on the "maybe"
     // cases.
 
-    if (w() - (h() < viewport->h() ? Fl::scrollbar_size() : 0) < viewport->w())
+    int sbPhys = logicalToPhysical(Fl::scrollbar_size(), ui);
+
+    if (physW - (physH < viewport->phys_h() ? sbPhys : 0) < viewport->phys_w())
       hscroll->show();
     else
       hscroll->hide();
 
-    if (h() - (w() < viewport->w() ? Fl::scrollbar_size() : 0) < viewport->h())
+    if (physH - (physW < viewport->phys_w() ? sbPhys : 0) < viewport->phys_h())
       vscroll->show();
     else
       vscroll->hide();
   }
 
-  // Scrollbars positions
+  // Scrollbars positions (logical FLTK units)
 
   hscroll->resize(0, h() - Fl::scrollbar_size(),
                   w() - (vscroll->visible() ? Fl::scrollbar_size() : 0),
@@ -1572,14 +1806,17 @@ void DesktopWindow::repositionWidgets()
                   Fl::scrollbar_size(),
                   h() - (hscroll->visible() ? Fl::scrollbar_size() : 0));
 
-  // Scrollbars range
+  // Scrollbars range (physical pixels)
 
-  hscroll->value(-viewport->x(),
-                 w() - (vscroll->visible() ? vscroll->w() : 0),
-                 0, viewport->w());
-  vscroll->value(-viewport->y(),
-                 h() - (hscroll->visible() ? hscroll->h() : 0),
-                 0, viewport->h());
+  int activePhysW = vscroll->visible()
+    ? std::max(0, std::min(physW, (int)floorf((float)vscroll->x() * ui)))
+    : physW;
+  int activePhysH = hscroll->visible()
+    ? std::max(0, std::min(physH, (int)floorf((float)hscroll->y() * ui)))
+    : physH;
+
+  hscroll->value(-viewport->phys_x(), activePhysW, 0, viewport->phys_w());
+  vscroll->value(-viewport->phys_y(), activePhysH, 0, viewport->phys_h());
   hscroll->value(hscroll->clamp(hscroll->value()));
   vscroll->value(vscroll->clamp(vscroll->value()));
 }
@@ -1596,8 +1833,12 @@ void DesktopWindow::handleOptions(void *data)
   int newScale = scaleFactor;
   bool scaleChanged = (newScale != self->viewport->getScaleFactor());
   bool wasFullscreen = self->fullscreen_active();
-  bool matchedViewport = (self->w() == self->viewport->w()) &&
-                         (self->h() == self->viewport->h());
+  float ui = self->uiScale();
+  int physW, physH;
+  self->getPhysicalSize(&physW, &physH);
+  int tol = std::max(1, (int)ceilf(ui));
+  bool matchedViewport = (abs(physW - self->viewport->phys_w()) <= tol) &&
+                         (abs(physH - self->viewport->phys_h()) <= tol);
 
   if (scaleChanged)
     self->viewport->setScaleFactor(newScale);
@@ -1613,11 +1854,10 @@ void DesktopWindow::handleOptions(void *data)
     if (!fullScreen && !wasFullscreen && !self->isMaximized() &&
         matchedViewport) {
       int sx, sy, sw, sh;
-      Fl::screen_work_area(sx, sy, sw, sh,
-                           Fl::screen_num(self->x(), self->y(),
-                                          self->w(), self->h()));
-      int win_w = std::min(self->viewport->w(), sw);
-      int win_h = std::min(self->viewport->h(), sh);
+      Fl::screen_work_area(sx, sy, sw, sh, self->currentScreenNum());
+      float curUi = self->uiScale();
+      int win_w = std::min(physicalToLogicalSize(self->viewport->phys_w(), curUi), sw);
+      int win_h = std::min(physicalToLogicalSize(self->viewport->phys_h(), curUi), sh);
       self->size(win_w, win_h);
     }
 
@@ -1641,23 +1881,23 @@ void DesktopWindow::handleFullscreenTimeout(void *data)
   self->remoteResize();
 }
 
-void DesktopWindow::scrollTo(int x, int y)
+void DesktopWindow::scrollTo(int sx, int sy)
 {
-  x = hscroll->clamp(x);
-  y = vscroll->clamp(y);
+  sx = hscroll->clamp(sx);
+  sy = vscroll->clamp(sy);
 
-  hscroll->value(x);
-  vscroll->value(y);
+  hscroll->value(sx);
+  vscroll->value(sy);
 
   // Scrollbar position results in inverse movement of
   // the viewport widget
-  x = -x;
-  y = -y;
+  sx = -sx;
+  sy = -sy;
 
-  if ((viewport->x() == x) && (viewport->y() == y))
+  if ((viewport->phys_x() == sx) && (viewport->phys_y() == sy))
     return;
 
-  viewport->position(x, y);
+  viewport->setPhysicalPosition(sx, sy, uiScale());
   damage(FL_DAMAGE_SCROLL);
 }
 
@@ -1672,43 +1912,48 @@ void DesktopWindow::handleEdgeScroll(void *data)
 {
   DesktopWindow *self = (DesktopWindow *)data;
 
+  int physW, physH;
   int mx, my;
   int dx, dy;
+  int speed;
 
   assert(self);
 
   if (!self->fullscreen_active())
     return;
 
-  mx = Fl::event_x();
-  my = Fl::event_y();
+  self->getPhysicalSize(&physW, &physH);
+  core::Point evPos = self->getEventPhysicalPos();
+  mx = evPos.x;
+  my = evPos.y;
+  speed = std::max(1, logicalToPhysical(EDGE_SCROLL_SPEED, self->uiScale()));
 
   dx = dy = 0;
 
   // Clamp mouse position in case it is outside the window
   if (mx < 0)
     mx = 0;
-  if (mx > self->w())
-    mx = self->w();
+  if (mx > physW)
+    mx = physW;
   if (my < 0)
     my = 0;
-  if (my > self->h())
-    my = self->h();
+  if (my > physH)
+    my = physH;
 
-  if ((self->viewport->x() < 0) && (mx < edge_scroll_size_x))
-    dx = EDGE_SCROLL_SPEED -
-         EDGE_SCROLL_SPEED * mx / edge_scroll_size_x;
-  if ((self->viewport->x() + self->viewport->w() >= self->w()) &&
-      (mx >= self->w() - edge_scroll_size_x))
-    dx = EDGE_SCROLL_SPEED * (self->w() - mx) / edge_scroll_size_x -
-         EDGE_SCROLL_SPEED - 1;
-  if ((self->viewport->y() < 0) && (my < edge_scroll_size_y))
-    dy = EDGE_SCROLL_SPEED -
-         EDGE_SCROLL_SPEED * my / edge_scroll_size_y;
-  if ((self->viewport->y() + self->viewport->h() >= self->h()) &&
-      (my >= self->h() - edge_scroll_size_y))
-    dy = EDGE_SCROLL_SPEED * (self->h() - my) / edge_scroll_size_y -
-         EDGE_SCROLL_SPEED - 1;
+  if ((edge_scroll_size_x > 0) &&
+      (self->viewport->phys_x() < 0) && (mx < edge_scroll_size_x))
+    dx = speed - speed * mx / edge_scroll_size_x;
+  if ((edge_scroll_size_x > 0) &&
+      (self->viewport->phys_x() + self->viewport->phys_w() >= physW) &&
+      (mx >= physW - edge_scroll_size_x))
+    dx = speed * (physW - mx) / edge_scroll_size_x - speed - 1;
+  if ((edge_scroll_size_y > 0) &&
+      (self->viewport->phys_y() < 0) && (my < edge_scroll_size_y))
+    dy = speed - speed * my / edge_scroll_size_y;
+  if ((edge_scroll_size_y > 0) &&
+      (self->viewport->phys_y() + self->viewport->phys_h() >= physH) &&
+      (my >= physH - edge_scroll_size_y))
+    dy = speed * (physH - my) / edge_scroll_size_y - speed - 1;
 
   if ((dx == 0) && (dy == 0))
     return;
@@ -1758,14 +2003,11 @@ void DesktopWindow::handleStatsTimeout(void *data)
   self->statsLastPixels = pixels;
   self->statsLastPosition = pos;
 
-#if !defined(WIN32) && !defined(__APPLE__)
-  // FLTK < 1.3.5 crashes if fl_gc is unset
-  if (!fl_gc)
-    fl_gc = XDefaultGC(fl_display, 0);
-#endif
+  if (self->shown())
+    self->make_current();
 
-  surface = new Fl_Image_Surface(statsWidth, statsHeight);
-  surface->set_current();
+  surface = new Fl_Image_Surface(statsWidth, statsHeight, 1);
+  Fl_Surface_Device::push_current(surface);
 
   fl_rectf(0, 0, statsWidth, statsHeight, FL_BLACK);
 
@@ -1826,17 +2068,16 @@ void DesktopWindow::handleStatsTimeout(void *data)
           5 + (statsWidth-10)*2/3, statsHeight - 5);
 
   image = surface->image();
+  Fl_Surface_Device::pop_current();
   delete surface;
-
-  Fl_Display_Device::display_device()->set_current();
 
   delete self->statsGraph;
   self->statsGraph = new Surface(image);
   delete image;
 
-  self->damage(FL_DAMAGE_CHILD, self->w() - statsWidth - 30,
-               self->h() - statsHeight - 30,
-               statsWidth, statsHeight);
+  self->damage(FL_DAMAGE_CHILD, self->w() - statsWidth - 32,
+               self->h() - statsHeight - 32,
+               statsWidth + 4, statsHeight + 4);
 
   Fl::repeat_timeout(0.5, handleStatsTimeout, data);
 }

@@ -37,7 +37,7 @@
 #include <FL/Fl.H>
 #include <FL/fl_draw.H>
 #include <FL/Fl_Button.H>
-#include <FL/x.H>
+#include <FL/platform.H>
 
 #if defined(HAVE_XRANDR) && !defined(__APPLE__)
 #include <X11/extensions/Xrandr.h>
@@ -53,7 +53,22 @@
 #include <IOKit/hidsystem/IOHIDParameter.h>
 #endif
 
+#include "../Scale.h"
 #include "Fl_Monitor_Arrangement.h"
+
+static void get_screen_physical_xywh(int m, int& x, int& y, int& w, int& h)
+{
+  int lx, ly, lw, lh;
+  Fl::screen_xywh(lx, ly, lw, lh, m);
+  float s = Fl::screen_scale(m);
+  if (s <= 0.0f)
+    s = 1.0f;
+  core::Rect pr = scaleScreenRectToPhysical(core::Rect(lx, ly, lx + lw, ly + lh), s);
+  x = pr.tl.x;
+  y = pr.tl.y;
+  w = pr.width();
+  h = pr.height();
+}
 
 static std::set<Fl_Monitor_Arrangement *> instances;
 static const Fl_Boxtype FL_CHECKERED_BOX = FL_FREE_BOXTYPE;
@@ -144,14 +159,14 @@ void Fl_Monitor_Arrangement::layout()
   for (int i = 0; i < Fl::screen_count(); i++) {
     bool match;
 
-    Fl::screen_xywh(x, y, w, h, i);
+    get_screen_physical_xywh(i, x, y, w, h);
 
     // Only keep a single entry for mirrored screens
     match = false;
     for (int j = 0; j < i; j++) {
         int x2, y2, w2, h2;
 
-        Fl::screen_xywh(x2, y2, w2, h2, j);
+        get_screen_physical_xywh(j, x2, y2, w2, h2);
 
         if ((x != x2) || (y != y2) || (w != w2) || (h != h2))
             continue;
@@ -220,7 +235,7 @@ bool Fl_Monitor_Arrangement::is_required(int m)
 
   // Base the rest of the calculations on the dimensions
   // obtained for the first monitor.
-  Fl::screen_xywh(x, y, w, h, *it);
+  get_screen_physical_xywh(*it, x, y, w, h);
   top_y = y;
   bottom_y = y + h;
   left_x = x;
@@ -229,7 +244,7 @@ bool Fl_Monitor_Arrangement::is_required(int m)
   // Go through the rest of the monitors,
   // exhausting the rest of the iterator.
   for (; it != selected.end(); it++) {
-    Fl::screen_xywh(x, y, w, h, *it);
+    get_screen_physical_xywh(*it, x, y, w, h);
 
     if (y < top_y) {
       top_y = y;
@@ -249,7 +264,7 @@ bool Fl_Monitor_Arrangement::is_required(int m)
   }
 
 
-  Fl::screen_xywh(x, y, w, h, m);
+  get_screen_physical_xywh(m, x, y, w, h);
 
   if (x < left_x)
     return false;
@@ -287,7 +302,7 @@ std::pair<int, int> Fl_Monitor_Arrangement::size()
   x_min = x_max = y_min = y_max = 0;
 
   for (int i = 0; i < Fl::screen_count(); i++) {
-    Fl::screen_xywh(x, y, w, h, i);
+    get_screen_physical_xywh(i, x, y, w, h);
 
     top = y;
     bottom = y + h;
@@ -328,7 +343,7 @@ std::pair<int, int> Fl_Monitor_Arrangement::origin()
   ox = oy = 0;
 
   for (int i = 0; i < Fl::screen_count(); i++) {
-    Fl::screen_xywh(x, y, w, h, i);
+    get_screen_physical_xywh(i, x, y, w, h);
 
     if (x < ox)
       ox = x;
@@ -349,7 +364,7 @@ std::string Fl_Monitor_Arrangement::description(int m)
   assert(m < Fl::screen_count());
 
   name = get_monitor_name(m);
-  Fl::screen_xywh(x, y, w, h, m);
+  get_screen_physical_xywh(m, x, y, w, h);
 
   if (!name.empty())
     ss << name << " (" << w << "x" << h << ")";
@@ -378,6 +393,10 @@ std::string Fl_Monitor_Arrangement::get_monitor_name(int m)
   int x, y, w, h;
 
   Fl::screen_xywh(x, y, w, h, m);
+  float s = Fl::screen_scale(m);
+  if (s <= 0.0f)
+    s = 1.0f;
+  core::Rect logicalRect(x, y, x + w, y + h);
 
   EnumDisplayMonitors(nullptr, nullptr, EnumDisplayMonitorsCallback,
                       (LPARAM)&sys_monitors);
@@ -390,13 +409,9 @@ std::string Fl_Monitor_Arrangement::get_monitor_name(int m)
     info.cbSize = sizeof(info);
     GetMonitorInfo(*iter, (LPMONITORINFO)&info);
 
-    if (info.rcMonitor.left != x)
-      continue;
-    if (info.rcMonitor.top != y)
-      continue;
-    if ((info.rcMonitor.right - info.rcMonitor.left) != w)
-      continue;
-    if ((info.rcMonitor.bottom - info.rcMonitor.top) != h)
+    core::Rect osRect(info.rcMonitor.left, info.rcMonitor.top,
+                      info.rcMonitor.right, info.rcMonitor.bottom);
+    if (!screenRectMatchesPhysical(logicalRect, s, osRect))
       continue;
 
     for (int i = 0; ; i++) {
@@ -498,6 +513,10 @@ std::string Fl_Monitor_Arrangement::get_monitor_name(int m)
   fl_open_display();
   assert(fl_display != nullptr);
   Fl::screen_xywh(x, y, w, h, m);
+  float s = Fl::screen_scale(m);
+  if (s <= 0.0f)
+    s = 1.0f;
+  core::Rect logicalRect(x, y, x + w, y + h);
 
   if (!XQueryExtension(fl_display, "RANDR", &xi_major, &ev, &err))
     return "";
@@ -512,8 +531,10 @@ std::string Fl_Monitor_Arrangement::get_monitor_name(int m)
     if (!crtc)
       continue;
 
-    if ((crtc->x != x) || (crtc->y != y) ||
-        ((int)crtc->width != w) || ((int)crtc->height != h))
+    core::Rect crtcRect(crtc->x, crtc->y,
+                        crtc->x + (int)crtc->width,
+                        crtc->y + (int)crtc->height);
+    if (!screenRectMatchesPhysical(logicalRect, s, crtcRect))
       continue;
 
     for (int j = 0; j < crtc->noutput; j++) {

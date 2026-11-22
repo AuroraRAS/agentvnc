@@ -47,7 +47,7 @@
 #include <IOKit/hidsystem/IOHIDParameter.h>
 #else
 #include <X11/XKBlib.h>
-#include <FL/x.H>
+#include <FL/platform.H>
 #endif
 
 // Size of toggle-password-eye

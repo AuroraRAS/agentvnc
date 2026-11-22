@@ -21,9 +21,11 @@
 #include <config.h>
 #endif
 
+#include <assert.h>
 #include <windows.h>
 
-#include <FL/x.H>
+#include <FL/Fl_Window.H>
+#include <FL/platform.H>
 
 #include "win32.h"
 
@@ -243,5 +245,90 @@ bool win32_win_is_maximized(Fl_Window* win)
   GetWindowPlacement(fl_xid(win), &wndpl);
   if (wndpl.showCmd == SW_SHOWMAXIMIZED)
     return true;
+  return false;
+}
+
+void win32_win_get_physical_size(Fl_Window* win, int* w, int* h)
+{
+  RECT r;
+
+  assert(win && win->shown());
+  assert(w);
+  assert(h);
+
+  GetClientRect(fl_xid(win), &r);
+  *w = r.right - r.left;
+  *h = r.bottom - r.top;
+}
+
+void win32_win_get_coords(Fl_Window* win, int* x, int* y, int* w, int* h)
+{
+  RECT r;
+  POINT pt = {0, 0};
+
+  assert(win && win->shown());
+  assert(x);
+  assert(y);
+  assert(w);
+  assert(h);
+
+  GetClientRect(fl_xid(win), &r);
+  ClientToScreen(fl_xid(win), &pt);
+
+  *x = pt.x;
+  *y = pt.y;
+  *w = r.right - r.left;
+  *h = r.bottom - r.top;
+}
+
+void win32_win_warp_pointer(Fl_Window* win, int x, int y)
+{
+  POINT pt = {x, y};
+
+  if (win && win->shown())
+    ClientToScreen(fl_xid(win), &pt);
+
+  SetCursorPos(pt.x, pt.y);
+}
+
+bool win32_event_physical_pos(Fl_Window* win, int* x, int* y)
+{
+  assert(x);
+  assert(y);
+
+  if (!win || !win->shown())
+    return false;
+
+  if (fl_msg.hwnd != fl_xid(win))
+    return false;
+
+  switch (fl_msg.message) {
+  case WM_MOUSEMOVE:
+  case WM_LBUTTONDOWN:
+  case WM_LBUTTONUP:
+  case WM_RBUTTONDOWN:
+  case WM_RBUTTONUP:
+  case WM_MBUTTONDOWN:
+  case WM_MBUTTONUP:
+  case WM_XBUTTONDOWN:
+  case WM_XBUTTONUP:
+    *x = (int)(short)LOWORD(fl_msg.lParam);
+    *y = (int)(short)HIWORD(fl_msg.lParam);
+    return true;
+  case WM_MOUSEWHEEL:
+#ifdef WM_MOUSEHWHEEL
+  case WM_MOUSEHWHEEL:
+#endif
+  {
+    POINT pt;
+    pt.x = (int)(short)LOWORD(fl_msg.lParam);
+    pt.y = (int)(short)HIWORD(fl_msg.lParam);
+    ScreenToClient(fl_xid(win), &pt);
+    *x = pt.x;
+    *y = pt.y;
+    return true;
+  }
+  }
+
   return false;
 }

@@ -41,6 +41,19 @@ struct ScaledBlitParams {
 
 int floorDiv(int a, int b);
 
+int logicalToPhysical(int v, float uiScale);
+int physicalToLogicalSize(int phys, float uiScale);
+core::Rect logicalRectToPhysical(const core::Rect& logicalRect,
+                                 float uiScale, int maxW, int maxH);
+core::Rect physicalRectToLogical(const core::Rect& physRect, float uiScale);
+core::Rect scaleScreenRectToPhysical(const core::Rect& logicalRect,
+                                     float uiScale);
+bool screenRectMatchesPhysical(const core::Rect& logicalRect,
+                               float uiScale,
+                               const core::Rect& osPhysRect);
+bool parseXftDpiFromResources(const char* resources, float* dpi);
+float computeUIScaleFromDpi(float dpi, float envMultiplier = 1.0f);
+
 core::Point scaleToFramebuffer(const core::Point& localPos, int scale);
 core::Point scaleFromFramebuffer(const core::Point& fbPos, int scale);
 core::Rect scaleRectFromFramebuffer(const core::Rect& fbRect, int scale);

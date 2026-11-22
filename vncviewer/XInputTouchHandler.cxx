@@ -28,7 +28,7 @@
 #include <X11/extensions/XI2.h>
 #include <X11/XKBlib.h>
 
-#include <FL/x.H>
+#include <FL/platform.H>
 
 #include <core/LogWriter.h>
 #include <core/i18n.h>
