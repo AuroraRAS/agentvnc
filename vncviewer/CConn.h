@@ -38,6 +38,11 @@ namespace network { class Socket; }
 class AgentBridge;
 class AudioOutput;
 class DesktopWindow;
+#ifndef WIN32
+class FtpEventLoop;
+class FtpBackend;
+class FtpServer;
+#endif
 
 class CConn : public rfb::CConnection
 {
@@ -48,6 +53,16 @@ public:
   void connect(const char* vncServerName, network::Socket* sock=nullptr);
 
   std::string connectionInfo();
+
+#ifndef WIN32
+  bool startFtpServer(std::string* errorMsg=nullptr);
+  void stopFtpServer();
+  void updateFtpServer();
+  bool isFtpServerRunning() const;
+  std::string ftpServerUrl() const;
+  void flushOutput();
+  bool isOutputCongested() const;
+#endif
 
   unsigned getUpdateCount();
   unsigned getPixelCount();
@@ -200,6 +215,12 @@ private:
   DesktopWindow *desktop;
 
   AudioOutput *audioOutput;
+
+#ifndef WIN32
+  FtpEventLoop *ftpLoop;
+  FtpBackend *ftpBackend;
+  FtpServer *ftpServer;
+#endif
 
   unsigned updateCount;
   unsigned pixelCount;

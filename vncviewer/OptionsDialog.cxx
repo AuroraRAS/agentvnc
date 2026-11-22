@@ -251,6 +251,9 @@ void OptionsDialog::loadOptions(void)
       encNoneCheckbox->value(true);
       authVncCheckbox->value(true);
       break;
+    case rfb::secTypeTight:
+      encNoneCheckbox->value(true);
+      break;
     }
   }
 
@@ -368,6 +371,12 @@ void OptionsDialog::loadOptions(void)
 #ifdef HAVE_AUDIO
   audioCheckbox->value(playAudio);
 #endif
+#ifndef WIN32
+  ftpServerCheckbox->value(ftpServer);
+  ftpPortInput->value(core::format("%d", (int)ftpPort).c_str());
+  ftpBindAddressInput->value(ftpBindAddress.getValueStr().c_str());
+  handleFtpServer(ftpServerCheckbox, this);
+#endif
   alwaysCursorCheckbox->value(alwaysCursor);
   if (cursorType == "system") {
     cursorTypeChoice->value(1);
@@ -435,6 +444,10 @@ void OptionsDialog::storeOptions(void)
       security.EnableSecType(rfb::secTypeDH);
       security.EnableSecType(rfb::secTypeMSLogonII);
 #endif
+    }
+    if (authNoneCheckbox->value() || authVncCheckbox->value() ||
+        authPlainCheckbox->value()) {
+      security.EnableSecType(rfb::secTypeTight);
     }
   }
 
@@ -527,6 +540,22 @@ void OptionsDialog::storeOptions(void)
   reconnectOnError.setParam(reconnectCheckbox->value());
 #ifdef HAVE_AUDIO
   playAudio.setParam(audioCheckbox->value());
+#endif
+#ifndef WIN32
+  ftpServer.setParam(ftpServerCheckbox->value());
+  {
+    const char *portStr = ftpPortInput->value();
+    if (portStr != nullptr && portStr[0] != '\0') {
+      char *endp = nullptr;
+      long portVal = strtol(portStr, &endp, 10);
+      if (endp != portStr && *endp == '\0' &&
+          portVal >= 0 && portVal <= 65535) {
+        ftpPort.setParam(static_cast<int>(portVal));
+      }
+    }
+  }
+  if (ftpBindAddressInput->value()[0] != '\0')
+    ftpBindAddress.setParam(ftpBindAddressInput->value());
 #endif
   alwaysCursor.setParam(alwaysCursorCheckbox->value());
 
@@ -1307,6 +1336,25 @@ void OptionsDialog::createMiscPage(int tx, int ty, int tw, int th)
   ty += CHECK_HEIGHT + TIGHT_MARGIN;
 #endif
 
+#ifndef WIN32
+  ftpServerCheckbox = new Fl_Check_Button(LBLRIGHT(tx, ty,
+                                                   CHECK_MIN_WIDTH,
+                                                   CHECK_HEIGHT,
+                                                   _("Enable FTP server bridge")));
+  ftpServerCheckbox->callback(handleFtpServer, this);
+  ty += CHECK_HEIGHT + TIGHT_MARGIN;
+
+  ftpPortInput = new Fl_Int_Input(tx + INDENT, ty,
+                                  70, INPUT_HEIGHT, _("FTP port"));
+  ftpPortInput->align(FL_ALIGN_RIGHT);
+  ty += INPUT_HEIGHT + TIGHT_MARGIN;
+
+  ftpBindAddressInput = new Fl_Input(tx + INDENT, ty,
+                                     160, INPUT_HEIGHT, _("FTP bind address"));
+  ftpBindAddressInput->align(FL_ALIGN_RIGHT);
+  ty += INPUT_HEIGHT + TIGHT_MARGIN;
+#endif
+
   group->end();
 }
 
@@ -1325,6 +1373,22 @@ void OptionsDialog::handleAutoselect(Fl_Widget* /*widget*/, void *data)
     dialog->qualityGroup->activate();
   }
 }
+
+
+#ifndef WIN32
+void OptionsDialog::handleFtpServer(Fl_Widget* /*widget*/, void *data)
+{
+  OptionsDialog *dialog = (OptionsDialog*)data;
+
+  if (dialog->ftpServerCheckbox->value()) {
+    dialog->ftpPortInput->activate();
+    dialog->ftpBindAddressInput->activate();
+  } else {
+    dialog->ftpPortInput->deactivate();
+    dialog->ftpBindAddressInput->deactivate();
+  }
+}
+#endif
 
 
 void OptionsDialog::handleCompression(Fl_Widget* /*widget*/, void *data)

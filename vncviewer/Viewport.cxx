@@ -85,7 +85,7 @@ static core::LogWriter vlog("Viewport");
 
 enum { ID_DISCONNECT, ID_FULLSCREEN, ID_MINIMIZE, ID_RESIZE,
        ID_CTRL, ID_ALT, ID_CTRLALTDEL,
-       ID_REFRESH, ID_PAUSE_AGENT, ID_AGENT_OVERLAY,
+       ID_REFRESH, ID_FTPSERVER, ID_PAUSE_AGENT, ID_AGENT_OVERLAY,
        ID_AGENT_COLLABORATE, ID_AGENT_NOTE,
        ID_OPTIONS, ID_INFO, ID_ABOUT };
 
@@ -1030,6 +1030,11 @@ void Viewport::initContextMenu()
   fltk_menu_add(contextMenu, C_("ContextMenu|", "&Refresh screen"),
                 0, nullptr, (void*)ID_REFRESH, FL_MENU_DIVIDER);
 
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "FTP &server"),
+                0, nullptr, (void*)ID_FTPSERVER,
+                FL_MENU_TOGGLE | FL_MENU_DIVIDER |
+                  (cc->isFtpServerRunning() ? FL_MENU_VALUE : 0));
+
   if (cc->hasAgentBridge()) {
     fltk_menu_add(contextMenu, C_("ContextMenu|", "&Pause agent input"),
                   0, nullptr, (void*)ID_PAUSE_AGENT,
@@ -1132,6 +1137,24 @@ void Viewport::popupContextMenu()
     break;
   case ID_REFRESH:
     cc->refreshFramebuffer();
+    break;
+  case ID_FTPSERVER:
+    if (cc->isFtpServerRunning()) {
+      ftpServer.setParam(false);
+      cc->stopFtpServer();
+      if (DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window()))
+        dw->showOverlayMessage(_("FTP server stopped"));
+    } else {
+      std::string err;
+      if (cc->startFtpServer(&err)) {
+        ftpServer.setParam(true);
+        if (DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window()))
+          dw->showOverlayMessage(core::format(_("FTP server listening at %s"),
+                                              cc->ftpServerUrl().c_str()).c_str());
+      } else {
+        fl_alert("%s", err.c_str());
+      }
+    }
     break;
   case ID_PAUSE_AGENT:
     cc->setAgentPaused(!cc->isAgentPaused(), "operator_menu");

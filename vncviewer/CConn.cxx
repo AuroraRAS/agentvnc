@@ -60,6 +60,8 @@
 #endif
 
 #include <FL/Fl.H>
+#include <map>
+
 #include <FL/fl_ask.H>
 
 #ifndef XK_VoidSymbol
@@ -68,17 +70,107 @@
 #include <rfb/keysymdef.h>
 #endif
 
+#include <rdr/BufferedOutStream.h>
+#include <rfb/fileTransferTypes.h>
+
 #include "fltk/layout.h"
 #include "fltk/util.h"
 #include "AudioOutput.h"
 #include "AuthDialog.h"
 #include "CConn.h"
+#ifndef WIN32
+#include "FtpServer.h"
+#endif
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
 #include "PlatformPixelBuffer.h"
 #include "keysym2ucs.h"
 #include "parameters.h"
 #include "vncviewer.h"
+
+#ifndef WIN32
+namespace {
+
+class FltkFtpEventLoop : public FtpEventLoop {
+public:
+  void setFdWatch(int fd, bool read, bool write,
+                  FdCallback cb, void* data) override
+  {
+    Fl::remove_fd(fd, FL_READ | FL_WRITE | FL_EXCEPT);
+    WatchEntry& e = watches_[fd];
+    e.read = read;
+    e.write = write;
+    e.cb = cb;
+    e.data = data;
+
+    int when = (read ? FL_READ : 0) | (write ? FL_WRITE : 0);
+    if (when != 0)
+      Fl::add_fd(fd, when, &FltkFtpEventLoop::fdTrampoline, this);
+    else
+      watches_.erase(fd);
+  }
+
+  void removeFd(int fd) override
+  {
+    Fl::remove_fd(fd, FL_READ | FL_WRITE | FL_EXCEPT);
+    watches_.erase(fd);
+  }
+
+  void addTimer(int delayMs, TimerCallback cb, void* data) override
+  {
+    Fl::add_timeout(delayMs / 1000.0, cb, data);
+  }
+
+  void removeTimer(TimerCallback cb, void* data) override
+  {
+    Fl::remove_timeout(cb, data);
+  }
+
+private:
+  struct WatchEntry {
+    bool read;
+    bool write;
+    FdCallback cb;
+    void* data;
+  };
+
+  static void fdTrampoline(FL_SOCKET fd, void* data)
+  {
+    FltkFtpEventLoop* self = static_cast<FltkFtpEventLoop*>(data);
+    int ifd = static_cast<int>(fd);
+    std::map<int, WatchEntry>::iterator it = self->watches_.find(ifd);
+    if (it == self->watches_.end())
+      return;
+    WatchEntry entry = it->second;
+    if (entry.cb != nullptr)
+      entry.cb(ifd, entry.read, entry.write, entry.data);
+  }
+
+  std::map<int, WatchEntry> watches_;
+};
+
+class CConnFtpBackend : public FtpBackend {
+public:
+  explicit CConnFtpBackend(CConn* cc) : cc_(cc) {}
+
+  bool isViewOnly() const override { return ::viewOnly; }
+  bool isConnected() const override
+  {
+    return cc_->state() == rfb::CConnection::RFBSTATE_NORMAL;
+  }
+  rfb::FileTransferClient* fileTransfer() override
+  {
+    return &cc_->fileTransferClient();
+  }
+  void flushOutput() override { cc_->flushOutput(); }
+  bool isOutputCongested() const override { return cc_->isOutputCongested(); }
+
+private:
+  CConn* cc_;
+};
+
+}
+#endif
 
 std::string CConn::savedUsername;
 std::string CConn::savedPassword;
@@ -109,6 +201,9 @@ CConn::CConn()
   : serverPort(0), sock(nullptr),
     msgTimer(this, &CConn::processNextMsg), desktop(nullptr),
     audioOutput(nullptr),
+#ifndef WIN32
+    ftpLoop(nullptr), ftpBackend(nullptr), ftpServer(nullptr),
+#endif
     updateCount(0), pixelCount(0),
     lastServerEncoding((unsigned int)-1), bpsEstimate(20000000),
     agentBridge(nullptr), sessionInitialized(false),
@@ -125,6 +220,10 @@ CConn::CConn()
   supportsCursorPosition = true;
   supportsDesktopResize = true;
   supportsLEDState = true;
+#ifndef WIN32
+  supportsFileTransfer = true;
+  preferTightForFileTransfer = ::ftpServer;
+#endif
 
 #ifdef HAVE_AUDIO
   // Only ask the server to send audio if there is a device that can
@@ -141,12 +240,37 @@ CConn::CConn()
 
   setQualityLevel(::qualityLevel);
 
+#ifndef WIN32
+  if (::ftpProtocol == "Tight2")
+    fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Tight2);
+  else if (::ftpProtocol == "Tight13")
+    fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Tight13);
+  else if (::ftpProtocol == "Ultra")
+    fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Ultra);
+  else
+    fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Unsupported);
+
+  ftpLoop = new FltkFtpEventLoop();
+  ftpBackend = new CConnFtpBackend(this);
+  ftpServer = new FtpServer(ftpLoop, ftpBackend);
+#endif
+
   if (!headless)
     OptionsDialog::addCallback(handleOptions, this);
 }
 
 CConn::~CConn()
 {
+#ifndef WIN32
+  stopFtpServer();
+  delete ftpServer;
+  ftpServer = nullptr;
+  delete ftpBackend;
+  ftpBackend = nullptr;
+  delete ftpLoop;
+  ftpLoop = nullptr;
+#endif
+
   close();
 
   if (!headless) {
@@ -285,6 +409,14 @@ std::string CConn::connectionInfo()
                            rfb::secTypeName(csecurity->getType()));
   infoText += "\n";
 
+#ifndef WIN32
+  if (ftpServer != nullptr && ftpServer->isRunning()) {
+    infoText += core::format(_("FTP server: %s"),
+                             ftpServer->url().c_str());
+    infoText += "\n";
+  }
+#endif
+
   return infoText;
 }
 
@@ -362,6 +494,10 @@ void CConn::processNextMsg(core::Timer*)
   try {
     // We might have been called to flush unwritten socket data
     sock->outStream().flush();
+#ifndef WIN32
+    if (ftpServer != nullptr)
+      ftpServer->onBackendOutputDrained();
+#endif
 
     again = processMsg();
   } catch (rdr::end_of_stream& e) {
@@ -517,6 +653,10 @@ void CConn::initDone()
   // Force a switch to the format and encoding we'd like
   updateEncoding();
   updatePixelFormat();
+
+#ifndef WIN32
+  updateFtpServer();
+#endif
 }
 
 bool CConn::verifyCertificate(unsigned int status,
@@ -1202,6 +1342,9 @@ void CConn::handleOptions(void *data)
   self->updateCompressLevel();
   self->updateQualityLevel();
   self->updatePixelFormat();
+#ifndef WIN32
+  self->updateFtpServer();
+#endif
 }
 
 void CConn::handleUpdateTimeout(void *data)
@@ -1552,3 +1695,104 @@ void CConn::clearAgentClipboardOwnership()
   hasAgentClipboard = false;
   agentClipboardText.clear();
 }
+
+////////////////////// FTP server bridge methods //////////////////////
+
+#ifndef WIN32
+bool CConn::startFtpServer(std::string* errorMsg)
+{
+  if (ftpServer == nullptr)
+    return false;
+
+  FtpServerConfig cfg;
+  cfg.bindAddress = ::ftpBindAddress.getValueStr();
+  cfg.port = ::ftpPort;
+  cfg.username = ::ftpUsername.getValueStr();
+  cfg.password = ::ftpPassword.getValueStr();
+
+  return ftpServer->start(cfg, errorMsg);
+}
+
+void CConn::stopFtpServer()
+{
+  if (ftpServer != nullptr)
+    ftpServer->stop();
+}
+
+void CConn::updateFtpServer()
+{
+  if (::ftpProtocol == "Tight2")
+    fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Tight2);
+  else if (::ftpProtocol == "Tight13")
+    fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Tight13);
+  else if (::ftpProtocol == "Ultra")
+    fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Ultra);
+  else
+    fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Unsupported);
+
+  if (!::ftpServer) {
+    stopFtpServer();
+    return;
+  }
+
+  if (ftpServer == nullptr)
+    return;
+
+  std::string desiredHost = ::ftpBindAddress.getValueStr();
+  if (desiredHost.empty())
+    desiredHost = "127.0.0.1";
+  int desiredPort = ::ftpPort;
+
+  if (ftpServer->isRunning()) {
+    bool sameHost = (desiredHost == ftpServer->listenHost());
+    bool samePort = (desiredPort == 0 || desiredPort == ftpServer->listenPort());
+    if (sameHost && samePort)
+      return;
+  }
+
+  std::string err;
+  if (!startFtpServer(&err)) {
+    vlog.error("%s", err.c_str());
+    if (desktop != nullptr)
+      desktop->showOverlayMessage(err.c_str());
+  }
+}
+
+bool CConn::isFtpServerRunning() const
+{
+  return ftpServer != nullptr && ftpServer->isRunning();
+}
+
+std::string CConn::ftpServerUrl() const
+{
+  if (ftpServer == nullptr || !ftpServer->isRunning())
+    return "";
+  return ftpServer->url();
+}
+
+void CConn::flushOutput()
+{
+  if (sock == nullptr)
+    return;
+  try {
+    sock->outStream().flush();
+    if (sock->outStream().hasBufferedData() && !msgTimer.isStarted()) {
+      int when = FL_READ | FL_WRITE | FL_EXCEPT;
+      Fl::remove_fd(sock->getFd());
+      Fl::add_fd(sock->getFd(), when, socketEvent, this);
+    }
+  } catch (std::exception& e) {
+    vlog.error("%s", e.what());
+    abort_connection_unexpected(e);
+  }
+}
+
+bool CConn::isOutputCongested() const
+{
+  if (sock == nullptr)
+    return false;
+  rdr::BufferedOutStream* bos =
+    dynamic_cast<rdr::BufferedOutStream*>(&sock->outStream());
+  return bos != nullptr && bos->bufferedSize() >= 262144;
+}
+#endif

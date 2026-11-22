@@ -92,6 +92,9 @@ public:
   void grabKeyboard();
   void ungrabKeyboard();
 
+  // Display a temporary status message in the window overlay
+  void showOverlayMessage(const char* text) { addOverlayTip("%s", text); }
+
 private:
   void addOverlayTip(const char *text, ...)
     __attribute__((__format__ (__printf__, 2, 3)));

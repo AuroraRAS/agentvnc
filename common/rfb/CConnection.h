@@ -31,6 +31,7 @@
 
 #include <rfb/CMsgHandler.h>
 #include <rfb/DecodeManager.h>
+#include <rfb/FileTransferClient.h>
 #include <rfb/PixelFormat.h>
 #include <rfb/SecurityClient.h>
 
@@ -164,6 +165,11 @@ namespace rfb {
 
     bool isSecure() const;
 
+    FileTransferClient& fileTransferClient() { return fileTransfer; }
+    void setFileTransferHandler(FileTransferHandler* handler) {
+      fileTransfer.setHandler(handler);
+    }
+
     enum stateEnum {
       RFBSTATE_UNINITIALISED,
       RFBSTATE_PROTOCOL_VERSION,
@@ -257,6 +263,41 @@ namespace rfb {
     void audioEnd() override;
     void audioData(const uint8_t* data, size_t length) override;
 
+    void serverTightCaps(const std::vector<TightCapability>& serverMsgs,
+                         const std::vector<TightCapability>& clientMsgs,
+                         const std::vector<TightCapability>& encodings) override;
+    void supportedMessages(const uint8_t client2server[32],
+                           const uint8_t server2client[32]) override;
+
+    void tight13FileListData(uint8_t flags,
+                             const std::vector<FileEntry>& entries) override;
+    void tight13FileDownloadData(const uint8_t* data, size_t len) override;
+    void tight13FileDownloadEnd(uint32_t modTime) override;
+    void tight13FileUploadCancel(const std::string& reason) override;
+    void tight13FileDownloadFailed(const std::string& reason) override;
+
+    void tight2CompressionSupportReply(bool supported) override;
+    void tight2FileListReply(const std::vector<FileEntry>& entries) override;
+    void tight2Md5Reply(const uint8_t digest[16]) override;
+    void tight2UploadStartReply() override;
+    void tight2UploadDataReply() override;
+    void tight2UploadEndReply() override;
+    void tight2DownloadStartReply() override;
+    void tight2DownloadDataReply(const uint8_t* data, size_t len) override;
+    void tight2DownloadEndReply(uint8_t flags, uint64_t modTimeMs) override;
+    void tight2MkdirReply() override;
+    void tight2RemoveReply() override;
+    void tight2RenameReply() override;
+    void tight2DirSizeReply(uint64_t size) override;
+    void tight2LastRequestFailedReply(const std::string& message) override;
+
+    void ultraFileTransferMessage(uint8_t contentType,
+                                  uint16_t contentParam,
+                                  uint32_t size,
+                                  uint32_t sizeH,
+                                  const uint8_t* payload,
+                                  size_t length) override;
+
 
     // Methods to be overridden in a derived class
 
@@ -324,6 +365,8 @@ namespace rfb {
     bool supportsDesktopResize;
     bool supportsLEDState;
     bool supportsAudio;
+    bool supportsFileTransfer;
+    bool preferTightForFileTransfer;
 
   private:
     bool processVersionMsg();
@@ -382,6 +425,8 @@ namespace rfb {
     };
     typedef std::map<int, DownKey> DownMap;
     DownMap downKeys;
+
+    FileTransferClient fileTransfer;
   };
 }
 #endif

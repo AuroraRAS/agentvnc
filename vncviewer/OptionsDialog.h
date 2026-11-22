@@ -74,6 +74,9 @@ protected:
   static void handleModifier(Fl_Widget *widget, void *data);
 
   static void handleFullScreenMode(Fl_Widget *widget, void *data);
+#ifndef WIN32
+  static void handleFtpServer(Fl_Widget *widget, void *data);
+#endif
 
   static void handleCancel(Fl_Widget *widget, void *data);
   static void handleOK(Fl_Widget *widget, void *data);
@@ -170,6 +173,11 @@ protected:
   Fl_Check_Button *reconnectCheckbox;
 #ifdef HAVE_AUDIO
   Fl_Check_Button *audioCheckbox;
+#endif
+#ifndef WIN32
+  Fl_Check_Button *ftpServerCheckbox;
+  Fl_Int_Input *ftpPortInput;
+  Fl_Input *ftpBindAddressInput;
 #endif
 
 private:

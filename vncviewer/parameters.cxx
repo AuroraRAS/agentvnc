@@ -284,6 +284,40 @@ core::StringParameter
   via("via", _("SSH gateway to tunnel the connection via"), "");
 #endif
 
+#ifndef WIN32
+core::BoolParameter
+  ftpServer("FtpServer",
+            _("Start an FTP server bridge for RFB file transfer"), false);
+
+core::IntParameter
+  ftpPort("FtpPort",
+          _("TCP port to listen on for the FTP server bridge (0 = auto)"),
+          2121, 0, 65535);
+
+core::StringParameter
+  ftpBindAddress("FtpBindAddress",
+                 _("Address to bind the FTP server bridge to"),
+                 "127.0.0.1");
+
+core::StringParameter
+  ftpUsername("FtpUsername",
+              _("Username required to log into the FTP server bridge"),
+              "");
+
+core::StringParameter
+  ftpPassword("FtpPassword",
+              _("Password required to log into the FTP server bridge"),
+              "");
+
+core::EnumParameter
+  ftpProtocol("FtpProtocol",
+              core::format(
+                "%s (%s)",
+                _("Preferred RFB file transfer protocol"),
+                "Auto, Tight2, Tight13, Ultra").c_str(),
+              {"Auto", "Tight2", "Tight13", "Ultra"}, "Auto");
+#endif
+
 static const char* IDENTIFIER_STRING = "TigerVNC Configuration file Version 1.0";
 
 /*
@@ -331,6 +365,13 @@ static core::Parameter* parameterArray[] = {
   &fullscreenSystemKeys,
   /* Keyboard shortcuts */
   &shortcutModifiers,
+  /* FTP server bridge */
+#ifndef WIN32
+  &ftpServer,
+  &ftpPort,
+  &ftpBindAddress,
+  &ftpProtocol,
+#endif
 };
 
 static core::Parameter* readOnlyParameterArray[] = {

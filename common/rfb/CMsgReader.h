@@ -26,6 +26,8 @@
 
 #include <stdint.h>
 
+#include <vector>
+
 #include <core/Rect.h>
 
 namespace rdr { class InStream; }
@@ -33,6 +35,7 @@ namespace rdr { class InStream; }
 namespace rfb {
 
   class CMsgHandler;
+  struct Tight2InflateState;
 
   class CMsgReader {
   public:
@@ -71,6 +74,14 @@ namespace rfb {
 
     bool readQEMUServerMessage();
 
+    bool readUltraFileTransfer();
+    bool readTight13FileListData();
+    bool readTight13FileDownloadData();
+    bool readTight13FileUploadCancel();
+    bool readTight13FileDownloadFailed();
+    bool readTight2Message();
+    bool readSupportedMessages();
+
   private:
     CMsgHandler* handler;
     rdr::InStream* is;
@@ -90,6 +101,12 @@ namespace rfb {
     int rectEncoding;
 
     int cursorEncoding;
+
+    Tight2InflateState* tight2Inflate;
+
+    std::vector<uint8_t> inflateTight2Block(const uint8_t* compressed,
+                                            size_t compressedSize,
+                                            size_t uncompressedSize);
 
     static const int maxCursorSize = 256;
   };
