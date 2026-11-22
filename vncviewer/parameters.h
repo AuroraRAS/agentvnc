@@ -68,6 +68,13 @@ extern core::BoolParameter listenMode;
 
 extern core::BoolParameter viewOnly;
 extern core::BoolParameter shared;
+extern core::BoolParameter headless;
+extern core::BoolParameter agentOverlay;
+extern core::BoolParameter agentCollaborate;
+
+#ifndef WIN32
+extern core::StringParameter agentSocket;
+#endif
 
 #ifdef HAVE_AUDIO
 extern core::BoolParameter playAudio;

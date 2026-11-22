@@ -33,6 +33,10 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#ifndef WIN32
+#include <poll.h>
+#endif
+
 #ifdef WIN32
 #include <core/winerrno.h>
 #include <direct.h>
@@ -62,6 +66,9 @@
 #include "fltk/theme.h"
 #include "fltk/util.h"
 #include "parameters.h"
+#ifndef WIN32
+#include "AgentBridge.h"
+#endif
 #include "CConn.h"
 #include "ServerDialog.h"
 #include "touch.h"
@@ -119,8 +126,12 @@ void abort_vncviewer(const char *error, ...)
     exitMainloop = true;
   else {
     // We're early in the startup. Assume we can just exit().
-    if (alertOnFatalError && !exitError.empty())
-      fl_alert("%s", exitError.c_str());
+    if (!exitError.empty()) {
+      if (headless)
+        vlog.error("%s", exitError.c_str());
+      else if (alertOnFatalError)
+        fl_alert("%s", exitError.c_str());
+    }
     exit(EXIT_FAILURE);
   }
 }
@@ -159,40 +170,138 @@ void about_vncviewer()
   fl_message("%s", about_text());
 }
 
+#ifndef WIN32
+static void agentWakeEvent(FL_SOCKET /*fd*/, void *data)
+{
+  AgentBridge *bridge = (AgentBridge *)data;
+  if (bridge)
+    bridge->processPendingRequests();
+}
+#endif
+
 static void mainloop(const char* vncserver, network::Socket* sock)
 {
+#ifndef WIN32
+  AgentBridge *agentBridge = nullptr;
+  if (strlen(agentSocket) > 0) {
+    try {
+      agentBridge = new AgentBridge((const char*)agentSocket);
+      agentBridge->start();
+      if (!headless)
+        Fl::add_fd(agentBridge->getWakeFd(), FL_READ, agentWakeEvent, agentBridge);
+    } catch (std::exception& e) {
+      delete agentBridge;
+      agentBridge = nullptr;
+      vlog.error("%s", e.what());
+      exitError = core::format(_("Failed to start agent bridge on \"%s\":\n\n%s"),
+                               (const char*)agentSocket, e.what());
+      fatalError = true;
+      if (!headless && alertOnFatalError)
+        fl_alert("%s", exitError.c_str());
+      return;
+    }
+  }
+#endif
+
   while (true) {
     CConn *cc;
 
     exitMainloop = false;
 
     cc = new CConn();
+#ifndef WIN32
+    if (agentBridge) {
+      cc->setAgentBridge(agentBridge);
+      agentBridge->setConnection(cc);
+    }
+#endif
     cc->connect(vncserver, sock);
 
     while (!exitMainloop) {
       int next_timer;
 
       next_timer = core::Timer::checkTimeouts();
-      if (next_timer < 0)
-        next_timer = INT_MAX;
+      if (exitMainloop)
+        break;
 
-      if (Fl::wait((double)next_timer / 1000.0) < 0.0) {
-        vlog.error(_("Internal FLTK error. Exiting."));
+      if (headless) {
+#ifndef WIN32
+        struct pollfd fds[2];
+        nfds_t nfds = 0;
+        int rfbIdx = -1;
+        int wakeIdx = -1;
+
+        if (cc->isSocketWatched() && (cc->getSocketFd() >= 0)) {
+          rfbIdx = (int)nfds;
+          fds[nfds].fd = cc->getSocketFd();
+          fds[nfds].events = POLLIN | (cc->wantsSocketWrite() ? POLLOUT : 0);
+          fds[nfds].revents = 0;
+          nfds++;
+        }
+        if (agentBridge && (agentBridge->getWakeFd() >= 0)) {
+          wakeIdx = (int)nfds;
+          fds[nfds].fd = agentBridge->getWakeFd();
+          fds[nfds].events = POLLIN;
+          fds[nfds].revents = 0;
+          nfds++;
+        }
+
+        if ((nfds == 0) && (next_timer < 0)) {
+          vlog.error(_("No active descriptors or timers in headless loop. Exiting."));
+          break;
+        }
+
+        int pollRet = poll(fds, nfds, next_timer);
+        if (pollRet < 0) {
+          if (errno == EINTR)
+            continue;
+          vlog.error(_("Internal poll error: %s"), strerror(errno));
+          exit(-1);
+        }
+
+        if ((wakeIdx >= 0) &&
+            (fds[wakeIdx].revents & (POLLIN | POLLERR | POLLHUP)))
+          agentBridge->processPendingRequests();
+
+        if ((rfbIdx >= 0) && (fds[rfbIdx].revents != 0))
+          cc->onSocketReady();
+#else
+        vlog.error(_("Headless mode is not supported on Windows."));
         exit(-1);
+#endif
+      } else {
+        if (next_timer < 0)
+          next_timer = INT_MAX;
+
+        if (Fl::wait((double)next_timer / 1000.0) < 0.0) {
+          vlog.error(_("Internal FLTK error. Exiting."));
+          exit(-1);
+        }
       }
     }
 
+#ifndef WIN32
+    if (agentBridge)
+      agentBridge->setConnection(nullptr);
+#endif
     delete cc;
 
     if (fatalError) {
       assert(!exitError.empty());
-      if (alertOnFatalError)
+      if (headless)
+        vlog.error("%s", exitError.c_str());
+      else if (alertOnFatalError)
         fl_alert("%s", exitError.c_str());
       break;
     }
 
     if (exitError.empty())
       break;
+
+    if (headless) {
+      vlog.error("%s", exitError.c_str());
+      break;
+    }
 
     if(reconnectOnError && (sock == nullptr)) {
       int ret;
@@ -212,6 +321,16 @@ static void mainloop(const char* vncserver, network::Socket* sock)
 
     break;
   }
+
+#ifndef WIN32
+  if (agentBridge) {
+    if (!headless)
+      Fl::remove_fd(agentBridge->getWakeFd());
+    agentBridge->stop();
+    delete agentBridge;
+    agentBridge = nullptr;
+  }
+#endif
 }
 
 #ifdef __APPLE__
@@ -249,6 +368,9 @@ static void CleanupSignalHandler(int sig)
   // CleanupSignalHandler allows C++ object cleanup to happen because it calls
   // exit() rather than the default which is to abort.
   vlog.info(_("Termination signal %d has been received. TigerVNC will now exit."), sig);
+#ifndef WIN32
+  AgentBridge::cleanupOnSignal();
+#endif
   exit(1);
 }
 
@@ -647,15 +769,17 @@ int main(int argc, char** argv)
   // Handle any old settings specified on the command line
   migrateDeprecatedOptions();
 
+  if (!headless) {
 #if !defined(WIN32) && !defined(__APPLE__)
-  if (strcmp(display, "") != 0) {
-    Fl::display(display);
-  }
-  fl_open_display();
+    if (strcmp(display, "") != 0) {
+      Fl::display(display);
+    }
+    fl_open_display();
 #endif
 
-  init_fltk();
-  enable_touch();
+    init_fltk();
+    enable_touch();
+  }
 
   // Check if the server name in reality is a configuration file
   potentiallyLoadConfigurationFile(vncServerName.c_str());
@@ -725,6 +849,10 @@ int main(int argc, char** argv)
     }
   } else {
     if (vncServerName.empty()) {
+      if (headless) {
+        vlog.error(_("No VNC server specified in headless mode"));
+        return 1;
+      }
       vncServerName = ServerDialog::run(defaultServerName.c_str());
       if (vncServerName.empty())
         return 1;
@@ -746,5 +874,5 @@ int main(int argc, char** argv)
   mainloop(vncServerName.c_str(), sock);
   inMainloop = false;
 
-  return 0;
+  return (fatalError || (headless && !exitError.empty())) ? EXIT_FAILURE : EXIT_SUCCESS;
 }

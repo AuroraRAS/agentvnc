@@ -200,6 +200,25 @@ core::BoolParameter
   shared("Shared",
          _("Don't disconnect other viewers upon connection"),
          false);
+core::BoolParameter
+  headless("Headless",
+           _("Run without opening a display window or requiring X11/Wayland"),
+           false);
+core::BoolParameter
+  agentOverlay("AgentOverlay",
+               _("Display real-time overlay of external agent actions and intent"),
+               false);
+core::BoolParameter
+  agentCollaborate("AgentCollaborate",
+                   _("Enable collaborative mode with live agent overlay and automatic takeover on local input"),
+                   false);
+
+#ifndef WIN32
+core::StringParameter
+  agentSocket("AgentSocket",
+              _("Path to Unix domain socket for external agent IPC bridge"),
+              "");
+#endif
 
 #ifdef HAVE_AUDIO
 core::BoolParameter

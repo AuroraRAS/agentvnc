@@ -23,6 +23,7 @@
 #endif
 
 #include <assert.h>
+#include <chrono>
 #ifndef _WIN32
 #include <unistd.h>
 #endif
@@ -46,6 +47,7 @@
 #include <rfb/CMsgWriter.h>
 #include <rfb/CSecurity.h>
 #include <rfb/Exception.h>
+#include <rfb/PixelBuffer.h>
 #include <rfb/Security.h>
 #include <rfb/fenceTypes.h>
 #include <rfb/obfuscate.h>
@@ -59,6 +61,12 @@
 #include <FL/Fl.H>
 #include <FL/fl_ask.H>
 
+#ifndef XK_VoidSymbol
+#define XK_LATIN1
+#define XK_MISCELLANY
+#include <rfb/keysymdef.h>
+#endif
+
 #include "fltk/layout.h"
 #include "fltk/util.h"
 #include "AudioOutput.h"
@@ -67,6 +75,7 @@
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
 #include "PlatformPixelBuffer.h"
+#include "keysym2ucs.h"
 #include "parameters.h"
 #include "vncviewer.h"
 
@@ -88,12 +97,26 @@ static const rfb::PixelFormat mediumColourPF(8, 8, false, true,
 // Time new bandwidth estimates are weighted against (in ms)
 static const unsigned bpsEstimateWindow = 1000;
 
+static int64_t steadyNowMs()
+{
+  using namespace std::chrono;
+  return duration_cast<milliseconds>(
+    steady_clock::now().time_since_epoch()).count();
+}
+
 CConn::CConn()
   : serverPort(0), sock(nullptr),
     msgTimer(this, &CConn::processNextMsg), desktop(nullptr),
     audioOutput(nullptr),
     updateCount(0), pixelCount(0),
-    lastServerEncoding((unsigned int)-1), bpsEstimate(20000000)
+    lastServerEncoding((unsigned int)-1), bpsEstimate(20000000),
+    agentBridge(nullptr), sessionInitialized(false),
+    socketWatched(false), socketWatchWrite(false),
+    agentPaused(false), inFramebufferUpdate(false),
+    frameSeq(0), damageCount(0), resizeCount(0), lastUpdateMs(0),
+    nextAgentKeyCode(0x40000000),
+    hasAgentClipboard(false), hasRemoteClipboardData(false),
+    humanActionCount(0), lastHumanInputMs(0), lastAgentButtonMask(0)
 {
   setShared(::shared);
 
@@ -106,7 +129,7 @@ CConn::CConn()
   // Only ask the server to send audio if there is a device that can
   // play it. Opening that device is deferred until the server actually
   // has something for us.
-  if (playAudio) {
+  if (playAudio && !headless) {
     audioOutput = AudioOutput::create();
     supportsAudio = audioOutput != nullptr;
   }
@@ -117,15 +140,18 @@ CConn::CConn()
 
   setQualityLevel(::qualityLevel);
 
-  OptionsDialog::addCallback(handleOptions, this);
+  if (!headless)
+    OptionsDialog::addCallback(handleOptions, this);
 }
 
 CConn::~CConn()
 {
   close();
 
-  OptionsDialog::removeCallback(handleOptions);
-  Fl::remove_timeout(handleUpdateTimeout, this);
+  if (!headless) {
+    OptionsDialog::removeCallback(handleOptions);
+    Fl::remove_timeout(handleUpdateTimeout, this);
+  }
 
   if (desktop)
     delete desktop;
@@ -165,7 +191,10 @@ CConn::~CConn()
   #endif
     }
 
-    Fl::remove_fd(sock->getFd());
+    socketWatched = false;
+    socketWatchWrite = false;
+    if (!headless)
+      Fl::remove_fd(sock->getFd());
 
     delete sock;
   }
@@ -198,7 +227,10 @@ void CConn::connect(const char* vncServerName, network::Socket* socket)
     }
   }
 
-  Fl::add_fd(sock->getFd(), FL_READ | FL_EXCEPT, socketEvent, this);
+  socketWatched = true;
+  socketWatchWrite = false;
+  if (!headless)
+    Fl::add_fd(sock->getFd(), FL_READ | FL_EXCEPT, socketEvent, this);
 
   setServerName(serverHost.c_str());
   setStreams(&sock->inStream(), &sock->outStream());
@@ -267,27 +299,55 @@ unsigned CConn::getPosition()
   return sock->inStream().pos();
 }
 
-void CConn::socketEvent(FL_SOCKET fd, void *data)
+int CConn::getSocketFd() const
+{
+  return sock ? sock->getFd() : -1;
+}
+
+void CConn::onSocketReady()
+{
+  if (!sock)
+    return;
+
+  // Stop monitoring the socket for now and start processing incoming
+  // data asynchronously
+  socketWatched = false;
+  socketWatchWrite = false;
+  if (!headless)
+    Fl::remove_fd(sock->getFd());
+  msgTimer.start(0);
+
+  // Coalesce data until we're fully done processing things
+  getOutStream()->cork(true);
+}
+
+void CConn::ensureSocketWriteWatch()
+{
+  if (!sock || !socketWatched || !sock->outStream().hasBufferedData())
+    return;
+
+  if (!socketWatchWrite) {
+    socketWatchWrite = true;
+    if (!headless) {
+      Fl::remove_fd(sock->getFd());
+      Fl::add_fd(sock->getFd(), FL_READ | FL_EXCEPT | FL_WRITE, socketEvent, this);
+    }
+  }
+}
+
+void CConn::socketEvent(FL_SOCKET /*fd*/, void *data)
 {
   CConn *cc;
 
   assert(data);
   cc = (CConn*)data;
-
-  // Stop monitoring the socket for now and start processing incoming
-  // data asynchronously
-  Fl::remove_fd(fd);
-  cc->msgTimer.start(0);
-
-  // Coalesce data until we're fully done processing things
-  cc->getOutStream()->cork(true);
+  cc->onSocketReady();
 }
 
 void CConn::processNextMsg(core::Timer*)
 {
   static bool recursing = false;
   bool again;
-  int when;
 
   // I don't think processMsg() is recursion safe, so add this check
   assert(!recursing);
@@ -302,7 +362,7 @@ void CConn::processNextMsg(core::Timer*)
     again = processMsg();
   } catch (rdr::end_of_stream& e) {
     vlog.info("%s", e.what());
-    if (!desktop) {
+    if (!sessionInitialized) {
       vlog.error(_("The connection was dropped by the server before "
                    "the session could be established."));
       abort_connection(_("The connection was dropped by the server "
@@ -335,11 +395,16 @@ void CConn::processNextMsg(core::Timer*)
 
   getOutStream()->cork(false);
 
-  when = FL_READ | FL_EXCEPT;
-  if (sock->outStream().hasBufferedData())
-    when |= FL_WRITE;
+  bool wantWrite = sock->outStream().hasBufferedData();
+  socketWatched = true;
+  socketWatchWrite = wantWrite;
+  if (!headless) {
+    int when = FL_READ | FL_EXCEPT;
+    if (wantWrite)
+      when |= FL_WRITE;
 
-  Fl::add_fd(sock->getFd(), when, socketEvent, this);
+    Fl::add_fd(sock->getFd(), when, socketEvent, this);
+  }
 }
 
 ////////////////////// CConnection callback methods //////////////////////
@@ -393,6 +458,11 @@ void CConn::getUserPasswd(std::string *user, std::string *password)
     return;
   }
 
+  if (headless) {
+    vlog.error(_("Authentication required in headless mode; set VNC_PASSWORD or -PasswordFile"));
+    throw rfb::auth_cancelled();
+  }
+
   AuthDialog d(isSecure(), user != nullptr, password != nullptr);
   d.show();
   while (d.shown())
@@ -422,11 +492,23 @@ void CConn::getUserPasswd(std::string *user, std::string *password)
 }
 
 // initDone() is called when the serverInit message has been received.  At
-// this point we create the desktop window and display it.  We also tell the
-// server the pixel format and encodings to use and request the first update.
+// this point we create the desktop window and display it (or allocate a
+// headless pixel buffer).  We also tell the server the pixel format and
+// encodings to use and request the first update.
 void CConn::initDone()
 {
-  desktop = new DesktopWindow(server.width(), server.height(), this);
+  sessionInitialized = true;
+
+  if (!headless) {
+    desktop = new DesktopWindow(server.width(), server.height(), this);
+  } else {
+    rfb::PixelFormat headlessPF(32, 24, false, true, 255, 255, 255, 0, 8, 16);
+    rfb::ManagedPixelBuffer* fb =
+      new rfb::ManagedPixelBuffer(headlessPF, server.width(), server.height());
+    const uint8_t black[4] = { 0, 0, 0, 0 };
+    fb->fillRect(fb->getRect(), black);
+    setFramebuffer(fb);
+  }
 
   // Force a switch to the format and encoding we'd like
   updateEncoding();
@@ -545,6 +627,11 @@ bool CConn::verifyCertificate(unsigned int status,
   info = (const char*)info_datum.data;
 
   gnutls_free(info_datum.data);
+
+  if (headless) {
+    vlog.error(_("Server TLS certificate cannot be interactively approved in headless mode"));
+    return false;
+  }
 
   /* New host */
   if (known == GNUTLS_E_NO_CERTIFICATE_FOUND) {
@@ -776,6 +863,12 @@ bool CConn::verifyCertificate(unsigned int status,
 bool CConn::verifyHostKey(const uint8_t* key, size_t length,
                           const char* fingerprint)
 {
+  if (headless) {
+    vlog.error(_("Host key verification required in headless mode (fingerprint: %s)"),
+               fingerprint);
+    return false;
+  }
+
   std::string text = core::format(
     _("The server has provided the following identifying information:\n"
       "\n"
@@ -801,7 +894,7 @@ void CConn::setExtendedDesktopSize(unsigned reason, unsigned result,
 {
   CConnection::setExtendedDesktopSize(reason, result, w, h, layout);
 
-  if (reason == rfb::reasonClient)
+  if (desktop && (reason == rfb::reasonClient))
     desktop->setDesktopSizeDone(result);
 }
 
@@ -809,7 +902,8 @@ void CConn::setExtendedDesktopSize(unsigned reason, unsigned result,
 void CConn::setName(const char* name)
 {
   CConnection::setName(name);
-  desktop->updateCaption();
+  if (desktop)
+    desktop->updateCaption();
 }
 
 // framebufferUpdateStart() is called at the beginning of an update.
@@ -820,12 +914,15 @@ void CConn::framebufferUpdateStart()
 {
   CConnection::framebufferUpdateStart();
 
+  inFramebufferUpdate = true;
+
   // For bandwidth estimate
   gettimeofday(&updateStartTime, nullptr);
   updateStartPos = sock->inStream().pos();
 
   // Update the screen prematurely for very slow updates
-  Fl::add_timeout(1.0, handleUpdateTimeout, this);
+  if (desktop)
+    Fl::add_timeout(1.0, handleUpdateTimeout, this);
 }
 
 // framebufferUpdateEnd() is called at the end of an update.
@@ -840,6 +937,9 @@ void CConn::framebufferUpdateEnd()
   CConnection::framebufferUpdateEnd();
 
   updateCount++;
+  inFramebufferUpdate = false;
+  frameSeq++;
+  lastUpdateMs = steadyNowMs();
 
   // Calculate bandwidth everything managed to maintain during this update
   gettimeofday(&now, nullptr);
@@ -858,8 +958,10 @@ void CConn::framebufferUpdateEnd()
   bpsEstimate = ((bpsEstimate * (1000000 - weight)) +
                  (bps * weight)) / 1000000;
 
-  Fl::remove_timeout(handleUpdateTimeout, this);
-  desktop->updateWindow();
+  if (desktop) {
+    Fl::remove_timeout(handleUpdateTimeout, this);
+    desktop->updateWindow();
+  }
 
   // Compute new settings based on updated bandwidth values
   if (autoSelect) {
@@ -873,7 +975,8 @@ void CConn::framebufferUpdateEnd()
 
 void CConn::bell()
 {
-  fl_beep();
+  if (!headless)
+    fl_beep();
 }
 
 bool CConn::dataRect(const core::Rect& r, int encoding)
@@ -885,8 +988,10 @@ bool CConn::dataRect(const core::Rect& r, int encoding)
 
   ret = CConnection::dataRect(r, encoding);
 
-  if (ret)
+  if (ret) {
     pixelCount += r.area();
+    damageCount++;
+  }
 
   return ret;
 }
@@ -896,34 +1001,58 @@ void CConn::setCursor(int width, int height, const core::Point& hotspot,
 {
   CConnection::setCursor(width, height, hotspot, data);
 
-  desktop->setCursor();
+  if (desktop)
+    desktop->setCursor();
 }
 
 void CConn::setCursorPos(const core::Point& pos)
 {
-  desktop->setCursorPos(pos);
+  if (desktop)
+    desktop->setCursorPos(pos);
 }
 
 void CConn::setLEDState(unsigned int state)
 {
   CConnection::setLEDState(state);
 
-  desktop->setLEDState(state);
+  if (desktop)
+    desktop->setLEDState(state);
 }
 
 void CConn::handleClipboardRequest()
 {
-  desktop->handleClipboardRequest();
+  if (hasAgentClipboard) {
+    sendClipboardData(agentClipboardText.c_str());
+    ensureSocketWriteWatch();
+    return;
+  }
+
+  if (desktop)
+    desktop->handleClipboardRequest();
 }
 
 void CConn::handleClipboardAnnounce(bool available)
 {
-  desktop->handleClipboardAnnounce(available);
+  if (!available) {
+    hasRemoteClipboardData = false;
+    remoteClipboardText.clear();
+  }
+
+  if (desktop) {
+    desktop->handleClipboardAnnounce(available);
+  } else if (available && acceptClipboard) {
+    requestClipboard();
+    ensureSocketWriteWatch();
+  }
 }
 
 void CConn::handleClipboardData(const char* data)
 {
-  desktop->handleClipboardData(data);
+  remoteClipboardText = data ? data : "";
+  hasRemoteClipboardData = true;
+
+  if (desktop)
+    desktop->handleClipboardData(data);
 }
 
 void CConn::handleAudioBegin()
@@ -955,7 +1084,23 @@ void CConn::handleAudioData(const uint8_t* data, size_t length)
 
 void CConn::resizeFramebuffer()
 {
-  desktop->resizeFramebuffer(server.width(), server.height());
+  if (desktop) {
+    desktop->resizeFramebuffer(server.width(), server.height());
+  } else if (!getFramebuffer() ||
+             (getFramebuffer()->width() != server.width()) ||
+             (getFramebuffer()->height() != server.height())) {
+    rfb::PixelFormat pf = getFramebuffer()
+      ? getFramebuffer()->getPF()
+      : rfb::PixelFormat(32, 24, false, true, 255, 255, 255, 0, 8, 16);
+    rfb::ManagedPixelBuffer* fb =
+      new rfb::ManagedPixelBuffer(pf, server.width(), server.height());
+    setFramebuffer(fb);
+  }
+
+  resizeCount++;
+  damageCount++;
+  frameSeq++;
+  lastUpdateMs = steadyNowMs();
 }
 
 void CConn::updateEncoding()
@@ -1061,7 +1206,345 @@ void CConn::handleUpdateTimeout(void *data)
 
   assert(self);
 
-  self->desktop->updateWindow();
+  if (self->desktop)
+    self->desktop->updateWindow();
 
   Fl::repeat_timeout(1.0, handleUpdateTimeout, data);
+}
+
+////////////////////// Agent bridge methods //////////////////////
+
+void CConn::setAgentBridge(AgentBridge* bridge)
+{
+  agentBridge = bridge;
+}
+
+bool CConn::isSessionReady()
+{
+  return sessionInitialized &&
+         (state() == rfb::CConnection::RFBSTATE_NORMAL) &&
+         (getFramebuffer() != nullptr);
+}
+
+void CConn::setAgentPaused(bool paused, const char* reason)
+{
+  if (agentPaused == paused)
+    return;
+
+  agentPaused = paused;
+  agentPauseReason = paused ? (reason ? reason : "operator") : "";
+  if (paused)
+    releaseAgentKeys();
+
+  vlog.info(paused ? _("Agent input paused") : _("Agent input resumed"));
+
+  if (desktop) {
+    desktop->updateCaption();
+    desktop->updateAgentOverlay();
+    if (paused && reason && strcmp(reason, "human_takeover") == 0) {
+      desktop->showNotification(_("Human takeover - agent paused (press shortcut+P to resume)"));
+    } else {
+      desktop->showNotification(paused ? _("Agent input paused")
+                                       : _("Agent input resumed"));
+    }
+  }
+}
+
+bool CConn::isAgentOverlayEnabled() const
+{
+  return (bool)agentOverlay || (bool)agentCollaborate;
+}
+
+void CConn::setAgentOverlayState(const std::string& st,
+                                 const std::string& action,
+                                 const std::string& intent,
+                                 bool hasPoint, int x, int y,
+                                 bool hasEndPoint, int endX, int endY,
+                                 bool triggerPulse,
+                                 uint16_t buttonMask)
+{
+  overlayState.state = st.empty() ? "idle" : st;
+  overlayState.action = action;
+  overlayState.intent = intent;
+  overlayState.hasPoint = hasPoint;
+  overlayState.x = x;
+  overlayState.y = y;
+  overlayState.hasEndPoint = hasEndPoint;
+  overlayState.endX = endX;
+  overlayState.endY = endY;
+  overlayState.buttonMask = buttonMask;
+  if (triggerPulse)
+    overlayState.triggerPulse = true;
+  overlayState.seq++;
+
+  if (desktop)
+    desktop->updateAgentOverlay();
+}
+
+void CConn::clearAgentOverlayState()
+{
+  overlayState = AgentOverlayState();
+  overlayState.seq++;
+
+  if (desktop)
+    desktop->updateAgentOverlay();
+}
+
+void CConn::notifyHumanInput()
+{
+  humanActionCount++;
+  lastHumanInputMs = steadyNowMs();
+
+  if (hasAgentBridge() && agentCollaborate && !agentPaused)
+    setAgentPaused(true, "human_takeover");
+}
+
+void CConn::pushUserMessage(const std::string& msg)
+{
+  if (msg.empty())
+    return;
+
+  while (userMessages.size() >= 32)
+    userMessages.pop_front();
+  userMessages.push_back(msg);
+
+  vlog.info(_("Queued collaborative note for agent (%u bytes)"),
+            (unsigned)msg.size());
+
+  if (desktop)
+    desktop->showNotification(_("Collaborative note queued for agent"));
+}
+
+std::vector<std::string> CConn::drainUserMessages()
+{
+  std::vector<std::string> out;
+  out.reserve(userMessages.size());
+  while (!userMessages.empty()) {
+    out.push_back(userMessages.front());
+    userMessages.pop_front();
+  }
+  return out;
+}
+
+void CConn::refreshAgentOverlayDisplay()
+{
+  if (desktop)
+    desktop->updateAgentOverlay();
+}
+
+bool CConn::captureFramebuffer(bool rgba32,
+                                 int* outWidth, int* outHeight,
+                                 int* outStrideBytes,
+                                 int* outFbBpp, int* outFbDepth,
+                                 std::vector<uint8_t>* outPixels)
+{
+  if (!isSessionReady() || !outPixels)
+    return false;
+
+  // Ensure DecodeManager worker threads have committed all active rectangles
+  // before reading the framebuffer on the main thread.
+  flushDecoder();
+
+  rfb::ModifiablePixelBuffer* fb = getFramebuffer();
+  int w = fb->width();
+  int h = fb->height();
+  if ((w <= 0) || (h <= 0))
+    return false;
+
+  int stridePixels = 0;
+  const uint8_t* src = fb->getBuffer(fb->getRect(), &stridePixels);
+  const rfb::PixelFormat& srcPF = fb->getPF();
+
+  if (rgba32) {
+    static const rfb::PixelFormat rgbaPF(32, 24, false, true,
+                                         255, 255, 255, 0, 8, 16);
+    size_t byteCount = (size_t)w * (size_t)h * 4;
+    outPixels->resize(byteCount);
+    rgbaPF.bufferFromBuffer(outPixels->data(), srcPF, src, w, h, w, stridePixels);
+    for (size_t i = 3; i < byteCount; i += 4)
+      (*outPixels)[i] = 0xff;
+    if (outStrideBytes)
+      *outStrideBytes = w * 4;
+  } else {
+    size_t byteCount = (size_t)w * (size_t)h * 3;
+    outPixels->resize(byteCount);
+    srcPF.rgbFromBuffer(outPixels->data(), src, w, stridePixels, h);
+    if (outStrideBytes)
+      *outStrideBytes = w * 3;
+  }
+
+  if (outWidth)
+    *outWidth = w;
+  if (outHeight)
+    *outHeight = h;
+  if (outFbBpp)
+    *outFbBpp = srcPF.bpp;
+  if (outFbDepth)
+    *outFbDepth = srcPF.depth;
+
+  return true;
+}
+
+void CConn::injectPointerEvent(int x, int y, uint16_t buttonMask)
+{
+  bool pressed = (buttonMask != 0) && (buttonMask != lastAgentButtonMask);
+  lastAgentButtonMask = buttonMask;
+
+  sendPointerEvent(core::Point(x, y), buttonMask);
+  ensureSocketWriteWatch();
+
+  if (desktop && isAgentOverlayEnabled()) {
+    overlayState.hasPoint = true;
+    overlayState.x = x;
+    overlayState.y = y;
+    overlayState.buttonMask = buttonMask;
+    if (pressed) {
+      if (overlayState.state == "idle")
+        overlayState.state = "acting";
+      if (overlayState.action.empty()) {
+        if (buttonMask & 4)
+          overlayState.action = "right_click";
+        else if (buttonMask & 2)
+          overlayState.action = "middle_click";
+        else if (buttonMask & 0x78)
+          overlayState.action = "scroll";
+        else
+          overlayState.action = "click";
+      }
+      overlayState.triggerPulse = true;
+    }
+    overlayState.seq++;
+    desktop->updateAgentOverlay();
+  }
+}
+
+void CConn::injectKeyEvent(uint32_t keysym, uint32_t keycode, bool down)
+{
+  if (down) {
+    int id;
+    std::map<uint32_t, int>::const_iterator it = agentDownKeys.find(keysym);
+    if (it != agentDownKeys.end()) {
+      id = it->second;
+    } else {
+      if (nextAgentKeyCode >= 0x7ffffff0)
+        nextAgentKeyCode = 0x40000000;
+      id = nextAgentKeyCode++;
+      agentDownKeys[keysym] = id;
+    }
+    sendKeyPress(id, keycode, keysym);
+  } else {
+    std::map<uint32_t, int>::iterator it = agentDownKeys.find(keysym);
+    if (it != agentDownKeys.end()) {
+      int id = it->second;
+      agentDownKeys.erase(it);
+      sendKeyRelease(id);
+    } else {
+      writer()->writeKeyEvent(keysym, keycode, false);
+    }
+  }
+  ensureSocketWriteWatch();
+
+  if (down && desktop && isAgentOverlayEnabled() &&
+      overlayState.state == "idle") {
+    overlayState.state = "acting";
+    overlayState.action = "key";
+    overlayState.seq++;
+    desktop->updateAgentOverlay();
+  }
+}
+
+size_t CConn::injectText(const std::string& utf8Text)
+{
+  size_t sent = 0;
+  const char* ptr = utf8Text.c_str();
+  size_t rem = utf8Text.size();
+
+  while (rem > 0) {
+    unsigned ucs = 0;
+    size_t consumed = core::utf8ToUCS4(ptr, rem, &ucs);
+    if (consumed == 0)
+      break;
+    ptr += consumed;
+    rem -= consumed;
+
+    uint32_t keysym = 0;
+    if (ucs == '\r') {
+      if ((rem > 0) && (*ptr == '\n')) {
+        ptr++;
+        rem--;
+      }
+      keysym = XK_Return;
+    } else if (ucs == '\n') {
+      keysym = XK_Return;
+    } else if (ucs == '\t') {
+      keysym = XK_Tab;
+    } else if (ucs == '\b') {
+      keysym = XK_BackSpace;
+    } else if (ucs == 0x1b) {
+      keysym = XK_Escape;
+    } else {
+      keysym = ucs2keysym(ucs);
+    }
+
+    if (keysym != 0) {
+      writer()->writeKeyEvent(keysym, 0, true);
+      writer()->writeKeyEvent(keysym, 0, false);
+      sent++;
+    }
+  }
+
+  ensureSocketWriteWatch();
+
+  if (!utf8Text.empty() && desktop && isAgentOverlayEnabled() &&
+      overlayState.state == "idle") {
+    overlayState.state = "acting";
+    overlayState.action = "type";
+    overlayState.seq++;
+    desktop->updateAgentOverlay();
+  }
+
+  return sent;
+}
+
+void CConn::injectClipboard(const std::string& utf8Text)
+{
+  agentClipboardText = core::convertLF(utf8Text.c_str(), utf8Text.size());
+  hasAgentClipboard = true;
+  announceClipboard(true);
+  ensureSocketWriteWatch();
+}
+
+bool CConn::getRemoteClipboard(std::string* outText) const
+{
+  if (!hasRemoteClipboardData)
+    return false;
+  if (outText)
+    *outText = remoteClipboardText;
+  return true;
+}
+
+void CConn::releaseAgentKeys()
+{
+  if (agentDownKeys.empty())
+    return;
+
+  while (!agentDownKeys.empty()) {
+    std::map<uint32_t, int>::iterator it = agentDownKeys.begin();
+    int id = it->second;
+    agentDownKeys.erase(it);
+    try {
+      if (isConnected() && writer())
+        sendKeyRelease(id);
+    } catch (std::exception& e) {
+      vlog.error(_("Failed releasing synthetic key: %s"), e.what());
+      break;
+    }
+  }
+  ensureSocketWriteWatch();
+}
+
+void CConn::clearAgentClipboardOwnership()
+{
+  hasAgentClipboard = false;
+  agentClipboardText.clear();
 }
