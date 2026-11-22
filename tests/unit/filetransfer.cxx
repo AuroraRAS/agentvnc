@@ -1146,6 +1146,20 @@ TEST(FileTransferUnit, Tight2PersistentZlibStreamAndFlags)
   EXPECT_TRUE(finReader.readMsg());
   EXPECT_EQ(ftHandler.lastEntries[0].name, "beta.txt");
 
+  auto& ft = conn.fileTransferClient();
+  int listCount = ftHandler.listCount;
+  ft.listDirectory("/slow");
+  ft.abortPendingOp();
+  EXPECT_TRUE(ft.isBusy());
+  EXPECT_THROW(ft.listDirectory("/next"), std::logic_error);
+  ft.onTight2FileListReply({});
+  EXPECT_EQ(ftHandler.listCount, listCount);
+  EXPECT_FALSE(ft.isBusy());
+
+  ft.listDirectory("/next");
+  ft.onTight2FileListReply({});
+  EXPECT_EQ(ftHandler.listCount, listCount + 1);
+
   // Wire verification of UPLOAD_START_REQUEST overwrite flag when offset > 0 vs == 0,
   // plus cancelDownload() and cancelUpload() handle-release wire messages
   clientOut.clear();
