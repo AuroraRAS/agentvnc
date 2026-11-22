@@ -978,6 +978,17 @@ void AgentBridge::handleRequest(const InboundRequest& req)
       return;
     }
 
+    if ((hasX && (x < INT_MIN || x > INT_MAX || y < INT_MIN || y > INT_MAX)) ||
+        (hasEndX && (endX < INT_MIN || endX > INT_MAX ||
+                     endY < INT_MIN || endY > INT_MAX))) {
+      enqueueResponse(req.clientId,
+                      buildJsonResponse(false, cmd, idVal,
+                                        buildErrorExtra("invalid_args",
+                                                        "Overlay coordinates are out of range")),
+                      std::vector<uint8_t>());
+      return;
+    }
+
     bool pulse = hasX && (state == "acting");
     if (root.get("pulse") && !root.getBool("pulse", &pulse)) {
       enqueueResponse(req.clientId,
