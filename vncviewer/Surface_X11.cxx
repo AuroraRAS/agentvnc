@@ -44,9 +44,11 @@ void Surface::clear(unsigned char r, unsigned char g, unsigned char b, unsigned 
 }
 
 void Surface::draw(int src_x, int src_y, int dst_x, int dst_y,
-                   int dst_w, int dst_h)
+                   int dst_w, int dst_h, int scale)
 {
   Picture winPict;
+
+  setScale(scale);
 
   winPict = XRenderCreatePicture(fl_display, fl_window, visFormat, 0, nullptr);
   XRenderComposite(fl_display, PictOpSrc, picture, None, winPict,
@@ -55,8 +57,10 @@ void Surface::draw(int src_x, int src_y, int dst_x, int dst_y,
 }
 
 void Surface::draw(Surface* dst, int src_x, int src_y,
-                   int dst_x, int dst_y, int dst_w, int dst_h)
+                   int dst_x, int dst_y, int dst_w, int dst_h, int scale)
 {
+  setScale(scale);
+
   XRenderComposite(fl_display, PictOpSrc, picture, None, dst->picture,
                    src_x, src_y, 0, 0, dst_x, dst_y, dst_w, dst_h);
 }
@@ -93,6 +97,8 @@ void Surface::blend(int src_x, int src_y, int dst_x, int dst_y,
 {
   Picture winPict, alpha;
 
+  setScale(1);
+
   winPict = XRenderCreatePicture(fl_display, fl_window, visFormat, 0, nullptr);
   alpha = alpha_mask(a);
   XRenderComposite(fl_display, PictOpOver, picture, alpha, winPict,
@@ -108,6 +114,8 @@ void Surface::blend(Surface* dst, int src_x, int src_y,
 {
   Picture alpha;
 
+  setScale(1);
+
   alpha = alpha_mask(a);
   XRenderComposite(fl_display, PictOpOver, picture, alpha, dst->picture,
                    src_x, src_y, 0, 0, dst_x, dst_y, dst_w, dst_h);
@@ -120,6 +128,8 @@ void Surface::alloc()
 {
   XRenderPictFormat templ;
   XRenderPictFormat* format;
+
+  currentScale = 1;
 
   pixmap = XCreatePixmap(fl_display, XDefaultRootWindow(fl_display),
                          width(), height(), 32);
@@ -164,6 +174,25 @@ void Surface::dealloc()
 {
   XRenderFreePicture(fl_display, picture);
   XFreePixmap(fl_display, pixmap);
+}
+
+void Surface::setScale(int scale)
+{
+  assert(scale >= 1);
+
+  if (scale == currentScale)
+    return;
+
+  XTransform xform = {{
+    { XDoubleToFixed(1.0), XDoubleToFixed(0.0), XDoubleToFixed(0.0) },
+    { XDoubleToFixed(0.0), XDoubleToFixed(1.0), XDoubleToFixed(0.0) },
+    { XDoubleToFixed(0.0), XDoubleToFixed(0.0), XDoubleToFixed((double)scale) }
+  }};
+
+  XRenderSetPictureTransform(fl_display, picture, &xform);
+  XRenderSetPictureFilter(fl_display, picture, FilterNearest, nullptr, 0);
+
+  currentScale = scale;
 }
 
 void Surface::update(const Fl_RGB_Image* image)

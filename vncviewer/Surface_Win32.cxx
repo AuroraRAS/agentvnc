@@ -27,6 +27,7 @@
 
 #include <core/Exception.h>
 
+#include "Scale.h"
 #include "Surface.h"
 
 void Surface::clear(unsigned char r, unsigned char g, unsigned char b, unsigned char a)
@@ -51,33 +52,60 @@ void Surface::clear(unsigned char r, unsigned char g, unsigned char b, unsigned 
 }
 
 void Surface::draw(int src_x, int src_y, int dst_x, int dst_y,
-                   int dst_w, int dst_h)
+                   int dst_w, int dst_h, int scale)
 {
   HDC dc;
+
+  assert(scale >= 1);
 
   dc = CreateCompatibleDC(fl_gc);
   if (!dc)
     throw core::win32_error("CreateCompatibleDC", GetLastError());
 
-  if (!SelectObject(dc, bitmap))
-    throw core::win32_error("SelectObject", GetLastError());
+  if (!SelectObject(dc, bitmap)) {
+    DWORD err = GetLastError();
+    DeleteDC(dc);
+    throw core::win32_error("SelectObject", err);
+  }
 
-  if (!BitBlt(fl_gc, dst_x, dst_y, dst_w, dst_h,
-              dc, src_x, src_y, SRCCOPY)) {
-    // If the desktop we're rendering to is inactive (like when the screen
-    // is locked or the UAC is active), then GDI calls will randomly fail.
-    // This is completely undocumented so we have no idea how best to deal
-    // with it. For now, we've only seen this error and for this function
-    // so only ignore this combination.
-    if (GetLastError() != ERROR_INVALID_HANDLE)
-      throw core::win32_error("BitBlt", GetLastError());
+  if (scale == 1) {
+    if (!BitBlt(fl_gc, dst_x, dst_y, dst_w, dst_h,
+                dc, src_x, src_y, SRCCOPY)) {
+      // If the desktop we're rendering to is inactive (like when the screen
+      // is locked or the UAC is active), then GDI calls will randomly fail.
+      // This is completely undocumented so we have no idea how best to deal
+      // with it. For now, we've only seen this error and for this function
+      // so only ignore this combination.
+      DWORD err = GetLastError();
+      if (err != ERROR_INVALID_HANDLE) {
+        DeleteDC(dc);
+        throw core::win32_error("BitBlt", err);
+      }
+    }
+  } else {
+    ScaledBlitParams p = computeScaledBlitParams(src_x, src_y,
+                                                 dst_x, dst_y,
+                                                 dst_w, dst_h, scale);
+    int saved = SaveDC(fl_gc);
+    IntersectClipRect(fl_gc, dst_x, dst_y, dst_x + dst_w, dst_y + dst_h);
+    SetStretchBltMode(fl_gc, COLORONCOLOR);
+    if (!StretchBlt(fl_gc, p.dstX, p.dstY, p.dstW, p.dstH,
+                    dc, p.srcX, p.srcY, p.srcW, p.srcH, SRCCOPY)) {
+      DWORD err = GetLastError();
+      if (err != ERROR_INVALID_HANDLE) {
+        RestoreDC(fl_gc, saved);
+        DeleteDC(dc);
+        throw core::win32_error("StretchBlt", err);
+      }
+    }
+    RestoreDC(fl_gc, saved);
   }
 
   DeleteDC(dc);
 }
 
 void Surface::draw(Surface* dst, int src_x, int src_y,
-                   int dst_x, int dst_y, int dst_w, int dst_h)
+                   int dst_x, int dst_y, int dst_w, int dst_h, int scale)
 {
   HDC origdc, dstdc;
 
@@ -90,7 +118,7 @@ void Surface::draw(Surface* dst, int src_x, int src_y,
 
   origdc = fl_gc;
   fl_gc = dstdc;
-  draw(src_x, src_y, dst_x, dst_y, dst_w, dst_h);
+  draw(src_x, src_y, dst_x, dst_y, dst_w, dst_h, scale);
   fl_gc = origdc;
 
   DeleteDC(dstdc);

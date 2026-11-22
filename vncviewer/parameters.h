@@ -63,6 +63,7 @@ extern MonitorIndicesParameter fullScreenSelectedMonitors;
 extern core::StringParameter desktopSize;
 extern core::StringParameter geometry;
 extern core::BoolParameter remoteResize;
+extern core::IntParameter scaleFactor;
 
 extern core::BoolParameter listenMode;
 

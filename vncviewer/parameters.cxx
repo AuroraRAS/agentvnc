@@ -51,6 +51,7 @@
 #include <assert.h>
 
 #include "MonitorIndicesParameter.h"
+#include "Scale.h"
 
 static core::LogWriter vlog("Parameters");
 
@@ -192,6 +193,11 @@ core::BoolParameter
                  "size of the local client window changes"),
                true);
 
+core::IntParameter
+  scaleFactor("ScaleFactor",
+              _("Integer scaling factor for the remote screen"),
+              1, MIN_SCALE_FACTOR, MAX_SCALE_FACTOR);
+
 core::BoolParameter
   viewOnly("ViewOnly",
            _("Don't send any mouse or keyboard events to the server"),
@@ -310,6 +316,7 @@ static core::Parameter* parameterArray[] = {
   &fullScreen,
   &fullScreenMode,
   &fullScreenSelectedMonitors,
+  &scaleFactor,
   /* Input */
   &viewOnly,
   &emulateMiddleButton,

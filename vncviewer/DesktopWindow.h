@@ -106,6 +106,8 @@ private:
   bool hasFocus();
   static void checkFocus(void *data);
 
+  bool isMaximized();
+
   void grabPointer();
   void ungrabPointer();
 

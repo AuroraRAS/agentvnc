@@ -30,6 +30,7 @@
 #include <FL/Fl_Window.H>
 #include <FL/x.H>
 
+#include "Scale.h"
 #include "Surface.h"
 
 static CGColorSpaceRef srgb = CGColorSpaceCreateWithName(kCGColorSpaceSRGB);
@@ -70,31 +71,70 @@ static void render(CGContextRef gc, CGColorSpaceRef lut,
                    const unsigned char* data,
                    CGBlendMode mode, CGFloat alpha,
                    int src_x, int src_y, int src_w, int src_h,
-                   int x, int y, int w, int h)
+                   int x, int y, int w, int h, int scale = 1)
 {
   CGRect rect;
   CGImageRef image, subimage;
 
+  assert(scale >= 1);
+
   image = create_image(lut, data, src_w, src_h, mode == kCGBlendModeCopy);
 
-  rect.origin.x = src_x;
-  rect.origin.y = src_y;
-  rect.size.width = w;
-  rect.size.height = h;
+  if (scale == 1) {
+    rect.origin.x = src_x;
+    rect.origin.y = src_y;
+    rect.size.width = w;
+    rect.size.height = h;
+
+    subimage = CGImageCreateWithImageInRect(image, rect);
+    if (!subimage) {
+      CGImageRelease(image);
+      throw std::runtime_error("CGImageCreateImageWithImageInRect");
+    }
+
+    CGContextSaveGState(gc);
+
+    CGContextSetBlendMode(gc, mode);
+    CGContextSetAlpha(gc, alpha);
+
+    rect.origin.x = x;
+    rect.origin.y = y;
+    rect.size.width = w;
+    rect.size.height = h;
+
+    CGContextDrawImage(gc, rect, subimage);
+
+    CGContextRestoreGState(gc);
+
+    CGImageRelease(subimage);
+    CGImageRelease(image);
+    return;
+  }
+
+  ScaledBlitParams p = computeScaledBlitParams(src_x, src_y, x, 0, w, h, scale);
+
+  rect.origin.x = p.srcX;
+  rect.origin.y = p.srcY;
+  rect.size.width = p.srcW;
+  rect.size.height = p.srcH;
 
   subimage = CGImageCreateWithImageInRect(image, rect);
-  if (!subimage)
+  if (!subimage) {
+    CGImageRelease(image);
     throw std::runtime_error("CGImageCreateImageWithImageInRect");
+  }
 
   CGContextSaveGState(gc);
 
   CGContextSetBlendMode(gc, mode);
   CGContextSetAlpha(gc, alpha);
+  CGContextClipToRect(gc, CGRectMake(x, y, w, h));
+  CGContextSetInterpolationQuality(gc, kCGInterpolationNone);
 
-  rect.origin.x = x;
-  rect.origin.y = y;
-  rect.size.width = w;
-  rect.size.height = h;
+  rect.origin.x = p.dstX;
+  rect.origin.y = y - p.bottomOverhang;
+  rect.size.width = p.dstW;
+  rect.size.height = p.dstH;
 
   CGContextDrawImage(gc, rect, subimage);
 
@@ -137,7 +177,7 @@ void Surface::clear(unsigned char r, unsigned char g, unsigned char b, unsigned 
 }
 
 void Surface::draw(int src_x, int src_y, int dst_x, int dst_y,
-                   int dst_w, int dst_h)
+                   int dst_w, int dst_h, int scale)
 {
   CGColorSpaceRef lut;
 
@@ -154,13 +194,13 @@ void Surface::draw(int src_x, int src_y, int dst_x, int dst_y,
   assert(lut);
 
   render(fl_gc, lut, data, kCGBlendModeCopy, 1.0,
-         src_x, src_y, width(), height(), dst_x, dst_y, dst_w, dst_h);
+         src_x, src_y, width(), height(), dst_x, dst_y, dst_w, dst_h, scale);
 
   CGContextRestoreGState(fl_gc);
 }
 
 void Surface::draw(Surface* dst, int src_x, int src_y,
-                   int dst_x, int dst_y, int dst_w, int dst_h)
+                   int dst_x, int dst_y, int dst_w, int dst_h, int scale)
 {
   CGContextRef bitmap;
 
@@ -170,7 +210,7 @@ void Surface::draw(Surface* dst, int src_x, int src_y,
   dst_y = dst->height() - (dst_y + dst_h);
 
   render(bitmap, srgb, data, kCGBlendModeCopy, 1.0,
-         src_x, src_y, width(), height(), dst_x, dst_y, dst_w, dst_h);
+         src_x, src_y, width(), height(), dst_x, dst_y, dst_w, dst_h, scale);
 
   CGContextRelease(bitmap);
 }

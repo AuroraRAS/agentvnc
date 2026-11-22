@@ -306,6 +306,16 @@ Dynamically resize the remote desktop size as the size of the local client
 window changes. Note that this may not work with all VNC servers.
 .
 .TP
+.B \-ScaleFactor \fIfactor\fP
+Integer scaling factor for the remote screen, from 1 to 8. Values larger than
+1 scale up the remote framebuffer using crisp nearest-neighbor pixel
+duplication, which is useful on HiDPI displays. When \fB-RemoteResize\fP is
+enabled, the remote desktop size is computed by dividing the viewer window
+dimensions by the scaling factor. Note that if \fB-DesktopSize\fP is also
+specified, it still specifies the unscaled remote framebuffer dimensions.
+Default is 1.
+.
+.TP
 .B \-SecurityTypes \fIsec-types\fP
 Specify which security schemes to attempt to use when authenticating with
 the server.  Valid values are a comma separated list of \fBNone\fP,

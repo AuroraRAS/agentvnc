@@ -41,6 +41,7 @@
 
 #include "MonitorIndicesParameter.h"
 #include "OptionsDialog.h"
+#include "Scale.h"
 #include "ShortcutHandler.h"
 #include "parameters.h"
 
@@ -359,6 +360,8 @@ void OptionsDialog::loadOptions(void)
 
   handleFullScreenMode(selectedMonitorsButton, this);
 
+  scaleFactorChoice->value((int)scaleFactor - MIN_SCALE_FACTOR);
+
   /* Misc. */
   sharedCheckbox->value(shared);
   reconnectCheckbox->value(reconnectOnError);
@@ -516,6 +519,8 @@ void OptionsDialog::storeOptions(void)
   }
 
   fullScreenSelectedMonitors.setMonitors(monitorArrangement->value());
+
+  scaleFactor.setParam(scaleFactorChoice->value() + MIN_SCALE_FACTOR);
 
   /* Misc. */
   shared.setParam(sharedCheckbox->value());
@@ -1176,8 +1181,8 @@ void OptionsDialog::createDisplayPage(int tx, int ty, int tw, int th)
 
     monitorArrangement = new Fl_Monitor_Arrangement(
                               tx + INDENT, ty,
-                              width - INDENT, 150);
-    ty += 150 + INNER_MARGIN;
+                              width - INDENT, 110);
+    ty += 110 + INNER_MARGIN;
 
     bool supportsMultihead;
 
@@ -1235,6 +1240,41 @@ void OptionsDialog::createDisplayPage(int tx, int ty, int tw, int th)
   tx = orig_tx;
   ty += INNER_MARGIN;
   width = tw - OUTER_MARGIN * 2;
+
+  /* Scaling */
+  ty += GROUP_LABEL_OFFSET;
+  scalingGroup = new Fl_Group(tx, ty, width, 0, _("Scaling"));
+  scalingGroup->labelfont(FL_BOLD);
+  scalingGroup->box(FL_FLAT_BOX);
+  scalingGroup->align(FL_ALIGN_LEFT | FL_ALIGN_TOP);
+
+  {
+    tx += INDENT;
+    ty += TIGHT_MARGIN;
+
+    scaleFactorChoice = new Fl_Choice(LBLLEFT(tx, ty, 150, CHOICE_HEIGHT,
+                                              _("Scale factor")));
+
+    for (int factor = MIN_SCALE_FACTOR; factor <= MAX_SCALE_FACTOR; factor++) {
+      std::string label = core::format("%dx", factor);
+      fltk_menu_add(scaleFactorChoice, label.c_str(), 0, nullptr, nullptr, 0);
+    }
+
+    fltk_adjust_choice(scaleFactorChoice);
+
+    ty += CHOICE_HEIGHT + TIGHT_MARGIN;
+  }
+  ty -= TIGHT_MARGIN;
+
+  scalingGroup->end();
+  /* Needed for resize to work sanely */
+  scalingGroup->resizable(nullptr);
+  scalingGroup->size(scalingGroup->w(),
+                     ty - scalingGroup->y());
+
+  /* Back to normal */
+  tx = orig_tx;
+  ty += INNER_MARGIN;
 
   group->end();
 }

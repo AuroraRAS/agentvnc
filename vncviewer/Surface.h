@@ -42,9 +42,9 @@ public:
   void clear(unsigned char r, unsigned char g, unsigned char b, unsigned char a=255);
 
   void draw(int src_x, int src_y, int dst_x, int dst_y,
-            int dst_w, int dst_h);
+            int dst_w, int dst_h, int scale = 1);
   void draw(Surface* dst, int src_x, int src_y, int dst_x, int dst_y,
-            int dst_w, int dst_h);
+            int dst_w, int dst_h, int scale = 1);
 
   void blend(int src_x, int src_y, int dst_x, int dst_y,
              int dst_w, int dst_h, int a=255);
@@ -55,6 +55,9 @@ protected:
   void alloc();
   void dealloc();
   void update(const Fl_RGB_Image* image);
+#if !defined(WIN32) && !defined(__APPLE__)
+  void setScale(int scale);
+#endif
 
 protected:
   int w, h;
@@ -68,6 +71,7 @@ protected:
   Pixmap pixmap;
   Picture picture;
   XRenderPictFormat* visFormat;
+  int currentScale;
 #endif
 };
 
