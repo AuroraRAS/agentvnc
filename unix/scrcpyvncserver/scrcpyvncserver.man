@@ -1,0 +1,33 @@
+.TH SCRCPYVNC 1 "" "TigerVNC" "TigerVNC Manual"
+.SH NAME
+scrcpyvncserver \- TigerVNC server bridging scrcpy H.264 streams with zero transcoding
+.SH SYNOPSIS
+.B scrcpyvncserver
+.RI [ options ]
+.br
+.B scrcpyvncserver -version
+.SH DESCRIPTION
+.B scrcpyvncserver
+bridges an Android device running
+.B scrcpy-server
+to VNC viewers using the RFB Open H.264 encoding (encoding 50) without
+host-side decoding, color-space conversion, or re-encoding.
+.PP
+It connects directly to the local ADB daemon (127.0.0.1:5037 by default)
+via \fBhost:transport:<serial>\fP and \fBlocalabstract:scrcpy\fP with
+\fBTCP_NODELAY\fP enabled, strips scrcpy's 12-byte packet header, and uses
+scatter-gather I/O (\fBwritev\fP) to prepend RFB Open H.264 headers directly
+to the raw Annex-B NAL payload.
+.PP
+Connecting viewers must support Open H.264 encoding (50), ContinuousUpdates
+(\-313), and DesktopSize (\-223) or ExtendedDesktopSize (\-308). When using
+\fBvncviewer\fP(1), pass \fB\-AutoSelect=0 \-PreferredEncoding=H.264\fP
+to prevent falling back to Tight encoding.
+.SH OPTIONS
+Parameters can be specified as \fB\-\fIParam\fR, \fB\-\fIParam\fP=0\fR,
+or \fB\-\fIParam\fP=\fIvalue\fR. Run \fBscrcpyvncserver \-h\fP for the full
+parameter list.
+.SH SEE ALSO
+.BR vncviewer (1),
+.BR x0vncserver (1),
+.BR w0vncserver (1)
