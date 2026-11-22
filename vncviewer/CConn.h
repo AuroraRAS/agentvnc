@@ -34,6 +34,9 @@
 #include <rfb/CConnection.h>
 
 namespace network { class Socket; }
+#ifndef WIN32
+struct pollfd;
+#endif
 
 class AgentBridge;
 class AudioOutput;
@@ -62,6 +65,10 @@ public:
   std::string ftpServerUrl() const;
   void flushOutput();
   bool isOutputCongested() const;
+  void collectFtpPollFds(std::vector<struct pollfd>* outFds,
+                         int* nextTimeoutMs) const;
+  void handleFtpPollEvents(const std::vector<struct pollfd>& pfds,
+                           size_t startIdx);
 #endif
 
   unsigned getUpdateCount();

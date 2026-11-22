@@ -33,6 +33,8 @@
 #include <unistd.h>
 #include <sys/stat.h>
 
+#include <vector>
+
 #ifndef WIN32
 #include <poll.h>
 #endif
@@ -226,32 +228,37 @@ static void mainloop(const char* vncserver, network::Socket* sock)
 
       if (headless) {
 #ifndef WIN32
-        struct pollfd fds[2];
-        nfds_t nfds = 0;
+        std::vector<struct pollfd> fds;
         int rfbIdx = -1;
         int wakeIdx = -1;
 
         if (cc->isSocketWatched() && (cc->getSocketFd() >= 0)) {
-          rfbIdx = (int)nfds;
-          fds[nfds].fd = cc->getSocketFd();
-          fds[nfds].events = POLLIN | (cc->wantsSocketWrite() ? POLLOUT : 0);
-          fds[nfds].revents = 0;
-          nfds++;
+          rfbIdx = (int)fds.size();
+          struct pollfd pfd;
+          pfd.fd = cc->getSocketFd();
+          pfd.events = POLLIN | (cc->wantsSocketWrite() ? POLLOUT : 0);
+          pfd.revents = 0;
+          fds.push_back(pfd);
         }
         if (agentBridge && (agentBridge->getWakeFd() >= 0)) {
-          wakeIdx = (int)nfds;
-          fds[nfds].fd = agentBridge->getWakeFd();
-          fds[nfds].events = POLLIN;
-          fds[nfds].revents = 0;
-          nfds++;
+          wakeIdx = (int)fds.size();
+          struct pollfd pfd;
+          pfd.fd = agentBridge->getWakeFd();
+          pfd.events = POLLIN;
+          pfd.revents = 0;
+          fds.push_back(pfd);
         }
 
-        if ((nfds == 0) && (next_timer < 0)) {
+        size_t ftpStartIdx = fds.size();
+        cc->collectFtpPollFds(&fds, &next_timer);
+
+        if (fds.empty() && (next_timer < 0)) {
           vlog.error(_("No active descriptors or timers in headless loop. Exiting."));
           break;
         }
 
-        int pollRet = poll(fds, nfds, next_timer);
+        int pollRet = poll(fds.empty() ? nullptr : fds.data(),
+                           (nfds_t)fds.size(), next_timer);
         if (pollRet < 0) {
           if (errno == EINTR)
             continue;
@@ -265,6 +272,8 @@ static void mainloop(const char* vncserver, network::Socket* sock)
 
         if ((rfbIdx >= 0) && (fds[rfbIdx].revents != 0))
           cc->onSocketReady();
+
+        cc->handleFtpPollEvents(fds, ftpStartIdx);
 #else
         vlog.error(_("Headless mode is not supported on Windows."));
         exit(-1);

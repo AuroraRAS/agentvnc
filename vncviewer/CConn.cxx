@@ -60,7 +60,11 @@
 #endif
 
 #include <FL/Fl.H>
+#include <algorithm>
 #include <map>
+#ifndef WIN32
+#include <poll.h>
+#endif
 
 #include <FL/fl_ask.H>
 
@@ -91,39 +95,140 @@
 #ifndef WIN32
 namespace {
 
-class FltkFtpEventLoop : public FtpEventLoop {
+class ViewerFtpEventLoop : public FtpEventLoop {
 public:
   void setFdWatch(int fd, bool read, bool write,
                   FdCallback cb, void* data) override
   {
-    Fl::remove_fd(fd, FL_READ | FL_WRITE | FL_EXCEPT);
+    if (!::headless)
+      Fl::remove_fd(fd, FL_READ | FL_WRITE | FL_EXCEPT);
+
+    if (!read && !write) {
+      watches_.erase(fd);
+      return;
+    }
+
     WatchEntry& e = watches_[fd];
     e.read = read;
     e.write = write;
     e.cb = cb;
     e.data = data;
 
-    int when = (read ? FL_READ : 0) | (write ? FL_WRITE : 0);
-    if (when != 0)
-      Fl::add_fd(fd, when, &FltkFtpEventLoop::fdTrampoline, this);
-    else
-      watches_.erase(fd);
+    if (!::headless) {
+      int when = (read ? FL_READ : 0) | (write ? FL_WRITE : 0);
+      Fl::add_fd(fd, when, &ViewerFtpEventLoop::fdTrampoline, this);
+    }
   }
 
   void removeFd(int fd) override
   {
-    Fl::remove_fd(fd, FL_READ | FL_WRITE | FL_EXCEPT);
+    if (!::headless)
+      Fl::remove_fd(fd, FL_READ | FL_WRITE | FL_EXCEPT);
     watches_.erase(fd);
   }
 
   void addTimer(int delayMs, TimerCallback cb, void* data) override
   {
-    Fl::add_timeout(delayMs / 1000.0, cb, data);
+    if (!::headless) {
+      Fl::add_timeout(delayMs / 1000.0, cb, data);
+      return;
+    }
+    removeTimer(cb, data);
+    TimerEntry te;
+    te.due = std::chrono::steady_clock::now() +
+             std::chrono::milliseconds(delayMs);
+    te.cb = cb;
+    te.data = data;
+    timers_.push_back(te);
   }
 
   void removeTimer(TimerCallback cb, void* data) override
   {
-    Fl::remove_timeout(cb, data);
+    if (!::headless) {
+      Fl::remove_timeout(cb, data);
+      return;
+    }
+    for (size_t i = 0; i < timers_.size(); ) {
+      if (timers_[i].cb == cb && timers_[i].data == data)
+        timers_.erase(timers_.begin() + i);
+      else
+        i++;
+    }
+  }
+
+  void collectPollFds(std::vector<struct pollfd>* outFds,
+                      int* nextTimeoutMs) const
+  {
+    if (outFds != nullptr) {
+      for (std::map<int, WatchEntry>::const_iterator it = watches_.begin();
+           it != watches_.end(); ++it) {
+        short ev = 0;
+        if (it->second.read)
+          ev |= POLLIN;
+        if (it->second.write)
+          ev |= POLLOUT;
+        if (ev != 0) {
+          struct pollfd pfd;
+          pfd.fd = it->first;
+          pfd.events = ev;
+          pfd.revents = 0;
+          outFds->push_back(pfd);
+        }
+      }
+    }
+
+    if (nextTimeoutMs != nullptr && !timers_.empty()) {
+      std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+      for (size_t i = 0; i < timers_.size(); i++) {
+        int64_t rem = std::chrono::duration_cast<std::chrono::milliseconds>(
+          timers_[i].due - now).count();
+        if (rem < 0)
+          rem = 0;
+        if (*nextTimeoutMs < 0 || rem < *nextTimeoutMs)
+          *nextTimeoutMs = static_cast<int>(rem);
+      }
+    }
+  }
+
+  void handlePollEvents(const std::vector<struct pollfd>& pfds,
+                        size_t startIdx)
+  {
+    for (size_t i = startIdx; i < pfds.size(); i++) {
+      short rev = pfds[i].revents;
+      if (rev == 0)
+        continue;
+      int fd = pfds[i].fd;
+      std::map<int, WatchEntry>::iterator it = watches_.find(fd);
+      if (it == watches_.end())
+        continue;
+      WatchEntry entry = it->second;
+      if (entry.cb != nullptr) {
+        bool readable = entry.read &&
+                        ((rev & (POLLIN | POLLHUP | POLLERR)) != 0);
+        bool writable = entry.write &&
+                        ((rev & (POLLOUT | POLLHUP | POLLERR)) != 0);
+        entry.cb(fd, readable, writable, entry.data);
+      }
+    }
+
+    if (!timers_.empty()) {
+      std::chrono::steady_clock::time_point now =
+        std::chrono::steady_clock::now();
+      std::vector<TimerEntry> due;
+      for (size_t i = 0; i < timers_.size(); ) {
+        if (timers_[i].due <= now) {
+          due.push_back(timers_[i]);
+          timers_.erase(timers_.begin() + i);
+        } else {
+          i++;
+        }
+      }
+      for (size_t i = 0; i < due.size(); i++) {
+        if (due[i].cb != nullptr)
+          due[i].cb(due[i].data);
+      }
+    }
   }
 
 private:
@@ -134,9 +239,15 @@ private:
     void* data;
   };
 
+  struct TimerEntry {
+    std::chrono::steady_clock::time_point due;
+    TimerCallback cb;
+    void* data;
+  };
+
   static void fdTrampoline(FL_SOCKET fd, void* data)
   {
-    FltkFtpEventLoop* self = static_cast<FltkFtpEventLoop*>(data);
+    ViewerFtpEventLoop* self = static_cast<ViewerFtpEventLoop*>(data);
     int ifd = static_cast<int>(fd);
     std::map<int, WatchEntry>::iterator it = self->watches_.find(ifd);
     if (it == self->watches_.end())
@@ -147,6 +258,7 @@ private:
   }
 
   std::map<int, WatchEntry> watches_;
+  std::vector<TimerEntry> timers_;
 };
 
 class CConnFtpBackend : public FtpBackend {
@@ -250,7 +362,7 @@ CConn::CConn()
   else
     fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Unsupported);
 
-  ftpLoop = new FltkFtpEventLoop();
+  ftpLoop = new ViewerFtpEventLoop();
   ftpBackend = new CConnFtpBackend(this);
   ftpServer = new FtpServer(ftpLoop, ftpBackend);
 #endif
@@ -1776,11 +1888,8 @@ void CConn::flushOutput()
     return;
   try {
     sock->outStream().flush();
-    if (sock->outStream().hasBufferedData() && !msgTimer.isStarted()) {
-      int when = FL_READ | FL_WRITE | FL_EXCEPT;
-      Fl::remove_fd(sock->getFd());
-      Fl::add_fd(sock->getFd(), when, socketEvent, this);
-    }
+    if (sock->outStream().hasBufferedData() && !msgTimer.isStarted())
+      ensureSocketWriteWatch();
   } catch (std::exception& e) {
     vlog.error("%s", e.what());
     abort_connection_unexpected(e);
@@ -1794,5 +1903,21 @@ bool CConn::isOutputCongested() const
   rdr::BufferedOutStream* bos =
     dynamic_cast<rdr::BufferedOutStream*>(&sock->outStream());
   return bos != nullptr && bos->bufferedSize() >= 262144;
+}
+
+void CConn::collectFtpPollFds(std::vector<struct pollfd>* outFds,
+                              int* nextTimeoutMs) const
+{
+  if (ftpLoop != nullptr)
+    static_cast<const ViewerFtpEventLoop*>(ftpLoop)->collectPollFds(
+      outFds, nextTimeoutMs);
+}
+
+void CConn::handleFtpPollEvents(const std::vector<struct pollfd>& pfds,
+                                size_t startIdx)
+{
+  if (ftpLoop != nullptr)
+    static_cast<ViewerFtpEventLoop*>(ftpLoop)->handlePollEvents(
+      pfds, startIdx);
 }
 #endif
