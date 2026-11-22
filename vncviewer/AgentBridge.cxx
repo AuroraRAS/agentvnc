@@ -1491,43 +1491,41 @@ void AgentBridge::ioLoop()
 
       if (revents & POLLIN) {
         uint8_t buf[65536];
-        while (true) {
-          ssize_t n = recv(client.fd, buf, sizeof(buf), 0);
-          if (n > 0) {
-            client.readBuf.insert(client.readBuf.end(), buf, buf + (size_t)n);
-          } else if (n == 0) {
-            dropClient = true;
-            break;
-          } else {
-            if (errno == EINTR)
-              continue;
-            if (errno == EAGAIN || errno == EWOULDBLOCK)
+        while (client.pendingRequests < MAX_INFLIGHT_PER_CLIENT) {
+          // Read at most one frame at a time so disabling POLLIN at the
+          // in-flight limit never leaves complete frames in the read buffer.
+          size_t frameSize = 8;
+          uint32_t headerLen = 0;
+          uint32_t payloadLen = 0;
+          if (client.readBuf.size() >= 8) {
+            headerLen = readBE32(client.readBuf.data());
+            payloadLen = readBE32(client.readBuf.data() + 4);
+            if (headerLen == 0 || headerLen > MAX_HEADER_BYTES ||
+                payloadLen > MAX_INBOUND_PAYLOAD_BYTES) {
+              vlog.error("Dropping agent client %llu due to invalid frame lengths (%u, %u)",
+                         (unsigned long long)client.id,
+                         (unsigned)headerLen, (unsigned)payloadLen);
+              dropClient = true;
               break;
-            dropClient = true;
-            break;
+            }
+            frameSize += (size_t)headerLen + payloadLen;
           }
-        }
 
-        size_t consumed = 0;
-        while (!dropClient && (client.readBuf.size() - consumed) >= 8) {
-          const uint8_t* ptr = client.readBuf.data() + consumed;
-          uint32_t headerLen = readBE32(ptr);
-          uint32_t payloadLen = readBE32(ptr + 4);
-
-          if ((headerLen == 0) ||
-              (headerLen > MAX_HEADER_BYTES) ||
-              (payloadLen > MAX_INBOUND_PAYLOAD_BYTES)) {
-            vlog.error("Dropping agent client %llu due to invalid frame lengths (%u, %u)",
-                       (unsigned long long)client.id,
-                       (unsigned)headerLen, (unsigned)payloadLen);
-            dropClient = true;
+          if (client.readBuf.size() < frameSize) {
+            size_t remaining = frameSize - client.readBuf.size();
+            ssize_t n = recv(client.fd, buf, std::min(sizeof(buf), remaining), 0);
+            if (n > 0) {
+              client.readBuf.insert(client.readBuf.end(), buf, buf + (size_t)n);
+              continue;
+            }
+            if (n < 0 && errno == EINTR)
+              continue;
+            if (n == 0 || (errno != EAGAIN && errno != EWOULDBLOCK))
+              dropClient = true;
             break;
           }
 
-          size_t frameSize = 8 + (size_t)headerLen + (size_t)payloadLen;
-          if ((client.readBuf.size() - consumed) < frameSize)
-            break;
-
+          const uint8_t* ptr = client.readBuf.data();
           InboundRequest req;
           req.clientId = client.id;
           req.headerJson.assign((const char*)(ptr + 8), headerLen);
@@ -1535,7 +1533,7 @@ void AgentBridge::ioLoop()
             req.payload.assign(ptr + 8 + headerLen,
                                ptr + 8 + headerLen + payloadLen);
           }
-          consumed += frameSize;
+          client.readBuf.clear();
           client.pendingRequests++;
 
           {
@@ -1544,10 +1542,6 @@ void AgentBridge::ioLoop()
           }
           pushedRequests = true;
         }
-
-        if (consumed > 0 && !dropClient)
-          client.readBuf.erase(client.readBuf.begin(),
-                               client.readBuf.begin() + (ptrdiff_t)consumed);
       }
 
       if (!dropClient && (revents & POLLOUT)) {
