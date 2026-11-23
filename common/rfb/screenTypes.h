@@ -31,6 +31,7 @@ namespace rfb {
   const unsigned int resultNoResources = 2;
   const unsigned int resultInvalid = 3;
 
+  const unsigned int resultPending = 0xfffe; // internal code: resize deferred/async
   const int resultUnsolicited = 0xffff; // internal code used for server changes
 
 }

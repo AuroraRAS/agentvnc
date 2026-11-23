@@ -133,6 +133,40 @@ namespace rfb {
     // the Socket is not recognised then null is returned.
     virtual SConnection* getConnection(network::Socket* sock) = 0;
 
+    virtual void add_changed(const core::Region& region) override = 0;
+    virtual void add_copied(const core::Region& dest,
+                            const core::Point& delta) override = 0;
+
+    // Optional passthrough hooks for zero-transcode/zero-scan acceleration
+    virtual void add_h264(const core::Rect& rect, const uint8_t* data, size_t len,
+                          uint32_t flags, bool isIdr,
+                          const core::Region& fallbackDirty) {
+      (void)rect; (void)data; (void)len; (void)flags; (void)isIdr;
+      add_changed(fallbackDirty);
+    }
+    virtual void resetH264Contexts() {}
+    virtual void add_solid_fill(const core::Rect& rect,
+                                const uint8_t bgrxColor[4]) {
+      (void)bgrxColor;
+      add_changed(core::Region(rect));
+    }
+    virtual void add_raw_passthrough(const core::Rect& rect) {
+      add_changed(core::Region(rect));
+    }
+    virtual void add_jpeg_passthrough(const core::Rect& rect,
+                                      const uint8_t* data, size_t len) {
+      (void)data; (void)len;
+      add_changed(core::Region(rect));
+    }
+    virtual void getClientCapabilities(int* totalNormal, int* h264Supported,
+                                       int* h264Synced,
+                                       int* jpegSupported) const {
+      if (totalNormal) *totalNormal = 0;
+      if (h264Supported) *h264Supported = 0;
+      if (h264Synced) *h264Synced = 0;
+      if (jpegSupported) *jpegSupported = 0;
+    }
+
     // setCursor() tells the server that the cursor has changed.  The
     // cursorData argument contains width*height rgba quadruplets with
     // non-premultiplied alpha.

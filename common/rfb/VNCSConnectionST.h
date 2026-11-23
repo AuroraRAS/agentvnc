@@ -27,7 +27,9 @@
 #ifndef __RFB_VNCSCONNECTIONST_H__
 #define __RFB_VNCSCONNECTIONST_H__
 
+#include <deque>
 #include <map>
+#include <vector>
 
 #include <core/Timer.h>
 
@@ -108,10 +110,22 @@ namespace rfb {
 
     // Change tracking
 
-    void add_changed(const core::Region& region) { updates.add_changed(region); }
-    void add_copied(const core::Region& dest, const core::Point& delta) {
-      updates.add_copied(dest, delta);
-    }
+    void add_changed(const core::Region& region);
+    void add_copied(const core::Region& dest, const core::Point& delta);
+
+    // Passthrough support
+    bool supportsH264() const;
+    bool isH264Synced() const;
+    bool supportsJpegPassthrough() const;
+
+    bool add_h264(const core::Rect& rect, const uint8_t* data, size_t len,
+                  uint32_t flags, bool isIdr,
+                  const core::Region& fallbackDirty);
+    void resetH264Context();
+    void add_solid_fill(const core::Rect& rect, const uint8_t bgrxColor[4]);
+    void add_raw_passthrough(const core::Rect& rect);
+    void add_jpeg_passthrough(const core::Rect& rect,
+                              const uint8_t* data, size_t len);
 
   private:
     using SConnection::approveConnection;
@@ -125,6 +139,7 @@ namespace rfb {
     void authSuccess() override;
     void queryConnection() override;
     void clientReady(bool shared) override;
+    void setEncodings(int nEncodings, const int32_t* encodings) override;
     void setPixelFormat(const PixelFormat& pf) override;
     void pointerEvent(const core::Point& pos,
                       uint16_t buttonMask) override;
@@ -202,6 +217,15 @@ namespace rfb {
     time_t pointerEventTime;
     core::Point pointerEventPos;
     bool clientHasCursor;
+
+    bool h264Synced;
+    bool h264NeedsReset;
+    bool h264ResetAll;
+    std::deque<H264Rect> pendingH264;
+    size_t pendingH264Bytes;
+    std::vector<SolidFillRect> pendingSolidFills;
+    core::Region pendingRawRects;
+    std::vector<JpegRect> pendingJpegRects;
 
     std::string closeReason;
   };

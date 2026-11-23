@@ -24,10 +24,12 @@
 #ifndef __RFB_VNCSERVERST_H__
 #define __RFB_VNCSERVERST_H__
 
+#include <vector>
 #include <sys/time.h>
 
 #include <core/Timer.h>
 
+#include <rfb/EncodeManager.h>
 #include <rfb/VNCServer.h>
 #include <rfb/Blacklist.h>
 #include <rfb/Cursor.h>
@@ -99,6 +101,20 @@ namespace rfb {
     void add_changed(const core::Region& region) override;
     void add_copied(const core::Region& dest,
                     const core::Point& delta) override;
+
+    void add_h264(const core::Rect& rect, const uint8_t* data, size_t len,
+                  uint32_t flags, bool isIdr,
+                  const core::Region& fallbackDirty) override;
+    void resetH264Contexts() override;
+    void add_solid_fill(const core::Rect& rect,
+                        const uint8_t bgrxColor[4]) override;
+    void add_raw_passthrough(const core::Rect& rect) override;
+    void add_jpeg_passthrough(const core::Rect& rect,
+                              const uint8_t* data, size_t len) override;
+    void getClientCapabilities(int* totalNormal, int* h264Supported,
+                               int* h264Synced,
+                               int* jpegSupported) const override;
+
     void setCursor(int width, int height, const core::Point& hotspot,
                    const uint8_t* data) override;
     void setCursorPos(const core::Point& p, bool warped) override;
@@ -143,6 +159,9 @@ namespace rfb {
     // client has completed the handshake and is ready for normal
     // communication.
     void clientReady(VNCSConnectionST* client, bool shared);
+
+    // Notify desktop that a client updated its encodings/sync status
+    void clientEncodingsChanged();
 
     // Estimated time until the next time new updates will be pushed
     // to clients
@@ -213,6 +232,10 @@ namespace rfb {
 
     uint64_t msc, queuedMsc;
     core::Timer frameTimer;
+
+    std::vector<SolidFillRect> pendingSolidFills;
+    core::Region pendingRawRects;
+    std::vector<JpegRect> pendingJpegRects;
   };
 
 };

@@ -69,7 +69,9 @@ VNCSConnectionST::VNCSConnectionST(VNCServerST* server_, network::Socket *s,
     losslessTimer(this), server(server_),
     updateRenderedCursor(false), removeRenderedCursor(false),
     continuousUpdates(false), encodeManager(this), idleTimer(this),
-    pointerEventTime(0), clientHasCursor(false)
+    pointerEventTime(0), clientHasCursor(false),
+    h264Synced(false), h264NeedsReset(true), h264ResetAll(false),
+    pendingH264Bytes(0)
 {
 }
 
@@ -257,6 +259,10 @@ void VNCSConnectionST::pixelBufferChange()
       // Drop any lossy tracking that is now outside the framebuffer
       encodeManager.pruneLosslessRefresh(server->getPixelBuffer()->getRect());
     }
+    resetH264Context();
+    pendingSolidFills.clear();
+    pendingRawRects.clear();
+    pendingJpegRects.clear();
     // Just update the whole screen at the moment because we're too lazy to
     // work out what's actually changed.
     updates.clear();
@@ -426,6 +432,145 @@ bool VNCSConnectionST::needRenderedCursor()
   return false;
 }
 
+void VNCSConnectionST::add_changed(const core::Region& region)
+{
+  PassthroughBatch tmp;
+  tmp.solidFills.swap(pendingSolidFills);
+  tmp.rawRects = pendingRawRects;
+  tmp.jpegRects.swap(pendingJpegRects);
+  tmp.pruneOverlapping(region);
+  pendingSolidFills.swap(tmp.solidFills);
+  pendingRawRects = tmp.rawRects;
+  pendingJpegRects.swap(tmp.jpegRects);
+
+  updates.add_changed(region);
+}
+
+void VNCSConnectionST::add_copied(const core::Region& dest,
+                                  const core::Point& delta)
+{
+  PassthroughBatch tmp;
+  tmp.solidFills.swap(pendingSolidFills);
+  tmp.rawRects = pendingRawRects;
+  tmp.jpegRects.swap(pendingJpegRects);
+  tmp.pruneOverlapping(dest);
+  pendingSolidFills.swap(tmp.solidFills);
+  pendingRawRects = tmp.rawRects;
+  pendingJpegRects.swap(tmp.jpegRects);
+
+  updates.add_copied(dest, delta);
+}
+
+bool VNCSConnectionST::supportsH264() const
+{
+  return (state() == RFBSTATE_NORMAL) &&
+         client.supportsEncoding(encodingH264);
+}
+
+bool VNCSConnectionST::isH264Synced() const
+{
+  return supportsH264() && h264Synced;
+}
+
+bool VNCSConnectionST::supportsJpegPassthrough() const
+{
+  return (state() == RFBSTATE_NORMAL) &&
+         encodeManager.supportsJpegPassthrough();
+}
+
+bool VNCSConnectionST::add_h264(const core::Rect& rect,
+                                const uint8_t* data, size_t len,
+                                uint32_t flags, bool isIdr,
+                                const core::Region& fallbackDirty)
+{
+  static const size_t maxQueuedH264Frames = 32;
+  static const size_t maxQueuedH264Bytes = 16u * 1024u * 1024u;
+
+  if (!supportsH264()) {
+    updates.add_changed(fallbackDirty);
+    return false;
+  }
+
+  if (!h264Synced && !isIdr) {
+    updates.add_changed(fallbackDirty);
+    return false;
+  }
+
+  if ((pendingH264.size() >= maxQueuedH264Frames) ||
+      (pendingH264Bytes + len > maxQueuedH264Bytes)) {
+    bool wasSynced = h264Synced;
+    pendingH264.clear();
+    pendingH264Bytes = 0;
+    h264Synced = false;
+    h264NeedsReset = true;
+    updates.add_changed(fallbackDirty);
+    if (server->getPixelBuffer() != nullptr)
+      updates.add_changed(server->getPixelBuffer()->getRect());
+    return wasSynced;
+  }
+
+  uint32_t effectiveFlags = flags;
+  if (h264ResetAll) {
+    effectiveFlags |= 0x02;
+    h264ResetAll = false;
+    h264NeedsReset = false;
+  } else if (h264NeedsReset) {
+    effectiveFlags |= 0x01;
+    h264NeedsReset = false;
+  }
+
+  H264Rect hr;
+  hr.rect = rect;
+  hr.flags = effectiveFlags;
+  if (data != nullptr && len > 0)
+    hr.data.assign(data, data + len);
+
+  pendingH264.push_back(std::move(hr));
+  pendingH264Bytes += len;
+
+  if (!h264Synced && isIdr) {
+    updates.subtract(core::Region(rect));
+    h264Synced = true;
+    return true;
+  }
+
+  return false;
+}
+
+void VNCSConnectionST::resetH264Context()
+{
+  pendingH264.clear();
+  pendingH264Bytes = 0;
+  h264Synced = false;
+  h264NeedsReset = true;
+  h264ResetAll = true;
+}
+
+void VNCSConnectionST::add_solid_fill(const core::Rect& rect,
+                                      const uint8_t bgrxColor[4])
+{
+  SolidFillRect sf;
+  sf.rect = rect;
+  memcpy(sf.bgrx, bgrxColor, sizeof(sf.bgrx));
+  pendingSolidFills.push_back(sf);
+}
+
+void VNCSConnectionST::add_raw_passthrough(const core::Rect& rect)
+{
+  pendingRawRects.assign_union(rect);
+}
+
+void VNCSConnectionST::add_jpeg_passthrough(const core::Rect& rect,
+                                            const uint8_t* data, size_t len)
+{
+  if (data == nullptr || len < 4)
+    return;
+  JpegRect jr;
+  jr.rect = rect;
+  jr.data.assign(data, data + len);
+  pendingJpegRects.push_back(std::move(jr));
+}
+
 void VNCSConnectionST::desktopReady()
 {
   if (state() != RFBSTATE_CLIENT_READY)
@@ -448,6 +593,7 @@ void VNCSConnectionST::desktopReady()
   updates.add_changed(server->getPixelBuffer()->getRect());
 
   SConnection::desktopReady();
+  server->clientEncodingsChanged();
 }
 
 
@@ -488,6 +634,16 @@ void VNCSConnectionST::clientReady(bool shared)
 
   if (server->isDesktopReady())
     desktopReady();
+}
+
+void VNCSConnectionST::setEncodings(int nEncodings, const int32_t* encodings)
+{
+  bool hadH264 = client.supportsEncoding(encodingH264);
+  SConnection::setEncodings(nEncodings, encodings);
+  bool hasH264 = client.supportsEncoding(encodingH264);
+  if (hadH264 && !hasH264)
+    resetH264Context();
+  server->clientEncodingsChanged();
 }
 
 void VNCSConnectionST::setPixelFormat(const PixelFormat& pf)
@@ -700,7 +856,8 @@ void VNCSConnectionST::setDesktopSize(int fb_width, int fb_height,
     result = server->setDesktopSize(this, fb_width, fb_height, layout);
   }
 
-  writer()->writeDesktopSize(reasonClient, result);
+  if (result != resultPending)
+    writer()->writeDesktopSize(reasonClient, result);
 }
 
 void VNCSConnectionST::fence(uint32_t flags, unsigned len, const uint8_t data[])
@@ -1018,7 +1175,8 @@ void VNCSConnectionST::writeDataUpdate()
 
   // If there are queued updates then we cannot safely send an update
   // without risking a partially updated screen
-  if (!server->getPendingRegion().is_empty()) {
+  bool serverPending = !server->getPendingRegion().is_empty();
+  if (serverPending) {
     req.clear();
     ui.changed.clear();
     ui.copied.clear();
@@ -1045,17 +1203,43 @@ void VNCSConnectionST::writeDataUpdate()
     damagedCursorRegion.assign_union(ui.changed.intersect(renderedCursorRect));
   }
 
+  bool hasPassthrough = !serverPending &&
+                        ((!pendingH264.empty() && supportsH264()) ||
+                         !pendingSolidFills.empty() ||
+                         !pendingRawRects.is_empty() ||
+                         !pendingJpegRects.empty());
+
   // If we don't have a normal update, then try a lossless refresh
-  if (ui.is_empty() && !writer()->needFakeUpdate()) {
+  if (ui.is_empty() && !hasPassthrough && !writer()->needFakeUpdate()) {
     writeLosslessRefresh();
     return;
   }
 
   // We have something to send, so let's get to it
 
+  PassthroughBatch batch;
+  if (!serverPending) {
+    if (!pendingH264.empty() && supportsH264()) {
+      while (!pendingH264.empty()) {
+        batch.h264Rects.push_back(std::move(pendingH264.front()));
+        pendingH264.pop_front();
+      }
+      pendingH264Bytes = 0;
+    }
+    if (!pendingSolidFills.empty())
+      batch.solidFills.swap(pendingSolidFills);
+    if (!pendingRawRects.is_empty()) {
+      batch.rawRects = pendingRawRects;
+      pendingRawRects.clear();
+    }
+    if (!pendingJpegRects.empty())
+      batch.jpegRects.swap(pendingJpegRects);
+  }
+
   writeRTTPing();
 
-  encodeManager.writeUpdate(ui, server->getPixelBuffer(), cursor);
+  encodeManager.writeUpdate(ui, server->getPixelBuffer(), cursor,
+                            batch.empty() ? nullptr : &batch);
 
   writeRTTPing();
 

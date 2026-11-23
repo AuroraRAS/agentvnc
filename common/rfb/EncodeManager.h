@@ -39,6 +39,36 @@ namespace rfb {
 
   struct RectInfo;
 
+  struct H264Rect {
+    core::Rect rect;
+    uint32_t flags;
+    std::vector<uint8_t> data;
+  };
+
+  struct SolidFillRect {
+    core::Rect rect;
+    uint8_t bgrx[4];
+  };
+
+  struct JpegRect {
+    core::Rect rect;
+    std::vector<uint8_t> data;
+  };
+
+  struct PassthroughBatch {
+    std::vector<H264Rect> h264Rects;
+    std::vector<SolidFillRect> solidFills;
+    core::Region rawRects;
+    std::vector<JpegRect> jpegRects;
+
+    bool empty() const {
+      return h264Rects.empty() && solidFills.empty() &&
+             rawRects.is_empty() && jpegRects.empty();
+    }
+    void clear();
+    void pruneOverlapping(const core::Region& region);
+  };
+
   class EncodeManager : public core::Timer::Callback {
   public:
     EncodeManager(SConnection* conn);
@@ -49,6 +79,8 @@ namespace rfb {
     // Hack to let ConnParams calculate the client's preferred encoding
     static bool supported(int encoding);
 
+    bool supportsJpegPassthrough() const;
+
     bool needsLosslessRefresh(const core::Region& req);
     int getNextLosslessRefresh(const core::Region& req);
 
@@ -57,7 +89,8 @@ namespace rfb {
     void forceRefresh(const core::Region& req);
 
     void writeUpdate(const UpdateInfo& ui, const PixelBuffer* pb,
-                     const RenderedCursor* renderedCursor);
+                     const RenderedCursor* renderedCursor,
+                     const PassthroughBatch* passthrough = nullptr);
 
     void writeLosslessRefresh(const core::Region& req,
                               const PixelBuffer* pb,
@@ -71,7 +104,8 @@ namespace rfb {
                   const core::Region& copied,
                   const core::Point& copy_delta,
                   const PixelBuffer* pb,
-                  const RenderedCursor* renderedCursor);
+                  const RenderedCursor* renderedCursor,
+                  const PassthroughBatch* passthrough = nullptr);
     void prepareEncoders(bool allowLossy);
 
     core::Region getLosslessRefresh(const core::Region& req,

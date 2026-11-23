@@ -15,3 +15,8 @@ endif()
 if (ENABLE_WAYLAND)
   add_subdirectory(w0vncserver)
 endif()
+
+option(BUILD_RDPVNCSERVER "Build rdpvncserver (RDP-to-VNC bridge)" OFF)
+if(BUILD_RDPVNCSERVER)
+  add_subdirectory(rdpvncserver)
+endif()

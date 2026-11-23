@@ -222,6 +222,8 @@ void VNCServerST::removeSocket(network::Socket* sock) {
       // - Check that the desktop object is still required
       if (authClientCount() == 0)
         stopDesktop();
+      else
+        clientEncodingsChanged();
 
       if (comparer)
         comparer->logStats();
@@ -305,6 +307,9 @@ void VNCServerST::setPixelBuffer(PixelBuffer* pb_, const ScreenSet& layout)
   pb = pb_;
   delete comparer;
   comparer = nullptr;
+  pendingSolidFills.clear();
+  pendingRawRects.clear();
+  pendingJpegRects.clear();
 
   if (!pb) {
     screenLayout = ScreenSet();
@@ -486,6 +491,15 @@ void VNCServerST::add_changed(const core::Region& region)
   if (comparer == nullptr)
     return;
 
+  PassthroughBatch tmp;
+  tmp.solidFills.swap(pendingSolidFills);
+  tmp.rawRects = pendingRawRects;
+  tmp.jpegRects.swap(pendingJpegRects);
+  tmp.pruneOverlapping(region);
+  pendingSolidFills.swap(tmp.solidFills);
+  pendingRawRects = tmp.rawRects;
+  pendingJpegRects.swap(tmp.jpegRects);
+
   comparer->add_changed(region);
   startFrameClock();
 }
@@ -496,8 +510,161 @@ void VNCServerST::add_copied(const core::Region& dest,
   if (comparer == nullptr)
     return;
 
+  PassthroughBatch tmp;
+  tmp.solidFills.swap(pendingSolidFills);
+  tmp.rawRects = pendingRawRects;
+  tmp.jpegRects.swap(pendingJpegRects);
+  tmp.pruneOverlapping(dest);
+  pendingSolidFills.swap(tmp.solidFills);
+  pendingRawRects = tmp.rawRects;
+  pendingJpegRects.swap(tmp.jpegRects);
+
   comparer->add_copied(dest, delta);
   startFrameClock();
+}
+
+void VNCServerST::add_h264(const core::Rect& rect, const uint8_t* data,
+                           size_t len, uint32_t flags, bool isIdr,
+                           const core::Region& fallbackDirty)
+{
+  if (!desktopStarted)
+    return;
+
+  if (blockCounter == 0 && comparer != nullptr && !comparer->is_empty())
+    writeUpdate();
+
+  bool syncChanged = false;
+  for (std::list<VNCSConnectionST*>::iterator ci = clients.begin();
+       ci != clients.end(); ++ci) {
+    if ((*ci)->state() != SConnection::RFBSTATE_NORMAL)
+      continue;
+    if ((*ci)->add_h264(rect, data, len, flags, isIdr, fallbackDirty))
+      syncChanged = true;
+    if (blockCounter == 0)
+      (*ci)->writeFramebufferUpdateOrClose();
+  }
+
+  if (syncChanged)
+    clientEncodingsChanged();
+}
+
+void VNCServerST::resetH264Contexts()
+{
+  for (std::list<VNCSConnectionST*>::iterator ci = clients.begin();
+       ci != clients.end(); ++ci)
+    (*ci)->resetH264Context();
+
+  clientEncodingsChanged();
+}
+
+void VNCServerST::add_solid_fill(const core::Rect& rect,
+                                 const uint8_t bgrxColor[4])
+{
+  if (comparer == nullptr)
+    return;
+
+  core::Region rgn(rect);
+  PassthroughBatch tmp;
+  tmp.solidFills.swap(pendingSolidFills);
+  tmp.rawRects = pendingRawRects;
+  tmp.jpegRects.swap(pendingJpegRects);
+  tmp.pruneOverlapping(rgn);
+  pendingSolidFills.swap(tmp.solidFills);
+  pendingRawRects = tmp.rawRects;
+  pendingJpegRects.swap(tmp.jpegRects);
+
+  SolidFillRect sf;
+  sf.rect = rect;
+  memcpy(sf.bgrx, bgrxColor, sizeof(sf.bgrx));
+  pendingSolidFills.push_back(sf);
+
+  comparer->add_changed(rgn);
+  startFrameClock();
+}
+
+void VNCServerST::add_raw_passthrough(const core::Rect& rect)
+{
+  if (comparer == nullptr)
+    return;
+
+  core::Region rgn(rect);
+  PassthroughBatch tmp;
+  tmp.solidFills.swap(pendingSolidFills);
+  tmp.rawRects = pendingRawRects;
+  tmp.jpegRects.swap(pendingJpegRects);
+  tmp.pruneOverlapping(rgn);
+  pendingSolidFills.swap(tmp.solidFills);
+  pendingRawRects = tmp.rawRects;
+  pendingJpegRects.swap(tmp.jpegRects);
+
+  pendingRawRects.assign_union(rgn);
+
+  comparer->add_changed(rgn);
+  startFrameClock();
+}
+
+void VNCServerST::add_jpeg_passthrough(const core::Rect& rect,
+                                       const uint8_t* data, size_t len)
+{
+  if (comparer == nullptr)
+    return;
+
+  core::Region rgn(rect);
+  PassthroughBatch tmp;
+  tmp.solidFills.swap(pendingSolidFills);
+  tmp.rawRects = pendingRawRects;
+  tmp.jpegRects.swap(pendingJpegRects);
+  tmp.pruneOverlapping(rgn);
+  pendingSolidFills.swap(tmp.solidFills);
+  pendingRawRects = tmp.rawRects;
+  pendingJpegRects.swap(tmp.jpegRects);
+
+  int totalNormal = 0;
+  int jpegSupported = 0;
+  getClientCapabilities(&totalNormal, nullptr, nullptr, &jpegSupported);
+  if (totalNormal > 0 && jpegSupported > 0 &&
+      data != nullptr && len >= 4) {
+    JpegRect jr;
+    jr.rect = rect;
+    jr.data.assign(data, data + len);
+    pendingJpegRects.push_back(std::move(jr));
+  }
+
+  comparer->add_changed(rgn);
+  startFrameClock();
+}
+
+void VNCServerST::getClientCapabilities(int* totalNormal, int* h264Supported,
+                                        int* h264Synced,
+                                        int* jpegSupported) const
+{
+  int total = 0;
+  int h264 = 0;
+  int synced = 0;
+  int jpeg = 0;
+
+  for (std::list<VNCSConnectionST*>::const_iterator ci = clients.begin();
+       ci != clients.end(); ++ci) {
+    if ((*ci)->state() != SConnection::RFBSTATE_NORMAL)
+      continue;
+    total++;
+    if ((*ci)->supportsH264())
+      h264++;
+    if ((*ci)->isH264Synced())
+      synced++;
+    if ((*ci)->supportsJpegPassthrough())
+      jpeg++;
+  }
+
+  if (totalNormal) *totalNormal = total;
+  if (h264Supported) *h264Supported = h264;
+  if (h264Synced) *h264Synced = synced;
+  if (jpegSupported) *jpegSupported = jpeg;
+}
+
+void VNCServerST::clientEncodingsChanged()
+{
+  desktop->clientEncodingsChanged();
 }
 
 void VNCServerST::setCursor(int width, int height,
@@ -659,6 +826,8 @@ unsigned int VNCServerST::setDesktopSize(VNCSConnectionST* requester,
   // of ExtendedDesktopSize messages will be sent. This is okay
   // protocol-wise, but unnecessary.
   result = desktop->setScreenLayout(fb_width, fb_height, layout);
+  if (result == resultPending)
+    return resultPending;
   if (result != resultSuccess)
     return result;
 
@@ -949,8 +1118,36 @@ void VNCServerST::writeUpdate()
   for (ci = clients.begin(); ci != clients.end(); ++ci) {
     (*ci)->add_copied(ui.copied, ui.copy_delta);
     (*ci)->add_changed(ui.changed);
+    if (!ui.changed.is_empty()) {
+      for (size_t idx = 0; idx < pendingSolidFills.size(); idx++) {
+        core::Region clipped =
+            core::Region(pendingSolidFills[idx].rect).intersect(ui.changed);
+        if (!clipped.is_empty()) {
+          std::vector<core::Rect> rects;
+          clipped.get_rects(&rects);
+          for (size_t r = 0; r < rects.size(); r++)
+            (*ci)->add_solid_fill(rects[r], pendingSolidFills[idx].bgrx);
+        }
+      }
+      core::Region rawClipped = pendingRawRects.intersect(ui.changed);
+      if (!rawClipped.is_empty()) {
+        std::vector<core::Rect> rects;
+        rawClipped.get_rects(&rects);
+        for (size_t r = 0; r < rects.size(); r++)
+          (*ci)->add_raw_passthrough(rects[r]);
+      }
+      for (size_t idx = 0; idx < pendingJpegRects.size(); idx++) {
+        const JpegRect& jr = pendingJpegRects[idx];
+        if (core::Region(jr.rect).subtract(ui.changed).is_empty())
+          (*ci)->add_jpeg_passthrough(jr.rect, jr.data.data(), jr.data.size());
+      }
+    }
     (*ci)->writeFramebufferUpdateOrClose();
   }
+
+  pendingSolidFills.clear();
+  pendingRawRects.clear();
+  pendingJpegRects.clear();
 }
 
 // checkUpdate() is called by clients to see if it is safe to read from
