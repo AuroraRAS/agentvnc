@@ -497,13 +497,14 @@ std::vector<DISPLAY_CONTROL_MONITOR_LAYOUT> KeyMap::buildMonitorLayout(
   std::vector<DISPLAY_CONTROL_MONITOR_LAYOUT> monitors;
 
   if (layout.num_screens() > 0) {
+    const core::Point primaryOrigin = layout.begin()->dimensions.tl;
     int idx = 0;
     for (rfb::ScreenSet::const_iterator it = layout.begin();
          it != layout.end(); ++it, ++idx) {
       DISPLAY_CONTROL_MONITOR_LAYOUT m{};
       m.Flags = (idx == 0) ? DISPLAY_CONTROL_MONITOR_PRIMARY : 0;
-      m.Left = it->dimensions.tl.x;
-      m.Top = it->dimensions.tl.y;
+      m.Left = it->dimensions.tl.x - primaryOrigin.x;
+      m.Top = it->dimensions.tl.y - primaryOrigin.y;
       m.Width = clampMonitorDimension(it->dimensions.width(), true);
       m.Height = clampMonitorDimension(it->dimensions.height(), false);
       m.Orientation = kOrientationLandscape;

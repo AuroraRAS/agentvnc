@@ -6,14 +6,14 @@ rdpvncserver \- TigerVNC RDP-to-VNC bridge server
 .RI [ parameters ]
 .SH DESCRIPTION
 .B rdpvncserver
-exposes an upstream FreeRDP 3.x RDP session as a TigerVNC RFB desktop server.
-It maintains a strict two-thread separation between the FreeRDP event/decoding
-worker and the TigerVNC
+exposes an upstream RDP session as a TigerVNC RFB desktop server using
+FreeRDP 3.x (3.2 or later).
+It hands completed pixel updates from the FreeRDP decoding worker to the TigerVNC
 .BR poll (2)
-client loop, supports zero-copy BGRX32 framebuffers with hardware cursors, and
-supports zero-transcoding AVC420 H.264 passthrough for clients negotiating
+client loop, supports BGRX32 framebuffers with hardware cursors, and
+can forward full-frame AVC420 H.264 updates to clients negotiating
 .B encodingH264 (50)
-alongside mixed legacy clients.
+while retaining decoded pixels for other clients and pixel-format updates.
 
 The upstream RDP session starts on demand when the first VNC client
 authenticates and disconnects when the last client leaves (or after
@@ -54,10 +54,12 @@ Enable zero-transcode AVC420 H.264 passthrough to RFB H.264 clients.
 Allow direct BGRX32 Raw passthrough on bit-for-bit pixel format match.
 .TP
 .B \-RdpJpegPassthrough
-Allow zero-decode JFIF passthrough for TightJPEG/JPEG VNC clients.
+Allow forwarding supported JFIF rectangles to TightJPEG/JPEG VNC clients.
 .TP
 .B \-RdpResizeDebounceMs \fIms\fP
 Delay (300\(en500 ms) before forwarding VNC resize requests over MS-RDPEDISP.
+Requests rejected by the upstream channel or left incomplete after five seconds
+receive an error reply.
 .TP
 .B \-RdpIdleDisconnectSec \fIsec\fP
 Grace period after the last VNC client disconnects before tearing down RDP.

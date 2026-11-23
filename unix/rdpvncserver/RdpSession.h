@@ -175,15 +175,15 @@ public:
   void sendKeyEvent(uint32_t keysym, uint32_t keycode, bool down);
   void sendPointerEvent(int x, int y, uint16_t buttonMask,
                         uint16_t prevButtonMask, int fbWidth, int fbHeight);
-  void sendMonitorLayout(const std::vector<DISPLAY_CONTROL_MONITOR_LAYOUT>& monitors);
+  void sendMonitorLayout(uint64_t resizeId,
+                         const std::vector<DISPLAY_CONTROL_MONITOR_LAYOUT>& monitors);
   void sendClipboardAnnounce(bool available);
   void sendClipboardRequest();
   void sendClipboardData(const std::string& utf8Text);
   void requestRefresh();
 
   /**
-   * Updates downstream VNC client H.264 capability summary so AVC420 bypass
-   * vs parallel Path A GDI decoding can adapt immediately.
+   * Updates downstream VNC H.264 capability and requests a refresh on resync.
    */
   void setClientH264Caps(bool anyH264Client, bool allH264Synced);
 
@@ -197,13 +197,13 @@ private:
       ClipboardRequest,
       ClipboardData,
       RefreshScreen,
-      Stop,
     };
 
-    Type type = Type::Stop;
+    Type type = Type::RefreshScreen;
     KeyAction key;
     std::vector<PointerAction> pointerActions;
     std::vector<DISPLAY_CONTROL_MONITOR_LAYOUT> monitors;
+    uint64_t resizeId = 0;
     bool clipboardAvailable = false;
     std::string text;
   };
@@ -213,6 +213,9 @@ private:
   void drainOutboundCommands(rdpContext* ctx);
   void executeOutboundCommand(rdpContext* ctx, const OutboundCommand& cmd);
   void pushDisconnect(uint32_t code, const std::string& reason);
+  void pushFrameUpdate(const core::Region& dirty);
+  void pushCopyRect(const PendingCopyOp& copy);
+  void capturePixels(const core::Region& region, std::vector<uint8_t>& pixels) const;
 
   core::Rect fbBounds() const;
   uint64_t nextGeneration();
@@ -322,10 +325,12 @@ private:
   std::atomic<bool> connected_{false};
   std::atomic<bool> stopRequested_{false};
   std::atomic<bool> anyH264Client_{false};
-  std::atomic<bool> allH264Synced_{false};
+  bool allH264Synced_ = false;
 
   std::thread workerThread_;
   HANDLE wakeEvent_ = nullptr;
+  std::mutex connectionMutex_;
+  HANDLE connectAbortEvent_ = nullptr;
 
   std::mutex outboundMutex_;
   std::deque<OutboundCommand> outboundQueue_;
@@ -335,6 +340,8 @@ private:
   uint64_t fbGeneration_ = 0;
   bool gdiInitialized_ = false;
   bool authAttempted_ = false;
+  const rfb::ScreenSet* gfxResizeLayout_ = nullptr;
+  rfb::ScreenSet currentLayout_;
 
   rdpUpdate origUpdate_{};
   rdpPrimaryUpdate origPrimary_{};
@@ -342,6 +349,9 @@ private:
   bool gfxHooked_ = false;
   RdpgfxClientContext* gfx_ = nullptr;
   DispClientContext* disp_ = nullptr;
+
+  // Some FreeRDP versions dispatch CLIPRDR callbacks on a channel thread.
+  std::mutex clipboardMutex_;
   CliprdrClientContext* cliprdr_ = nullptr;
 
   bool cliprdrReady_ = false;
@@ -351,12 +361,14 @@ private:
   uint64_t localClipboardReqStartMs_ = 0;
 
   UINT32 dispMaxMonitors_ = 16;
+  uint64_t dispMaxArea_ = 0;
 
   // Frame / paint tracking (worker thread only)
   bool inGfxFrame_ = false;
   bool inGfxEndFrame_ = false;
   bool inPaint_ = false;
   core::Region dirtyInGfxFrame_;
+  core::Region gfxPaintDirty_;
   core::Region suppressedGfxCopies_;
   core::Region suppressedLegacyCopies_;
   std::vector<PendingCopyOp> pendingGfxCopies_;

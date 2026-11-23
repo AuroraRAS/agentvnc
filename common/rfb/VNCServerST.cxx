@@ -209,6 +209,8 @@ void VNCServerST::removeSocket(network::Socket* sock) {
       if (clipboardClient == *ci)
         handleClipboardAnnounce(*ci, false);
       clipboardRequestors.remove(*ci);
+      if (resizeRequester == *ci)
+        resizeRequester = nullptr;
 
       std::string peer((*ci)->getPeerEndpoint());
 
@@ -299,7 +301,8 @@ void VNCServerST::queueMsc(uint64_t target)
   startFrameClock();
 }
 
-void VNCServerST::setPixelBuffer(PixelBuffer* pb_, const ScreenSet& layout)
+void VNCServerST::setPixelBuffer(PixelBuffer* pb_, const ScreenSet& layout,
+                                 bool resizeFromClient)
 {
   if (comparer)
     comparer->logStats();
@@ -334,9 +337,16 @@ void VNCServerST::setPixelBuffer(PixelBuffer* pb_, const ScreenSet& layout)
   // The desktop is considered ready after the pixelbuffer is set
   checkDesktopReady();
 
+  VNCSConnectionST* requester = resizeFromClient ? resizeRequester : nullptr;
+  if (resizeFromClient)
+    resizeRequester = nullptr;
+
   std::list<VNCSConnectionST*>::iterator ci;
   for (ci = clients.begin(); ci != clients.end(); ++ci) {
-    (*ci)->pixelBufferChange();
+    unsigned int reason = reasonServer;
+    if (requester)
+      reason = (*ci == requester) ? reasonClient : reasonOtherClient;
+    (*ci)->pixelBufferChange(reason);
     // Since the new pixel buffer means an ExtendedDesktopSize needs to
     // be sent anyway, we don't need to call screenLayoutChange.
   }
@@ -532,6 +542,11 @@ void VNCServerST::add_h264(const core::Rect& rect, const uint8_t* data,
 
   if (blockCounter == 0 && comparer != nullptr && !comparer->is_empty())
     writeUpdate();
+
+  // H.264 bypasses the comparing tracker, so its baseline is now stale.
+  if (comparer != nullptr)
+    comparer->disable();
+  renderedCursorInvalid = true;
 
   bool syncChanged = false;
   for (std::list<VNCSConnectionST*>::iterator ci = clients.begin();
@@ -804,6 +819,9 @@ unsigned int VNCServerST::setDesktopSize(VNCSConnectionST* requester,
   unsigned int result;
   std::list<VNCSConnectionST*>::iterator ci;
 
+  if (resizeRequester == requester)
+    finishDesktopSize(resultProhibited);
+
   if (!rfb::Server::acceptSetDesktopSize) {
     slog.debug("Rejecting unauthorized framebuffer resize request");
     return resultProhibited;
@@ -826,8 +844,11 @@ unsigned int VNCServerST::setDesktopSize(VNCSConnectionST* requester,
   // of ExtendedDesktopSize messages will be sent. This is okay
   // protocol-wise, but unnecessary.
   result = desktop->setScreenLayout(fb_width, fb_height, layout);
-  if (result == resultPending)
+  if (result == resultPending) {
+    finishDesktopSize(resultProhibited);
+    resizeRequester = requester;
     return resultPending;
+  }
   if (result != resultSuccess)
     return result;
 
@@ -844,6 +865,16 @@ unsigned int VNCServerST::setDesktopSize(VNCSConnectionST* requester,
   }
 
   return resultSuccess;
+}
+
+void VNCServerST::finishDesktopSize(unsigned int result)
+{
+  if (resizeRequester == nullptr)
+    return;
+
+  VNCSConnectionST* requester = resizeRequester;
+  resizeRequester = nullptr;
+  requester->finishDesktopSizeOrClose(result);
 }
 
 // Other public methods

@@ -27,6 +27,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <mutex>
+#include <system_error>
 
 #include <core/LogWriter.h>
 
@@ -85,18 +86,6 @@ void removeRectFromHints(std::vector<RdpSession::PendingHintOp>& hints,
   for (auto it = hints.begin(); it != hints.end();) {
     if (!it->rect.intersect(r).is_empty()) {
       it = hints.erase(it);
-    } else {
-      ++it;
-    }
-  }
-}
-
-void removeRectFromCopies(std::vector<RdpSession::PendingCopyOp>& copies,
-                          const core::Rect& r)
-{
-  for (auto it = copies.begin(); it != copies.end();) {
-    if (!it->dstRect.intersect(r).is_empty()) {
-      it = copies.erase(it);
     } else {
       ++it;
     }
@@ -168,6 +157,10 @@ bool RdpSession::start()
 {
   if (running_.load())
     return true;
+  if (!wakeEvent_)
+    return false;
+  if (workerThread_.joinable())
+    workerThread_.join();
 
   stopRequested_.store(false);
   connected_.store(false);
@@ -181,7 +174,13 @@ bool RdpSession::start()
     ResetEvent(wakeEvent_);
 
   running_.store(true);
-  workerThread_ = std::thread(&RdpSession::workerMain, this);
+  try {
+    workerThread_ = std::thread(&RdpSession::workerMain, this);
+  } catch (const std::system_error& e) {
+    vlog.error("Could not start RDP worker: %s", e.what());
+    running_.store(false);
+    return false;
+  }
   return true;
 }
 
@@ -191,9 +190,13 @@ void RdpSession::stop()
     return;
 
   stopRequested_.store(true);
-  OutboundCommand cmd;
-  cmd.type = OutboundCommand::Type::Stop;
-  enqueueOutbound(std::move(cmd));
+  eventQueue_.cancel();
+  SetEvent(wakeEvent_);
+  {
+    std::lock_guard<std::mutex> lock(connectionMutex_);
+    if (connectAbortEvent_)
+      SetEvent(connectAbortEvent_);
+  }
 
   if (workerThread_.joinable())
     workerThread_.join();
@@ -229,7 +232,7 @@ void RdpSession::sendPointerEvent(int x, int y, uint16_t buttonMask,
   enqueueOutbound(std::move(cmd));
 }
 
-void RdpSession::sendMonitorLayout(
+void RdpSession::sendMonitorLayout(uint64_t resizeId,
     const std::vector<DISPLAY_CONTROL_MONITOR_LAYOUT>& monitors)
 {
   if (monitors.empty())
@@ -238,6 +241,7 @@ void RdpSession::sendMonitorLayout(
   OutboundCommand cmd;
   cmd.type = OutboundCommand::Type::MonitorLayout;
   cmd.monitors = monitors;
+  cmd.resizeId = resizeId;
   enqueueOutbound(std::move(cmd));
 }
 
@@ -274,7 +278,8 @@ void RdpSession::requestRefresh()
 void RdpSession::setClientH264Caps(bool anyH264Client, bool allH264Synced)
 {
   bool prevAny = anyH264Client_.exchange(anyH264Client);
-  bool prevAll = allH264Synced_.exchange(allH264Synced);
+  bool prevAll = allH264Synced_;
+  allH264Synced_ = allH264Synced;
   if ((anyH264Client && !prevAny) || (anyH264Client && prevAll && !allH264Synced)) {
     requestRefresh();
   }
@@ -341,6 +346,52 @@ void RdpSession::pushDisconnect(uint32_t code, const std::string& reason)
   eventQueue_.push(std::move(ev));
 }
 
+void RdpSession::capturePixels(const core::Region& region,
+                               std::vector<uint8_t>& pixels) const
+{
+  std::vector<core::Rect> rects;
+  region.get_rects(&rects);
+  size_t size = 0;
+  for (const core::Rect& rect : rects)
+    size += static_cast<size_t>(rect.area()) * 4;
+  pixels.resize(size);
+
+  uint8_t* dst = pixels.data();
+  for (const core::Rect& rect : rects) {
+    size_t rowBytes = static_cast<size_t>(rect.width()) * 4;
+    for (int y = rect.tl.y; y < rect.br.y; ++y) {
+      const uint8_t* src = currentFb_->data() +
+          static_cast<size_t>(y) * currentFb_->strideBytes() + rect.tl.x * 4;
+      std::memcpy(dst, src, rowBytes);
+      dst += rowBytes;
+    }
+  }
+}
+
+void RdpSession::pushFrameUpdate(const core::Region& dirty)
+{
+  if (dirty.is_empty())
+    return;
+  RdpEvent ev;
+  ev.type = RdpEvent::Type::FrameUpdate;
+  ev.fbGeneration = fbGeneration_;
+  ev.dirty = dirty;
+  capturePixels(dirty, ev.pixels);
+  eventQueue_.push(std::move(ev));
+}
+
+void RdpSession::pushCopyRect(const PendingCopyOp& copy)
+{
+  RdpEvent ev;
+  ev.type = RdpEvent::Type::CopyRect;
+  ev.fbGeneration = fbGeneration_;
+  ev.rect = copy.dstRect;
+  ev.srcX = copy.srcX;
+  ev.srcY = copy.srcY;
+  capturePixels(core::Region(ev.rect), ev.pixels);
+  eventQueue_.push(std::move(ev));
+}
+
 bool RdpSession::reallocateFramebuffer(rdpContext* ctx, int width, int height,
                                        const rfb::ScreenSet* explicitLayout)
 {
@@ -351,8 +402,24 @@ bool RdpSession::reallocateFramebuffer(rdpContext* ctx, int width, int height,
     return false;
   }
 
+  if (currentFb_ && currentFb_->width() == width && currentFb_->height() == height) {
+    if (explicitLayout && explicitLayout->validate(width, height) &&
+        *explicitLayout != currentLayout_) {
+      currentLayout_ = *explicitLayout;
+      RdpEvent ev;
+      ev.type = RdpEvent::Type::Resize;
+      ev.fbGeneration = fbGeneration_;
+      ev.width = width;
+      ev.height = height;
+      ev.layout = currentLayout_;
+      eventQueue_.push(std::move(ev));
+    }
+    return true;
+  }
+
   uint64_t gen = nextGeneration();
   std::shared_ptr<AlignedBuffer> nextFb = AlignedBuffer::create(width, height, gen);
+  auto publishedFb = AlignedBuffer::create(width, height, gen);
 
   if (!gdiInitialized_) {
     if (!gdi_init_ex(ctx->instance, PIXEL_FORMAT_BGRX32,
@@ -374,16 +441,26 @@ bool RdpSession::reallocateFramebuffer(rdpContext* ctx, int width, int height,
   }
 
   currentFb_ = nextFb;
-  h264State_.markContextReset();
+  h264State_.reset();
+  gfxPaintDirty_.clear();
+  dirtyInGfxFrame_.clear();
+  suppressedGfxCopies_.clear();
+  suppressedLegacyCopies_.clear();
+  pendingGfxCopies_.clear();
+  pendingGfxHints_.clear();
+  pendingGfxH264_.clear();
+  pendingLegacyCopies_.clear();
+  pendingLegacyHints_.clear();
 
   RdpEvent ev;
   ev.type = RdpEvent::Type::Resize;
   ev.fbGeneration = gen;
-  ev.framebuffer = nextFb;
+  ev.framebuffer = std::move(publishedFb);
   ev.width = width;
   ev.height = height;
-  ev.layout = explicitLayout ? *explicitLayout
-                             : buildScreenSetFromDims(width, height);
+  currentLayout_ = explicitLayout && explicitLayout->validate(width, height)
+                      ? *explicitLayout : buildScreenSetFromDims(width, height);
+  ev.layout = currentLayout_;
   eventQueue_.push(std::move(ev));
   return true;
 }
@@ -463,21 +540,26 @@ void RdpSession::workerMain()
   ok &= freerdp_settings_set_bool(
       settings, FreeRDP_SupportDynamicChannels,
       (config_.enableGfx || config_.enableDynamicResize) ? TRUE : FALSE) != FALSE;
+  // Graphics callbacks and the outbound channel commands share worker state.
+  ok &= freerdp_settings_set_bool(
+      settings, FreeRDP_SynchronousDynamicChannels, TRUE) != FALSE;
   ok &= freerdp_settings_set_bool(
       settings, FreeRDP_SupportGraphicsPipeline,
       config_.enableGfx ? TRUE : FALSE) != FALSE;
   ok &= freerdp_settings_set_bool(
       settings, FreeRDP_GfxH264, config_.enableGfx ? TRUE : FALSE) != FALSE;
 
-  // Path B constraint 1: RFB encodingH264 requires 4:2:0; disable AVC444
-  // dual-stream chroma splitting whenever H.264 passthrough is active.
-  bool allowAvc444 = !config_.enableH264Passthrough;
+  // FreeRDP omits RDPGFX 10.x capabilities when H.264 is enabled but
+  // AVC444 is disabled. GDI decodes AVC444 for the pixel fallback.
   ok &= freerdp_settings_set_bool(
-      settings, FreeRDP_GfxAVC444, allowAvc444 ? TRUE : FALSE) != FALSE;
+      settings, FreeRDP_GfxAVC444, config_.enableGfx ? TRUE : FALSE) != FALSE;
   ok &= freerdp_settings_set_bool(
-      settings, FreeRDP_GfxAVC444v2, allowAvc444 ? TRUE : FALSE) != FALSE;
+      settings, FreeRDP_GfxAVC444v2, config_.enableGfx ? TRUE : FALSE) != FALSE;
   ok &= freerdp_settings_set_bool(
       settings, FreeRDP_SupportDisplayControl,
+      config_.enableDynamicResize ? TRUE : FALSE) != FALSE;
+  ok &= freerdp_settings_set_bool(
+      settings, FreeRDP_DynamicResolutionUpdate,
       config_.enableDynamicResize ? TRUE : FALSE) != FALSE;
   ok &= freerdp_settings_set_bool(
       settings, FreeRDP_RedirectClipboard,
@@ -492,7 +574,12 @@ void RdpSession::workerMain()
   }
 
   vlog.info("Connecting to RDP server %s:%d", config_.host.c_str(), config_.port);
-  if (!freerdp_connect(instance)) {
+  bool connected = !stopRequested_.load() && freerdp_connect(instance);
+  {
+    std::lock_guard<std::mutex> lock(connectionMutex_);
+    connectAbortEvent_ = nullptr;
+  }
+  if (!connected) {
     UINT32 err = freerdp_get_last_error(ctx);
     const char* errStr = freerdp_get_last_error_string(err);
     std::string msg = std::string("RDP connect failed: ") +
@@ -514,11 +601,13 @@ void RdpSession::workerMain()
     if (stopRequested_.load())
       break;
 
-    // Abort hanging clipboard transfer request from server if VNC client does not answer.
-    if (waitingLocalClipboardData_ &&
-        (monotonicNowMs() - localClipboardReqStartMs_ > 1500)) {
-      waitingLocalClipboardData_ = false;
-      sendCliprdrDataResponse(false, std::string());
+    {
+      std::lock_guard<std::mutex> lock(clipboardMutex_);
+      if (waitingLocalClipboardData_ &&
+          (monotonicNowMs() - localClipboardReqStartMs_ > 1500)) {
+        waitingLocalClipboardData_ = false;
+        sendCliprdrDataResponse(false, std::string());
+      }
     }
 
     DWORD count = freerdp_get_event_handles(ctx, handles,
@@ -590,12 +679,8 @@ void RdpSession::drainOutboundCommands(rdpContext* ctx)
   }
 
   for (const OutboundCommand& cmd : batch) {
-    if (cmd.type == OutboundCommand::Type::Stop) {
-      stopRequested_.store(true);
-      if (ctx)
-        freerdp_abort_connect_context(ctx);
+    if (stopRequested_.load())
       break;
-    }
     executeOutboundCommand(ctx, cmd);
   }
 }
@@ -634,23 +719,35 @@ void RdpSession::executeOutboundCommand(rdpContext* ctx,
     }
     break;
 
-  case OutboundCommand::Type::MonitorLayout:
-    if (disp_ && disp_->SendMonitorLayout && !cmd.monitors.empty()) {
+  case OutboundCommand::Type::MonitorLayout: {
+    uint64_t area = 0;
+    for (const auto& monitor : cmd.monitors)
+      area += static_cast<uint64_t>(monitor.Width) * monitor.Height;
+    if (disp_ && disp_->SendMonitorLayout &&
+        cmd.monitors.size() <= dispMaxMonitors_ && area <= dispMaxArea_) {
       std::vector<DISPLAY_CONTROL_MONITOR_LAYOUT> copy = cmd.monitors;
-      UINT32 count = static_cast<UINT32>(
-          std::min<size_t>(copy.size(), dispMaxMonitors_));
-      disp_->SendMonitorLayout(disp_, count, copy.data());
+      if (disp_->SendMonitorLayout(disp_, copy.size(), copy.data()) == CHANNEL_RC_OK)
+        break;
     }
+    vlog.info("Upstream display control could not accept the requested layout");
+    RdpEvent ev;
+    ev.type = RdpEvent::Type::ResizeFailed;
+    ev.resizeId = cmd.resizeId;
+    eventQueue_.push(std::move(ev));
     break;
+  }
 
-  case OutboundCommand::Type::ClipboardAnnounce:
+  case OutboundCommand::Type::ClipboardAnnounce: {
+    std::lock_guard<std::mutex> lock(clipboardMutex_);
     pendingLocalClipboardAnnounce_ = true;
     pendingLocalClipboardAvailable_ = cmd.clipboardAvailable;
     if (cliprdrReady_)
       sendCliprdrFormatList(cmd.clipboardAvailable);
     break;
+  }
 
-  case OutboundCommand::Type::ClipboardRequest:
+  case OutboundCommand::Type::ClipboardRequest: {
+    std::lock_guard<std::mutex> lock(clipboardMutex_);
     if (cliprdrReady_ && cliprdr_ && cliprdr_->ClientFormatDataRequest) {
       CLIPRDR_FORMAT_DATA_REQUEST req{};
       req.common.msgType = CB_FORMAT_DATA_REQUEST;
@@ -659,27 +756,28 @@ void RdpSession::executeOutboundCommand(rdpContext* ctx,
       cliprdr_->ClientFormatDataRequest(cliprdr_, &req);
     }
     break;
+  }
 
-  case OutboundCommand::Type::ClipboardData:
+  case OutboundCommand::Type::ClipboardData: {
+    std::lock_guard<std::mutex> lock(clipboardMutex_);
     if (waitingLocalClipboardData_) {
       waitingLocalClipboardData_ = false;
       sendCliprdrDataResponse(true, cmd.text);
     }
     break;
+  }
 
   case OutboundCommand::Type::RefreshScreen:
     if (ctx->update && ctx->update->RefreshRect && currentFb_) {
       RECTANGLE_16 area{};
       area.left = 0;
       area.top = 0;
-      area.right = static_cast<UINT16>(currentFb_->width());
-      area.bottom = static_cast<UINT16>(currentFb_->height());
+      area.right = static_cast<UINT16>(currentFb_->width() - 1);
+      area.bottom = static_cast<UINT16>(currentFb_->height() - 1);
       ctx->update->RefreshRect(ctx, 1, &area);
     }
     break;
 
-  case OutboundCommand::Type::Stop:
-    break;
   }
 }
 
@@ -688,6 +786,13 @@ BOOL RdpSession::cbPreConnect(freerdp* instance)
   if (!instance || !instance->context)
     return FALSE;
   rdpContext* ctx = instance->context;
+  RdpSession* self = fromContext(ctx);
+  {
+    std::lock_guard<std::mutex> lock(self->connectionMutex_);
+    if (self->stopRequested_.load())
+      return FALSE;
+    self->connectAbortEvent_ = freerdp_abort_event(ctx);
+  }
   if (PubSub_SubscribeChannelConnected(
           ctx->pubSub, &RdpSession::cbOnChannelConnected) < 0 ||
       PubSub_SubscribeChannelDisconnected(
@@ -777,6 +882,7 @@ void RdpSession::cbPostDisconnect(freerdp* instance)
   self->gfx_ = nullptr;
   self->gfxHooked_ = false;
   self->disp_ = nullptr;
+  std::lock_guard<std::mutex> lock(self->clipboardMutex_);
   self->cliprdr_ = nullptr;
   self->cliprdrReady_ = false;
 }
@@ -876,9 +982,11 @@ void RdpSession::cbOnChannelConnected(void* context,
     disp->custom = self;
     disp->DisplayControlCaps = &RdpSession::cbDispCaps;
     self->disp_ = disp;
+    self->dispMaxArea_ = 0;
     vlog.info("MS-RDPEDISP channel connected");
   } else if (std::strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0 &&
              e->pInterface) {
+    std::lock_guard<std::mutex> lock(self->clipboardMutex_);
     auto* cliprdr = static_cast<CliprdrClientContext*>(e->pInterface);
     cliprdr->custom = self;
     cliprdr->ServerCapabilities = &RdpSession::cbCliprdrServerCaps;
@@ -906,7 +1014,13 @@ void RdpSession::cbOnChannelDisconnected(void* context,
   if (std::strcmp(e->name, RDPGFX_DVC_CHANNEL_NAME) == 0 && e->pInterface) {
     auto* gfx = static_cast<RdpgfxClientContext*>(e->pInterface);
     if (self->gfxHooked_ && self->gfx_ == gfx) {
-      *gfx = self->origGfx_;
+      gfx->ResetGraphics = self->origGfx_.ResetGraphics;
+      gfx->StartFrame = self->origGfx_.StartFrame;
+      gfx->EndFrame = self->origGfx_.EndFrame;
+      gfx->SurfaceCommand = self->origGfx_.SurfaceCommand;
+      gfx->SolidFill = self->origGfx_.SolidFill;
+      gfx->SurfaceToSurface = self->origGfx_.SurfaceToSurface;
+      gfx->DeleteSurface = self->origGfx_.DeleteSurface;
       self->gfxHooked_ = false;
       self->gfx_ = nullptr;
     }
@@ -915,8 +1029,10 @@ void RdpSession::cbOnChannelDisconnected(void* context,
   } else if (std::strcmp(e->name, DISP_DVC_CHANNEL_NAME) == 0) {
     self->disp_ = nullptr;
   } else if (std::strcmp(e->name, CLIPRDR_SVC_CHANNEL_NAME) == 0) {
+    std::lock_guard<std::mutex> lock(self->clipboardMutex_);
     self->cliprdr_ = nullptr;
     self->cliprdrReady_ = false;
+    self->waitingLocalClipboardData_ = false;
   }
 }
 
@@ -944,13 +1060,7 @@ void RdpSession::emitPendingCopiesAndDirty(const core::Region& hwndDirty,
 {
   // Emit CopyRect operations first before remaining dirty pixel rects.
   for (const PendingCopyOp& cp : copies) {
-    RdpEvent ev;
-    ev.type = RdpEvent::Type::CopyRect;
-    ev.fbGeneration = fbGeneration_;
-    ev.rect = cp.dstRect;
-    ev.srcX = cp.srcX;
-    ev.srcY = cp.srcY;
-    eventQueue_.push(std::move(ev));
+    pushCopyRect(cp);
   }
   copies.clear();
 
@@ -958,13 +1068,7 @@ void RdpSession::emitPendingCopiesAndDirty(const core::Region& hwndDirty,
   effectiveDirty.assign_subtract(suppressedCopies);
   suppressedCopies.clear();
 
-  if (!effectiveDirty.is_empty()) {
-    RdpEvent ev;
-    ev.type = RdpEvent::Type::FrameUpdate;
-    ev.fbGeneration = fbGeneration_;
-    ev.dirty = std::move(effectiveDirty);
-    eventQueue_.push(std::move(ev));
-  }
+  pushFrameUpdate(effectiveDirty);
 }
 
 void RdpSession::emitPendingHints(std::vector<PendingHintOp>& hints)
@@ -974,6 +1078,20 @@ void RdpSession::emitPendingHints(std::vector<PendingHintOp>& hints)
     ev.fbGeneration = fbGeneration_;
     ev.rect = op.rect;
     if (op.kind == PendingHintOp::Kind::SolidFill) {
+      // GDI may have clipped a fill or painted over it with a later order.
+      bool solid = true;
+      for (int y = op.rect.tl.y; y < op.rect.br.y && solid; ++y) {
+        const uint8_t* px = currentFb_->data() +
+            static_cast<size_t>(y) * currentFb_->strideBytes() + op.rect.tl.x * 4;
+        for (int x = op.rect.tl.x; x < op.rect.br.x; ++x, px += 4) {
+          if (px[0] != op.b || px[1] != op.g || px[2] != op.r) {
+            solid = false;
+            break;
+          }
+        }
+      }
+      if (!solid)
+        continue;
       ev.type = RdpEvent::Type::SolidFill;
       ev.r = op.r;
       ev.g = op.g;
@@ -1031,8 +1149,7 @@ BOOL RdpSession::cbEndPaint(rdpContext* ctx)
   self->inPaint_ = false;
 
   if (self->inGfxEndFrame_) {
-    self->emitPendingCopiesAndDirty(dirty, self->pendingGfxCopies_,
-                                    self->suppressedGfxCopies_);
+    self->gfxPaintDirty_.assign_union(dirty);
   } else {
     self->emitPendingCopiesAndDirty(dirty, self->pendingLegacyCopies_,
                                     self->suppressedLegacyCopies_);
@@ -1053,7 +1170,7 @@ BOOL RdpSession::cbDesktopResize(rdpContext* ctx)
       ctx->settings, FreeRDP_DesktopHeight));
 
   vlog.info("RDP upstream DesktopResize to %dx%d", w, h);
-  if (!self->reallocateFramebuffer(ctx, w, h))
+  if (!self->reallocateFramebuffer(ctx, w, h, self->gfxResizeLayout_))
     return FALSE;
   return TRUE;
 }
@@ -1065,9 +1182,10 @@ void RdpSession::invalidatePendingHintsOverlapping(const core::Rect& rect)
     suppressedGfxCopies_.assign_subtract(core::Region(rect));
     removeRectFromHints(pendingGfxHints_, rect);
     for (auto it = pendingGfxH264_.begin(); it != pendingGfxH264_.end();) {
-      if (!it->rect.intersect(rect).is_empty())
+      if (!it->rect.intersect(rect).is_empty()) {
+        h264State_.markAllContextsReset();
         it = pendingGfxH264_.erase(it);
-      else
+      } else
         ++it;
     }
   } else {
@@ -1114,11 +1232,7 @@ BOOL RdpSession::cbSurfaceBits(rdpContext* ctx,
     } else if (self->inGfxFrame_) {
       self->pendingGfxHints_.push_back(std::move(op));
     } else {
-      RdpEvent dirtyEv;
-      dirtyEv.type = RdpEvent::Type::FrameUpdate;
-      dirtyEv.fbGeneration = self->fbGeneration_;
-      dirtyEv.dirty = core::Region(r);
-      self->eventQueue_.push(std::move(dirtyEv));
+      self->pushFrameUpdate(core::Region(r));
 
       std::vector<PendingHintOp> immediate;
       immediate.push_back(std::move(op));
@@ -1158,13 +1272,7 @@ BOOL RdpSession::cbScrBlt(rdpContext* ctx, const SCRBLT_ORDER* scrBlt)
       self->pendingLegacyCopies_.emplace_back(dstRect, srcRect.tl.x, srcRect.tl.y);
       self->suppressedLegacyCopies_.assign_union(core::Region(dstRect));
     } else {
-      RdpEvent ev;
-      ev.type = RdpEvent::Type::CopyRect;
-      ev.fbGeneration = self->fbGeneration_;
-      ev.rect = dstRect;
-      ev.srcX = srcRect.tl.x;
-      ev.srcY = srcRect.tl.y;
-      self->eventQueue_.push(std::move(ev));
+      self->pushCopyRect(PendingCopyOp(dstRect, srcRect.tl.x, srcRect.tl.y));
     }
   }
   return TRUE;
@@ -1207,11 +1315,7 @@ BOOL RdpSession::cbPatBlt(rdpContext* ctx, PATBLT_ORDER* patBlt)
     if (self->inPaint_) {
       self->pendingLegacyHints_.push_back(std::move(op));
     } else {
-      RdpEvent dirtyEv;
-      dirtyEv.type = RdpEvent::Type::FrameUpdate;
-      dirtyEv.fbGeneration = self->fbGeneration_;
-      dirtyEv.dirty = core::Region(r);
-      self->eventQueue_.push(std::move(dirtyEv));
+      self->pushFrameUpdate(core::Region(r));
 
       std::vector<PendingHintOp> immediate;
       immediate.push_back(std::move(op));
@@ -1256,11 +1360,7 @@ BOOL RdpSession::cbOpaqueRect(rdpContext* ctx,
     if (self->inPaint_) {
       self->pendingLegacyHints_.push_back(std::move(op));
     } else {
-      RdpEvent dirtyEv;
-      dirtyEv.type = RdpEvent::Type::FrameUpdate;
-      dirtyEv.fbGeneration = self->fbGeneration_;
-      dirtyEv.dirty = core::Region(r);
-      self->eventQueue_.push(std::move(dirtyEv));
+      self->pushFrameUpdate(core::Region(r));
 
       std::vector<PendingHintOp> immediate;
       immediate.push_back(std::move(op));
@@ -1358,6 +1458,9 @@ bool RdpSession::tryGetMappedSurfaceOffset(RdpgfxClientContext* gfx,
   auto* surf = static_cast<gdiGfxSurface*>(gfx->GetSurfaceData(gfx, surfaceId));
   if (!surf || !surf->outputMapped || surf->windowMapped)
     return false;
+  if (surf->outputOriginX > AlignedBuffer::kMaxDimension ||
+      surf->outputOriginY > AlignedBuffer::kMaxDimension)
+    return false;
   if ((surf->outputTargetWidth != 0 && surf->outputTargetWidth != surf->width) ||
       (surf->outputTargetHeight != 0 &&
        surf->outputTargetHeight != surf->height)) {
@@ -1372,34 +1475,43 @@ UINT RdpSession::cbGfxResetGraphics(RdpgfxClientContext* gfx,
                                     const RDPGFX_RESET_GRAPHICS_PDU* resetGraphics)
 {
   RdpSession* self = fromGfx(gfx);
-  if (!self || !self->origGfx_.ResetGraphics)
+  if (!self || !self->origGfx_.ResetGraphics || !resetGraphics)
     return ERROR_INTERNAL_ERROR;
 
-  UINT rc = self->origGfx_.ResetGraphics(gfx, resetGraphics);
-  if (rc != CHANNEL_RC_OK)
-    return rc;
-
-  auto* gdi = static_cast<rdpGdi*>(gfx->custom);
-  if (gdi && gdi->context && resetGraphics) {
-    int w = static_cast<int>(resetGraphics->width);
-    int h = static_cast<int>(resetGraphics->height);
-    if (w > 0 && h > 0 && self->currentFb_ &&
-        (w != self->currentFb_->width() || h != self->currentFb_->height())) {
-      rfb::ScreenSet layout;
-      for (UINT32 i = 0; i < resetGraphics->monitorCount; ++i) {
-        const MONITOR_DEF& m = resetGraphics->monitorDefArray[i];
-        int mw = static_cast<int>(m.right - m.left + 1);
-        int mh = static_cast<int>(m.bottom - m.top + 1);
-        if (mw > 0 && mh > 0) {
-          layout.add_screen(rfb::Screen(i + 1, m.left, m.top, mw, mh, 0));
-        }
-      }
-      self->reallocateFramebuffer(gdi->context, w, h,
-                                  layout.num_screens() > 0 ? &layout : nullptr);
-    } else {
-      self->h264State_.markAllContextsReset();
+  rfb::ScreenSet layout;
+  int64_t left = 0;
+  int64_t top = 0;
+  if (resetGraphics->monitorCount > 0) {
+    left = resetGraphics->monitorDefArray[0].left;
+    top = resetGraphics->monitorDefArray[0].top;
+    for (UINT32 i = 1; i < resetGraphics->monitorCount; ++i) {
+      const MONITOR_DEF& m = resetGraphics->monitorDefArray[i];
+      left = std::min(left, static_cast<int64_t>(m.left));
+      top = std::min(top, static_cast<int64_t>(m.top));
     }
   }
+  for (UINT32 i = 0; i < resetGraphics->monitorCount; ++i) {
+    const MONITOR_DEF& m = resetGraphics->monitorDefArray[i];
+    int64_t width = static_cast<int64_t>(m.right) - m.left + 1;
+    int64_t height = static_cast<int64_t>(m.bottom) - m.top + 1;
+    if (m.right - left >= AlignedBuffer::kMaxDimension ||
+        m.bottom - top >= AlignedBuffer::kMaxDimension ||
+        width <= 0 || height <= 0)
+      break;
+    layout.add_screen(rfb::Screen(i, m.left - left, m.top - top, width, height, 0));
+  }
+  if (static_cast<UINT32>(layout.num_screens()) != resetGraphics->monitorCount)
+    layout = rfb::ScreenSet();
+  self->gfxResizeLayout_ = &layout;
+  UINT rc = self->origGfx_.ResetGraphics(gfx, resetGraphics);
+  self->gfxResizeLayout_ = nullptr;
+  self->h264State_.reset();
+  // Some FreeRDP versions skip DesktopResize if only the layout changed.
+  auto* gdi = static_cast<rdpGdi*>(gfx->custom);
+  if (rc == CHANNEL_RC_OK &&
+      !self->reallocateFramebuffer(gdi->context, resetGraphics->width,
+                                   resetGraphics->height, &layout))
+    return ERROR_INTERNAL_ERROR;
   return rc;
 }
 
@@ -1412,15 +1524,24 @@ UINT RdpSession::cbGfxStartFrame(RdpgfxClientContext* gfx,
 
   self->inGfxFrame_ = true;
   self->dirtyInGfxFrame_.clear();
+  self->gfxPaintDirty_.clear();
   self->suppressedGfxCopies_.clear();
   self->pendingGfxCopies_.clear();
   self->pendingGfxHints_.clear();
+  if (!self->pendingGfxH264_.empty()) {
+    self->pendingGfxH264_.clear();
+    self->h264State_.reset();
+  }
 
   return self->origGfx_.StartFrame(gfx, startFrame);
 }
 
 void RdpSession::flushPostGfxHints()
 {
+  for (const PendingH264Op& frame : pendingGfxH264_)
+    suppressedGfxCopies_.assign_union(core::Region(frame.rect));
+  emitPendingCopiesAndDirty(gfxPaintDirty_, pendingGfxCopies_,
+                            suppressedGfxCopies_);
   emitPendingHints(pendingGfxHints_);
   for (PendingH264Op& h : pendingGfxH264_) {
     RdpEvent ev;
@@ -1431,9 +1552,11 @@ void RdpSession::flushPostGfxHints()
     ev.h264Flags = h.flags;
     ev.h264IsIdr = h.isIdr;
     ev.fallbackDirty = std::move(h.fallbackDirty);
+    capturePixels(core::Region(ev.rect), ev.pixels);
     eventQueue_.push(std::move(ev));
   }
   pendingGfxH264_.clear();
+  gfxPaintDirty_.clear();
   dirtyInGfxFrame_.clear();
   suppressedGfxCopies_.clear();
   pendingGfxCopies_.clear();
@@ -1451,7 +1574,8 @@ UINT RdpSession::cbGfxEndFrame(RdpgfxClientContext* gfx,
   self->inGfxEndFrame_ = false;
   self->inGfxFrame_ = false;
 
-  self->flushPostGfxHints();
+  if (rc == CHANNEL_RC_OK)
+    self->flushPostGfxHints();
   return rc;
 }
 
@@ -1466,7 +1590,8 @@ UINT RdpSession::cbGfxDeleteSurface(RdpgfxClientContext* gfx,
     int ox = 0;
     int oy = 0;
     if (self->tryGetMappedSurfaceOffset(gfx, deleteSurface->surfaceId, ox, oy)) {
-      self->h264State_.markContextReset();
+      self->h264State_.reset();
+      self->pendingGfxH264_.clear();
     }
   }
   return self->origGfx_.DeleteSurface(gfx, deleteSurface);
@@ -1482,81 +1607,67 @@ UINT RdpSession::cbGfxSurfaceCommand(RdpgfxClientContext* gfx,
   int ox = 0;
   int oy = 0;
   bool isMapped = self->tryGetMappedSurfaceOffset(gfx, cmd->surfaceId, ox, oy);
-  core::Rect rawRect(ox + static_cast<int>(cmd->left),
-                     oy + static_cast<int>(cmd->top),
-                     ox + static_cast<int>(cmd->right),
-                     oy + static_cast<int>(cmd->bottom));
-  core::Rect r = isMapped ? rawRect.intersect(self->fbBounds()) : core::Rect();
-
-  // Path B: Zero-transcode AVC420 H.264 passthrough
-  bool deferMixedH264 = false;
-  PendingH264Op mixedH264Op;
-  if (isMapped && cmd->codecId == RDPGFX_CODECID_AVC420 &&
-      self->config_.enableH264Passthrough &&
-      self->anyH264Client_.load() && cmd->extra != nullptr &&
-      !r.is_empty() && r == rawRect) {
-    auto* avc = static_cast<const RDPGFX_AVC420_BITMAP_STREAM*>(cmd->extra);
-    ProcessedH264Frame processed;
-    if (self->h264State_.processAccessUnit(avc->data, avc->length, processed)) {
-      bool allSynced = self->allH264Synced_.load();
-
-      // Clear superseded copy/fill hints at this rectangle.
-      if (self->inGfxFrame_) {
-        removeRectFromHints(self->pendingGfxHints_, r);
-        removeRectFromCopies(self->pendingGfxCopies_, r);
-        self->suppressedGfxCopies_.assign_subtract(core::Region(r));
-        self->dirtyInGfxFrame_.assign_union(core::Region(r));
-      }
-
-      if (allSynced) {
-        RdpEvent ev;
-        ev.type = RdpEvent::Type::H264Frame;
-        ev.fbGeneration = self->fbGeneration_;
-        ev.rect = r;
-        ev.payload = std::move(processed.annexB);
-        ev.h264Flags = processed.flags;
-        ev.h264IsIdr = processed.hasIdr;
-        self->eventQueue_.push(std::move(ev));
-        // Bypass GDI AVC420 CPU decode completely when all clients are synced H.264.
-        return CHANNEL_RC_OK;
-      }
-
-      // Mixed legacy or unsynced H.264 client mode: run FreeRDP GDI decode
-      // into the surface so fallbackDirty pixels match before emitting.
-      deferMixedH264 = true;
-      mixedH264Op.rect = r;
-      mixedH264Op.annexB = std::move(processed.annexB);
-      mixedH264Op.flags = processed.flags;
-      mixedH264Op.isIdr = processed.hasIdr;
-      mixedH264Op.fallbackDirty = core::Region(r);
-    }
+  core::Rect rawRect;
+  if (isMapped && cmd->left <= AlignedBuffer::kMaxDimension &&
+      cmd->top <= AlignedBuffer::kMaxDimension &&
+      cmd->right <= AlignedBuffer::kMaxDimension &&
+      cmd->bottom <= AlignedBuffer::kMaxDimension) {
+    rawRect = core::Rect(ox + cmd->left, oy + cmd->top,
+                         ox + cmd->right, oy + cmd->bottom);
   }
+  core::Rect r = rawRect.intersect(self->fbBounds());
 
   UINT rc = self->origGfx_.SurfaceCommand(gfx, cmd);
-  if (rc != CHANNEL_RC_OK || !isMapped || r.is_empty())
+  if (rc != CHANNEL_RC_OK)
     return rc;
 
-  self->invalidatePendingHintsOverlapping(r);
-
-  if (deferMixedH264) {
-    if (self->inGfxFrame_) {
-      // Suppress broadcast FrameUpdate for r so synced H.264 clients do not
-      // receive duplicate Path A pixels alongside H.264.
-      self->suppressedGfxCopies_.assign_union(core::Region(r));
-      self->pendingGfxH264_.push_back(std::move(mixedH264Op));
-    } else {
-      RdpEvent ev;
-      ev.type = RdpEvent::Type::H264Frame;
-      ev.fbGeneration = self->fbGeneration_;
-      ev.rect = mixedH264Op.rect;
-      ev.payload = std::move(mixedH264Op.annexB);
-      ev.h264Flags = mixedH264Op.flags;
-      ev.h264IsIdr = mixedH264Op.isIdr;
-      ev.fallbackDirty = std::move(mixedH264Op.fallbackDirty);
-      self->eventQueue_.push(std::move(ev));
-    }
-    return rc;
+  if (!r.is_empty())
+    self->invalidatePendingHintsOverlapping(r);
+  else if (!self->pendingGfxH264_.empty()) {
+    // Some codecs update a surface without a destination rectangle.
+    self->pendingGfxH264_.clear();
+    self->h264State_.reset();
   }
+
+  if (cmd->codecId == RDPGFX_CODECID_AVC444 ||
+      cmd->codecId == RDPGFX_CODECID_AVC444v2) {
+    self->h264State_.reset();
+  } else if (cmd->codecId == RDPGFX_CODECID_AVC420) {
+    // RFB paints the entire H.264 rectangle. RDP can instead apply
+    // selected regions of a decoded surface, which need pixel fallback.
+    auto* avc = static_cast<const RDPGFX_AVC420_BITMAP_STREAM*>(cmd->extra);
+    core::Region coverage;
+    if (avc && avc->meta.regionRects) {
+      for (UINT32 i = 0; i < avc->meta.numRegionRects; ++i) {
+        const auto& rect = avc->meta.regionRects[i];
+        coverage.assign_union(core::Rect(rect.left, rect.top,
+                                        rect.right, rect.bottom));
+      }
+    }
+
+    ProcessedH264Frame processed;
+    if (self->config_.enableH264Passthrough && self->anyH264Client_.load() &&
+        self->inGfxFrame_ && !r.is_empty() && r == rawRect &&
+        r == self->fbBounds() && coverage == core::Region(r) &&
+        avc && self->h264State_.processAccessUnit(avc->data, avc->length, processed)) {
+      if (!processed.hasIdr && processed.flags != 0)
+        self->h264State_.markAllContextsReset();
+      else {
+        PendingH264Op op;
+        op.rect = r;
+        op.annexB = std::move(processed.annexB);
+        op.flags = processed.flags;
+        op.isIdr = processed.hasIdr && processed.hasSps && processed.hasPps;
+        op.fallbackDirty = core::Region(r);
+        self->pendingGfxH264_.push_back(std::move(op));
+      }
+    } else {
+      self->h264State_.reset();
+    }
+  }
+
+  if (!isMapped || r.is_empty())
+    return rc;
 
   // P3: Opt-in zero-copy Raw passthrough on bit-for-bit PIXEL_FORMAT_BGRX32 match
   if (self->config_.allowRawPassthrough &&
@@ -1568,11 +1679,7 @@ UINT RdpSession::cbGfxSurfaceCommand(RdpgfxClientContext* gfx,
     if (self->inGfxFrame_) {
       self->pendingGfxHints_.push_back(std::move(op));
     } else {
-      RdpEvent dirtyEv;
-      dirtyEv.type = RdpEvent::Type::FrameUpdate;
-      dirtyEv.fbGeneration = self->fbGeneration_;
-      dirtyEv.dirty = core::Region(r);
-      self->eventQueue_.push(std::move(dirtyEv));
+      self->pushFrameUpdate(core::Region(r));
       std::vector<PendingHintOp> immediate;
       immediate.push_back(std::move(op));
       self->emitPendingHints(immediate);
@@ -1620,11 +1727,7 @@ UINT RdpSession::cbGfxSolidFill(RdpgfxClientContext* gfx,
     if (self->inGfxFrame_) {
       self->pendingGfxHints_.push_back(std::move(op));
     } else {
-      RdpEvent dirtyEv;
-      dirtyEv.type = RdpEvent::Type::FrameUpdate;
-      dirtyEv.fbGeneration = self->fbGeneration_;
-      dirtyEv.dirty = core::Region(r);
-      self->eventQueue_.push(std::move(dirtyEv));
+      self->pushFrameUpdate(core::Region(r));
       std::vector<PendingHintOp> immediate;
       immediate.push_back(std::move(op));
       self->emitPendingHints(immediate);
@@ -1683,26 +1786,21 @@ UINT RdpSession::cbGfxSurfaceToSurface(
       self->pendingGfxCopies_.emplace_back(dstRect, srcRect.tl.x, srcRect.tl.y);
       self->suppressedGfxCopies_.assign_union(core::Region(dstRect));
     } else {
-      RdpEvent ev;
-      ev.type = RdpEvent::Type::CopyRect;
-      ev.fbGeneration = self->fbGeneration_;
-      ev.rect = dstRect;
-      ev.srcX = srcRect.tl.x;
-      ev.srcY = srcRect.tl.y;
-      self->eventQueue_.push(std::move(ev));
+      self->pushCopyRect(PendingCopyOp(dstRect, srcRect.tl.x, srcRect.tl.y));
     }
   }
   return rc;
 }
 
 UINT RdpSession::cbDispCaps(DispClientContext* disp, UINT32 maxNumMonitors,
-                            UINT32 /*maxMonitorAreaFactorA*/,
-                            UINT32 /*maxMonitorAreaFactorB*/)
+                            UINT32 maxMonitorAreaFactorA,
+                            UINT32 maxMonitorAreaFactorB)
 {
   if (disp && disp->custom) {
     auto* self = static_cast<RdpSession*>(disp->custom);
-    if (maxNumMonitors > 0)
-      self->dispMaxMonitors_ = maxNumMonitors;
+    self->dispMaxMonitors_ = maxNumMonitors;
+    self->dispMaxArea_ = static_cast<uint64_t>(maxMonitorAreaFactorA) *
+                        maxMonitorAreaFactorB;
   }
   return CHANNEL_RC_OK;
 }
@@ -1773,6 +1871,7 @@ UINT RdpSession::cbCliprdrMonitorReady(CliprdrClientContext* cliprdr,
   if (cliprdr->ClientCapabilities)
     cliprdr->ClientCapabilities(cliprdr, &caps);
 
+  std::lock_guard<std::mutex> lock(self->clipboardMutex_);
   self->cliprdrReady_ = true;
   if (self->pendingLocalClipboardAnnounce_) {
     self->sendCliprdrFormatList(self->pendingLocalClipboardAvailable_);
@@ -1827,13 +1926,16 @@ UINT RdpSession::cbCliprdrServerFormatDataRequest(
   if (!self || !cliprdr || !request)
     return CHANNEL_RC_OK;
 
-  if (request->requestedFormatId != CF_UNICODETEXT) {
-    self->sendCliprdrDataResponse(false, std::string());
-    return CHANNEL_RC_OK;
-  }
+  {
+    std::lock_guard<std::mutex> lock(self->clipboardMutex_);
+    if (request->requestedFormatId != CF_UNICODETEXT) {
+      self->sendCliprdrDataResponse(false, std::string());
+      return CHANNEL_RC_OK;
+    }
 
-  self->waitingLocalClipboardData_ = true;
-  self->localClipboardReqStartMs_ = monotonicNowMs();
+    self->waitingLocalClipboardData_ = true;
+    self->localClipboardReqStartMs_ = monotonicNowMs();
+  }
 
   RdpEvent ev;
   ev.type = RdpEvent::Type::ClipboardRequest;

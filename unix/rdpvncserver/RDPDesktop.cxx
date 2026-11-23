@@ -24,8 +24,10 @@
 
 #include <algorithm>
 #include <chrono>
+#include <cstring>
 
 #include <core/LogWriter.h>
+#include <core/time.h>
 #include <rfb/screenTypes.h>
 
 namespace rdpvnc {
@@ -46,6 +48,16 @@ int clampDebounceMs(int ms)
   return std::max(300, std::min(ms, 500));
 }
 
+bool sameMonitorGeometry(const rfb::ScreenSet& a, const rfb::ScreenSet& b)
+{
+  if (a.num_screens() != b.num_screens())
+    return false;
+  return std::is_permutation(a.begin(), a.end(), b.begin(),
+                             [](const rfb::Screen& x, const rfb::Screen& y) {
+                               return x.dimensions == y.dimensions;
+                             });
+}
+
 } // namespace
 
 RDPDesktop::RDPDesktop(const RdpConfig& rdpConfig,
@@ -63,7 +75,8 @@ RDPDesktop::RDPDesktop(const RdpConfig& rdpConfig,
 
 RDPDesktop::~RDPDesktop()
 {
-  teardownUpstreamSession();
+  if (session_)
+    session_->stop();
 }
 
 void RDPDesktop::init(rfb::VNCServer* vs)
@@ -83,12 +96,11 @@ void RDPDesktop::startUpstreamSession()
   if (session_ && session_->isRunning())
     return;
 
+  session_.reset();
   eventQueue_.clear();
   session_.reset(new RdpSession(rdpConfig_, eventQueue_, credProvider_));
   state_ = State::Connecting;
   prevButtonMask_ = 0;
-  hasPendingResize_ = false;
-  resizeTimer_.stop();
 
   if (!session_->start()) {
     finishReconnectFailure("Failed to start RDP session worker");
@@ -97,10 +109,9 @@ void RDPDesktop::startUpstreamSession()
 
 void RDPDesktop::teardownUpstreamSession()
 {
-  resizeTimer_.stop();
+  finishResize(rfb::resultProhibited);
   idleTimer_.stop();
   reconnectTimer_.stop();
-  hasPendingResize_ = false;
 
   if (session_) {
     session_->stop();
@@ -109,6 +120,10 @@ void RDPDesktop::teardownUpstreamSession()
   eventQueue_.clear();
 
   state_ = State::Idle;
+  lastClipboardOrigin_ = ClipboardOrigin::None;
+  awaitingVncClipboardForRdp_ = false;
+  lastRemoteClipboardText_.clear();
+  lastLocalClipboardText_.clear();
 }
 
 void RDPDesktop::start()
@@ -133,14 +148,14 @@ void RDPDesktop::start()
 void RDPDesktop::stop()
 {
   started_ = false;
-  resizeTimer_.stop();
-  hasPendingResize_ = false;
+  finishResize(rfb::resultProhibited);
   prevButtonMask_ = 0;
 
   if (policy_.idleDisconnectSec > 0 && session_ && session_->isRunning() &&
       (state_ == State::Connected || state_ == State::Connecting)) {
     state_ = State::IdleGrace;
-    idleTimer_.start(policy_.idleDisconnectSec * 1000);
+    clientEncodingsChanged();
+    idleTimer_.start(core::secsToMillis(policy_.idleDisconnectSec));
     vlog.info("Last VNC client disconnected; keeping upstream RDP alive for %d s",
               policy_.idleDisconnectSec);
     return;
@@ -175,8 +190,8 @@ void RDPDesktop::pointerEvent(const core::Point& pos, uint16_t buttonMask)
   if (session_ && state_ == State::Connected && pixelBuffer_.hasValidBuffer()) {
     session_->sendPointerEvent(pos.x, pos.y, buttonMask, prevButtonMask_,
                                pixelBuffer_.width(), pixelBuffer_.height());
+    prevButtonMask_ = buttonMask;
   }
-  prevButtonMask_ = buttonMask;
 }
 
 void RDPDesktop::keyEvent(uint32_t keysym, uint32_t keycode, bool down)
@@ -246,16 +261,34 @@ unsigned int RDPDesktop::setScreenLayout(int fb_width, int fb_height,
     return rfb::resultInvalid;
   }
 
+  if (resizeSent_)
+    return rfb::resultProhibited;
+
   if (pixelBuffer_.hasValidBuffer() &&
       pixelBuffer_.width() == fb_width &&
-      pixelBuffer_.height() == fb_height) {
+      pixelBuffer_.height() == fb_height &&
+      sameMonitorGeometry(layout, currentLayout_)) {
+    finishResize(rfb::resultProhibited);
+    if (server_ && currentLayout_ != layout)
+      server_->setScreenLayout(layout);
+    currentLayout_ = layout;
     return rfb::resultSuccess;
+  }
+
+  auto monitors = KeyMap::buildMonitorLayout(fb_width, fb_height, layout);
+  auto monitor = monitors.begin();
+  for (const rfb::Screen& screen : layout) {
+    if (static_cast<int>(monitor->Width) != screen.dimensions.width() ||
+        static_cast<int>(monitor->Height) != screen.dimensions.height())
+      return rfb::resultInvalid;
+    ++monitor;
   }
 
   pendingResizeWidth_ = fb_width;
   pendingResizeHeight_ = fb_height;
   pendingResizeLayout_ = layout;
   hasPendingResize_ = true;
+  ++resizeId_;
 
   // Mandatory 300-500 ms debounce timer before emitting MS-RDPEDISP PDUs.
   resizeTimer_.start(policy_.resizeDebounceMs);
@@ -280,17 +313,31 @@ void RDPDesktop::flushDebouncedResize()
 {
   if (!hasPendingResize_)
     return;
-  hasPendingResize_ = false;
 
-  if (!session_ || state_ != State::Connected)
+  if (!session_ || state_ != State::Connected) {
+    finishResize(rfb::resultProhibited);
     return;
+  }
 
   std::vector<DISPLAY_CONTROL_MONITOR_LAYOUT> monitors =
       KeyMap::buildMonitorLayout(pendingResizeWidth_, pendingResizeHeight_,
                                  pendingResizeLayout_);
-  vlog.info("Sending debounced MS-RDPEDISP layout for %dx%d (%zu monitor(s))",
+  vlog.info("Requesting MS-RDPEDISP layout for %dx%d (%zu monitor(s))",
             pendingResizeWidth_, pendingResizeHeight_, monitors.size());
-  session_->sendMonitorLayout(monitors);
+  session_->sendMonitorLayout(resizeId_, monitors);
+  resizeSent_ = true;
+  resizeTimer_.start(5000);
+}
+
+void RDPDesktop::finishResize(unsigned int result)
+{
+  if (!hasPendingResize_)
+    return;
+  hasPendingResize_ = false;
+  resizeSent_ = false;
+  resizeTimer_.stop();
+  if (server_)
+    server_->finishDesktopSize(result);
 }
 
 void RDPDesktop::finishReconnectFailure(const std::string& reason)
@@ -304,7 +351,10 @@ void RDPDesktop::finishReconnectFailure(const std::string& reason)
 void RDPDesktop::handleTimeout(core::Timer* t)
 {
   if (t == &resizeTimer_) {
-    flushDebouncedResize();
+    if (resizeSent_)
+      finishResize(rfb::resultNoResources);
+    else
+      flushDebouncedResize();
     return;
   }
 
@@ -312,6 +362,8 @@ void RDPDesktop::handleTimeout(core::Timer* t)
     if (!started_ && state_ == State::IdleGrace) {
       vlog.info("Idle grace timer expired; disconnecting upstream RDP");
       teardownUpstreamSession();
+      server_->setPixelBuffer(nullptr);
+      pixelBuffer_.detach();
     }
     return;
   }
@@ -336,6 +388,16 @@ void RDPDesktop::processEvents()
   }
 }
 
+void RDPDesktop::applyPixels(const core::Region& region, const uint8_t* pixels)
+{
+  std::vector<core::Rect> rects;
+  region.get_rects(&rects);
+  for (const core::Rect& rect : rects) {
+    pixelBuffer_.imageRect(rect, pixels);
+    pixels += static_cast<size_t>(rect.area()) * 4;
+  }
+}
+
 void RDPDesktop::handleSingleEvent(RdpEvent& ev)
 {
   switch (ev.type) {
@@ -350,16 +412,27 @@ void RDPDesktop::handleSingleEvent(RdpEvent& ev)
     }
     break;
 
-  case RdpEvent::Type::Resize:
+  case RdpEvent::Type::Resize: {
     if (state_ == State::Idle)
       break;
-    hasPendingResize_ = false;
-    resizeTimer_.stop();
-    pixelBuffer_.rebind(std::move(ev.framebuffer));
+    bool completed = resizeSent_ && ev.width == pendingResizeWidth_ &&
+                     ev.height == pendingResizeHeight_ &&
+                     sameMonitorGeometry(ev.layout, pendingResizeLayout_);
+    currentLayout_ = completed ? pendingResizeLayout_ : ev.layout;
+    if (ev.framebuffer)
+      pixelBuffer_.rebind(std::move(ev.framebuffer));
     if (server_) {
-      server_->setPixelBuffer(&pixelBuffer_, ev.layout);
+      server_->setPixelBuffer(&pixelBuffer_, currentLayout_, completed);
       server_->resetH264Contexts();
     }
+    if (completed)
+      finishResize(rfb::resultSuccess);
+    break;
+  }
+
+  case RdpEvent::Type::ResizeFailed:
+    if (resizeSent_ && ev.resizeId == resizeId_)
+      finishResize(rfb::resultProhibited);
     break;
 
   case RdpEvent::Type::FrameUpdate:
@@ -367,8 +440,10 @@ void RDPDesktop::handleSingleEvent(RdpEvent& ev)
         ev.fbGeneration != pixelBuffer_.generation()) {
       break;
     }
-    if (server_ && !ev.dirty.is_empty())
+    if (server_ && !ev.dirty.is_empty()) {
+      applyPixels(ev.dirty, ev.pixels.data());
       server_->add_changed(ev.dirty);
+    }
     break;
 
   case RdpEvent::Type::CopyRect:
@@ -378,7 +453,25 @@ void RDPDesktop::handleSingleEvent(RdpEvent& ev)
     }
     if (server_ && !ev.rect.is_empty()) {
       core::Point delta(ev.rect.tl.x - ev.srcX, ev.rect.tl.y - ev.srcY);
-      server_->add_copied(core::Region(ev.rect), delta);
+      core::Rect source = ev.rect.translate(delta.negate());
+      int stride;
+      const uint8_t* src = pixelBuffer_.getBuffer(source, &stride);
+      const uint8_t* pixels = ev.pixels.data();
+      size_t rowBytes = static_cast<size_t>(ev.rect.width()) * 4;
+      bool matches = true;
+      for (int row = 0; row < ev.rect.height(); ++row) {
+        if (std::memcmp(src + static_cast<size_t>(row) * stride * 4,
+                        pixels + row * rowBytes, rowBytes) != 0) {
+          matches = false;
+          break;
+        }
+      }
+      core::Region region(ev.rect);
+      applyPixels(region, pixels);
+      if (matches)
+        server_->add_copied(region, delta);
+      else
+        server_->add_changed(region);
     }
     break;
 
@@ -414,13 +507,17 @@ void RDPDesktop::handleSingleEvent(RdpEvent& ev)
     break;
 
   case RdpEvent::Type::H264Frame:
-    if (state_ != State::Connected ||
+    if (!pixelBuffer_.hasValidBuffer() ||
         ev.fbGeneration != pixelBuffer_.generation()) {
       break;
     }
     if (server_ && !ev.rect.is_empty() && !ev.payload.empty()) {
-      server_->add_h264(ev.rect, ev.payload.data(), ev.payload.size(),
-                        ev.h264Flags, ev.h264IsIdr, ev.fallbackDirty);
+      applyPixels(core::Region(ev.rect), ev.pixels.data());
+      if (state_ == State::Connected)
+        server_->add_h264(ev.rect, ev.payload.data(), ev.payload.size(),
+                          ev.h264Flags, ev.h264IsIdr, ev.fallbackDirty);
+      else
+        server_->add_changed(ev.fallbackDirty);
     }
     break;
 
@@ -485,9 +582,12 @@ void RDPDesktop::handleSingleEvent(RdpEvent& ev)
               lastDisconnectReason_.c_str());
     if (!started_) {
       teardownUpstreamSession();
+      server_->setPixelBuffer(nullptr);
+      pixelBuffer_.detach();
       break;
     }
 
+    finishResize(rfb::resultNoResources);
     if (policy_.maxReconnectAttempts > 0 &&
         reconnectAttempts_ < policy_.maxReconnectAttempts) {
       ++reconnectAttempts_;

@@ -30,7 +30,9 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstring>
+#include <future>
 #include <memory>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <vector>
@@ -178,7 +180,8 @@ public:
 
   std::vector<uint8_t> readBytes(size_t count)
   {
-    EXPECT_TRUE(waitBytes(count));
+    if (!waitBytes(count))
+      throw std::runtime_error("Timed out reading RFB test response");
     std::vector<uint8_t> out(rx_.begin(), rx_.begin() + count);
     rx_.erase(rx_.begin(), rx_.begin() + count);
     return out;
@@ -669,6 +672,20 @@ TEST(MonitorLayoutTest, ClampsMonitorsAndEvenWidths)
   EXPECT_EQ(768U, monitors[1].Height);
 }
 
+TEST(MonitorLayoutTest, UsesPrimaryMonitorAsOrigin)
+{
+  rfb::ScreenSet set;
+  set.add_screen(rfb::Screen(1, 1280, 200, 1920, 1080, 0));
+  set.add_screen(rfb::Screen(2, 0, 0, 1280, 1024, 0));
+
+  auto monitors = KeyMap::buildMonitorLayout(3200, 1280, set);
+  ASSERT_EQ(2U, monitors.size());
+  EXPECT_EQ(0, monitors[0].Left);
+  EXPECT_EQ(0, monitors[0].Top);
+  EXPECT_EQ(-1280, monitors[1].Left);
+  EXPECT_EQ(-200, monitors[1].Top);
+}
+
 TEST(RdpPixelBufferTest, AlignmentAndFormat)
 {
   auto buf = AlignedBuffer::create(1366, 768, 7);
@@ -762,11 +779,12 @@ TEST(EventQueueOrderTest, FifoOrderingAndEventFdWakeup)
   f1.dirty = core::Region(core::Rect(0, 0, 10, 10));
   q.push(std::move(f1));
 
-  // Adjacent FrameUpdate coalesces
+  // Adjacent frame updates retain their own pixel data.
   RdpEvent f2;
   f2.type = RdpEvent::Type::FrameUpdate;
   f2.fbGeneration = 1;
   f2.dirty = core::Region(core::Rect(20, 20, 30, 30));
+  f2.pixels.assign(10 * 10 * 4, 42);
   q.push(std::move(f2));
 
   // CopyRect acts as barrier
@@ -789,14 +807,36 @@ TEST(EventQueueOrderTest, FifoOrderingAndEventFdWakeup)
 
   std::vector<RdpEvent> out;
   q.drain(out);
-  ASSERT_EQ(3U, out.size());
+  ASSERT_EQ(4U, out.size());
   EXPECT_EQ(RdpEvent::Type::FrameUpdate, out[0].type);
-  EXPECT_EQ(RdpEvent::Type::CopyRect, out[1].type);
-  EXPECT_EQ(RdpEvent::Type::FrameUpdate, out[2].type);
+  EXPECT_EQ(RdpEvent::Type::FrameUpdate, out[1].type);
+  EXPECT_EQ(std::vector<uint8_t>(10 * 10 * 4, 42), out[1].pixels);
+  EXPECT_EQ(RdpEvent::Type::CopyRect, out[2].type);
+  EXPECT_EQ(RdpEvent::Type::FrameUpdate, out[3].type);
 
   // Drain clears eventfd
   pfd.revents = 0;
   EXPECT_EQ(0, ::poll(&pfd, 1, 0));
+}
+
+TEST(EventQueueOrderTest, CancelWakesProducerWaitingForSpace)
+{
+  RdpEventQueue queue;
+  for (int i = 0; i < 1024; ++i)
+    queue.push(RdpEvent());
+
+  auto producer = std::async(std::launch::async, [&] {
+    queue.push(RdpEvent());
+  });
+  EXPECT_EQ(std::future_status::timeout,
+            producer.wait_for(std::chrono::milliseconds(20)));
+  queue.cancel();
+  producer.get();
+  EXPECT_EQ(1024U, queue.approximateSize());
+
+  queue.clear();
+  queue.push(RdpEvent());
+  EXPECT_EQ(1U, queue.approximateSize());
 }
 
 TEST(RfbPassthroughPipelineTest, PathACopyRectSolidFillRawJpegAndH264Mixed)
@@ -994,7 +1034,7 @@ TEST(RfbPassthroughPipelineTest, PathACopyRectSolidFillRawJpegAndH264Mixed)
   desktop.pb_.rebind(newBuf);
   rfb::ScreenSet newLayout;
   newLayout.add_screen(rfb::Screen(1, 0, 0, 2500, 768, 0));
-  server.setPixelBuffer(&desktop.pb_, newLayout);
+  server.setPixelBuffer(&desktop.pb_, newLayout, true);
   auto resizeRects = c1.readNextFramebufferUpdate(32);
   ASSERT_FALSE(resizeRects.empty());
   bool sawEds = false;
@@ -1002,6 +1042,8 @@ TEST(RfbPassthroughPipelineTest, PathACopyRectSolidFillRawJpegAndH264Mixed)
     if (r.encoding == rfb::pseudoEncodingExtendedDesktopSize) {
       EXPECT_EQ(2500, r.w);
       EXPECT_EQ(768, r.h);
+      EXPECT_EQ(rfb::reasonClient, r.x);
+      EXPECT_EQ(rfb::resultSuccess, r.y);
       sawEds = true;
     }
   }
@@ -1026,6 +1068,57 @@ TEST(RfbPassthroughPipelineTest, PathACopyRectSolidFillRawJpegAndH264Mixed)
     EXPECT_LE(r.w, 2048);
     EXPECT_EQ(rfb::encodingTight, r.encoding);
   }
+}
+
+TEST(RfbPassthroughPipelineTest, H264OutsideRequestedAreaUsesPixelFallback)
+{
+  core::Configuration::setParam("SecurityTypes", "None");
+  core::Configuration::setParam("FrameRate", "1000");
+  MockDesktop desktop(64, 64);
+  rfb::VNCServerST server("test", &desktop);
+  TestRfbClient client(server);
+  client.sendSetEncodings({rfb::encodingH264, rfb::encodingRaw});
+  client.sendFbUpdateRequest(0, 0, 64, 64, false);
+  ASSERT_FALSE(client.readNextFramebufferUpdate().empty());
+
+  core::Rect fullFrame(0, 0, 64, 64);
+  const uint8_t frame[] = {0, 0, 1, 0x65, 0x88};
+  desktop.pb_.backing()->data()[0] = 123;
+  server.add_h264(fullFrame, frame, sizeof(frame), 0, true,
+                  core::Region(fullFrame));
+  client.sendFbUpdateRequest(0, 0, 16, 16, true);
+  auto rects = client.readNextFramebufferUpdate();
+  ASSERT_EQ(1U, rects.size());
+  EXPECT_EQ(rfb::encodingRaw, rects[0].encoding);
+  EXPECT_EQ(16, rects[0].w);
+  EXPECT_EQ(16, rects[0].h);
+  ASSERT_FALSE(rects[0].data.empty());
+  EXPECT_EQ(123, rects[0].data[0]);
+
+  int synced = -1;
+  server.getClientCapabilities(nullptr, nullptr, &synced, nullptr);
+  EXPECT_EQ(0, synced);
+}
+
+TEST(RfbPassthroughPipelineTest, ResizeFailureRepliesWithoutOutstandingUpdate)
+{
+  core::Configuration::setParam("SecurityTypes", "None");
+  MockDesktop desktop(64, 64);
+  desktop.nextLayoutResult_ = rfb::resultPending;
+  rfb::VNCServerST server("test", &desktop);
+  TestRfbClient client(server);
+  client.sendSetEncodings({rfb::encodingRaw,
+                           rfb::pseudoEncodingExtendedDesktopSize});
+  client.sendSetDesktopSize(100, 100);
+  client.pump();
+  EXPECT_EQ(0U, client.bufferedRxSize());
+
+  server.finishDesktopSize(rfb::resultProhibited);
+  auto rects = client.readNextFramebufferUpdate();
+  ASSERT_EQ(1U, rects.size());
+  EXPECT_EQ(rfb::pseudoEncodingExtendedDesktopSize, rects[0].encoding);
+  EXPECT_EQ(rfb::reasonClient, rects[0].x);
+  EXPECT_EQ(rfb::resultProhibited, rects[0].y);
 }
 
 TEST(RDPDesktopPolicyTest, DebounceClampingAndZeroSilentHangOnDisconnect)

@@ -21,7 +21,6 @@
 #endif
 
 #include <poll.h>
-#include <sys/stat.h>
 
 #include <algorithm>
 #include <cerrno>
@@ -66,12 +65,12 @@ core::StringParameter desktopName("desktop",
                                   "Name of desktop reported to VNC clients",
                                   "rdpvnc");
 core::IntParameter rfbport("rfbport",
-                           "TCP port to listen for RFB protocol", 5900);
+                           "TCP port to listen for RFB protocol", 5900, -1, 65535);
 core::StringParameter rfbunixpath("rfbunixpath",
                                   "Unix socket path to listen for RFB protocol",
                                   "");
 core::IntParameter rfbunixmode("rfbunixmode",
-                               "Unix socket permission mode", 0600);
+                               "Unix socket permission mode", 0600, 0000, 0777);
 core::StringParameter interfaceOpt("interface",
                                    "Interface address to listen on", "all");
 core::BoolParameter localhostOnly("localhost",
@@ -148,60 +147,48 @@ void printVersion(FILE* fp)
   std::fprintf(fp, "\nTigerVNC rdpvncserver %s\n", PACKAGE_VERSION);
 }
 
-bool hasSystemdListeners()
-{
-#ifdef HAVE_LIBSYSTEMD
-  return sd_listen_fds(0) != 0;
-#else
-  return false;
-#endif
-}
-
 class FileTcpFilter : public network::TcpFilter {
 public:
   explicit FileTcpFilter(std::string fname)
-    : network::TcpFilter("-"), fileName_(std::move(fname)), lastModTime_(0)
+    : network::TcpFilter("-"), fileName_(std::move(fname))
   {
   }
 
   bool verifyConnection(network::Socket* s) override
   {
-    if (!reloadRules()) {
-      vlog.error("Could not read IP filtering rules, rejecting client");
-      filter.clear();
-      filter.push_back(parsePattern("-"));
+    try {
+      if (reloadRules())
+        return network::TcpFilter::verifyConnection(s);
+    } catch (const std::exception& e) {
+      vlog.error("Invalid IP filtering rules in %s: %s",
+                 fileName_.c_str(), e.what());
       return false;
     }
-    return network::TcpFilter::verifyConnection(s);
+    vlog.error("Could not read IP filtering rules from %s", fileName_.c_str());
+    return false;
   }
 
 private:
   bool reloadRules()
   {
-    if (fileName_.empty())
-      return true;
-    struct stat st{};
-    if (::stat(fileName_.c_str(), &st) != 0)
+    std::ifstream in(fileName_);
+    if (!in.is_open())
       return false;
-    if (st.st_mtime != lastModTime_) {
-      std::ifstream in(fileName_);
-      if (!in.is_open())
-        return false;
-      filter.clear();
-      std::string line;
-      while (std::getline(in, line)) {
-        if (!line.empty() && line.back() == '\r')
-          line.pop_back();
-        if (!line.empty() && std::strchr("+-?", line[0]) != nullptr)
-          filter.push_back(parsePattern(line.c_str()));
-      }
-      lastModTime_ = st.st_mtime;
+    std::list<Pattern> rules;
+    std::string line;
+    while (std::getline(in, line)) {
+      if (!line.empty() && line.back() == '\r')
+        line.pop_back();
+      if (!line.empty() && std::strchr("+-?", line[0]) != nullptr)
+        rules.push_back(parsePattern(line.c_str()));
     }
+    if (in.bad())
+      return false;
+    filter.swap(rules);
     return true;
   }
 
   std::string fileName_;
-  time_t lastModTime_;
 };
 
 void printUsage(const char* prog)
@@ -209,7 +196,7 @@ void printUsage(const char* prog)
   std::fprintf(stderr,
                "\nusage: %s [parameters]\n"
                "\n"
-               "Bridge an upstream FreeRDP 3.x session to downstream VNC/RFB "
+               "Bridge an upstream RDP session to downstream VNC/RFB "
                "clients.\n"
                "\nParameters can be turned on with -<param> or off with "
                "-<param>=0\n"
@@ -228,9 +215,6 @@ int main(int argc, char** argv)
 {
   core::initStdIOLoggers();
   core::LogWriter::setLogParams("*:stderr:30");
-
-  if (hasSystemdListeners())
-    rfbport.setParam(-1);
 
   for (int i = 1; i < argc;) {
     if (std::strcmp(argv[i], "-h") == 0 ||
@@ -266,9 +250,20 @@ int main(int argc, char** argv)
   std::signal(SIGPIPE, SIG_IGN);
 
   try {
+    sigset_t terminationSignals, waitMask;
+    sigemptyset(&terminationSignals);
+    sigaddset(&terminationSignals, SIGHUP);
+    sigaddset(&terminationSignals, SIGINT);
+    sigaddset(&terminationSignals, SIGTERM);
+    if (sigprocmask(SIG_BLOCK, &terminationSignals, &waitMask) < 0)
+      throw std::runtime_error(std::string("Could not block signals: ") +
+                               std::strerror(errno));
+
     rdpvnc::RdpConfig rdpCfg;
     rdpCfg.host = rdpHost.getValueStr();
     rdpCfg.port = rdpPort;
+    if (rdpCfg.port < 1 || rdpCfg.port > 65535)
+      throw std::invalid_argument("RdpPort must be between 1 and 65535");
     rdpCfg.username = rdpUser.getValueStr();
     rdpCfg.password = rdpPassword.getValueStr();
     if (rdpCfg.password.empty()) {
@@ -302,20 +297,25 @@ int main(int argc, char** argv)
     rdpvnc::RDPDesktop desktop(rdpCfg, policy);
     rfb::VNCServerST server(desktopName.getValueStr().c_str(), &desktop);
 
-    std::vector<std::unique_ptr<network::SocketListener>> listeners;
-
-#ifdef HAVE_LIBSYSTEMD
-    int sdFds = sd_listen_fds(0);
-    for (int i = 0; i < sdFds; ++i) {
-      listeners.emplace_back(new network::TcpListener(SD_LISTEN_FDS_START + i));
-    }
-#endif
-
     std::unique_ptr<FileTcpFilter> tcpFilter;
     std::string hostsPath = hostsFile.getValueStr();
     if (!hostsPath.empty()) {
       tcpFilter.reset(new FileTcpFilter(hostsPath));
     }
+
+    std::vector<std::unique_ptr<network::SocketListener>> listeners;
+#ifdef HAVE_LIBSYSTEMD
+    int sdFds = sd_listen_fds(1);
+    if (sdFds < 0)
+      throw std::runtime_error(std::string("Could not get systemd sockets: ") +
+                               std::strerror(-sdFds));
+    for (int i = 0; i < sdFds; ++i) {
+      std::unique_ptr<network::TcpListener> listener(
+          new network::TcpListener(SD_LISTEN_FDS_START + i));
+      listener->setFilter(tcpFilter.get());
+      listeners.push_back(std::move(listener));
+    }
+#endif
 
     if (listeners.empty()) {
       std::string unixPath = rfbunixpath.getValueStr();
@@ -393,19 +393,29 @@ int main(int argc, char** argv)
       }
 
       int nextTimeout = core::Timer::checkTimeouts();
-      int n = ::poll(fds.data(), static_cast<nfds_t>(fds.size()), nextTimeout);
+      struct timespec timeout{};
+      if (nextTimeout >= 0) {
+        timeout.tv_sec = nextTimeout / 1000;
+        timeout.tv_nsec = (nextTimeout % 1000) * 1000000L;
+      }
+      int n = ::ppoll(fds.data(), fds.size(),
+                      nextTimeout >= 0 ? &timeout : nullptr, &waitMask);
       if (n < 0) {
         if (errno == EINTR)
           continue;
-        throw std::runtime_error(std::string("poll() failed: ") +
+        throw std::runtime_error(std::string("ppoll() failed: ") +
                                  std::strerror(errno));
       }
 
+      if (fds[0].revents & (POLLERR | POLLHUP | POLLNVAL))
+        throw std::runtime_error("RDP event descriptor closed");
       if (fds[0].revents & POLLIN) {
         desktop.processEvents();
       }
 
       for (size_t i = 0; i < listeners.size(); ++i) {
+        if (fds[listenerStart + i].revents & (POLLERR | POLLHUP | POLLNVAL))
+          throw std::runtime_error("RFB listening socket closed");
         if (fds[listenerStart + i].revents & POLLIN) {
           network::Socket* client = listeners[i]->accept();
           if (client) {
@@ -418,11 +428,11 @@ int main(int argc, char** argv)
       for (size_t i = 0; i < activeSockets.size(); ++i) {
         short revents = fds[socketStart + i].revents;
         network::Socket* sock = activeSockets[i];
-        if (revents & POLLIN)
+        if (revents & (POLLIN | POLLHUP | POLLERR))
           server.processSocketReadEvent(sock);
         if (revents & POLLOUT)
           server.processSocketWriteEvent(sock);
-        if (sock->isShutdownRead()) {
+        if (sock->isShutdownRead() || (revents & POLLNVAL)) {
           server.removeSocket(sock);
           delete sock;
         }

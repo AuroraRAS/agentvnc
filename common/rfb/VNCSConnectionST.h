@@ -71,11 +71,12 @@ namespace rfb {
     void processSocketWriteEvent();
 
     // Called when the underlying pixelbuffer is resized or replaced.
-    void pixelBufferChange();
+    void pixelBufferChange(unsigned int reason);
 
     // Wrappers to make these methods "safe" for VNCServerST.
     void writeFramebufferUpdateOrClose();
     void screenLayoutChangeOrClose(uint16_t reason);
+    void finishDesktopSizeOrClose(unsigned int result);
     void setCursorOrClose();
     void bellOrClose();
     void setDesktopNameOrClose(const char *name);
@@ -181,6 +182,7 @@ namespace rfb {
     void writeLosslessRefresh();
 
     void screenLayoutChange(uint16_t reason);
+    void queueDesktopSizeReply(unsigned int result);
     void setCursor();
     void setCursorPos();
     void setDesktopName(const char *name);
@@ -193,6 +195,7 @@ namespace rfb {
     bool inProcessMessages;
 
     bool pendingSyncFence, syncFence;
+    bool pendingDesktopSizeReply = false;
     uint32_t fenceFlags;
     unsigned fenceDataLen;
     uint8_t *fenceData;

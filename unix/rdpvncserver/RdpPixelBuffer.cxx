@@ -64,6 +64,8 @@ std::shared_ptr<AlignedBuffer> AlignedBuffer::create(int width, int height,
       width > kMaxDimension || height > kMaxDimension) {
     throw std::invalid_argument("Invalid framebuffer dimensions");
   }
+  if (minStridePixels > kMaxDimension)
+    throw std::invalid_argument("Invalid framebuffer stride");
 
   int stridePixels = roundUpStride(width, minStridePixels);
   if (stridePixels <= 0 || stridePixels > kMaxDimension) {
@@ -128,8 +130,7 @@ void RdpPixelBuffer::detach()
 }
 
 RdpEventQueue::RdpEventQueue()
-  : eventfd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC)),
-    signaled_(false)
+  : eventfd_(::eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC))
 {
   if (eventfd_ < 0) {
     throw std::runtime_error(std::string("eventfd() failed: ") +
@@ -147,24 +148,22 @@ RdpEventQueue::~RdpEventQueue()
 
 void RdpEventQueue::push(RdpEvent&& ev)
 {
-  bool needSignal = false;
-  {
-    std::lock_guard<std::mutex> lock(mutex_);
-    if (ev.type == RdpEvent::Type::FrameUpdate &&
-        !queue_.empty() &&
-        queue_.back().type == RdpEvent::Type::FrameUpdate &&
-        queue_.back().fbGeneration == ev.fbGeneration) {
-      queue_.back().dirty.assign_union(ev.dirty);
-    } else {
-      queue_.push_back(std::move(ev));
-    }
-    if (!signaled_) {
-      signaled_ = true;
-      needSignal = true;
-    }
-  }
+  constexpr size_t queueBudget = 32u * 1024u * 1024u;
+  size_t bytes = ev.pixels.size() + ev.payload.size() + ev.text.size();
+  if (ev.framebuffer)
+    bytes += ev.framebuffer->byteSize();
+  std::unique_lock<std::mutex> lock(mutex_);
+  spaceAvailable_.wait(lock, [&] {
+    return cancelled_ || queue_.empty() ||
+           (queuedBytes_ + bytes <= queueBudget && queue_.size() < 1024);
+  });
+  if (cancelled_)
+    return;
 
-  if (needSignal && eventfd_ >= 0) {
+  bool needSignal = queue_.empty();
+  queue_.push_back(std::move(ev));
+  queuedBytes_ += bytes;
+  if (needSignal) {
     uint64_t one = 1;
     ssize_t n;
     do {
@@ -173,39 +172,45 @@ void RdpEventQueue::push(RdpEvent&& ev)
   }
 }
 
+void RdpEventQueue::drainSignal()
+{
+  uint64_t val;
+  ssize_t n;
+  do {
+    n = ::read(eventfd_, &val, sizeof(val));
+  } while (n < 0 && errno == EINTR);
+}
+
 void RdpEventQueue::drain(std::vector<RdpEvent>& out)
 {
   out.clear();
-  if (eventfd_ >= 0) {
-    uint64_t val = 0;
-    ssize_t n;
-    do {
-      n = ::read(eventfd_, &val, sizeof(val));
-    } while (n < 0 && errno == EINTR);
-  }
-
   std::lock_guard<std::mutex> lock(mutex_);
-  signaled_ = false;
+  drainSignal();
+
   out.reserve(queue_.size());
   while (!queue_.empty()) {
     out.push_back(std::move(queue_.front()));
     queue_.pop_front();
   }
+  queuedBytes_ = 0;
+  spaceAvailable_.notify_all();
+}
+
+void RdpEventQueue::cancel()
+{
+  std::lock_guard<std::mutex> lock(mutex_);
+  cancelled_ = true;
+  spaceAvailable_.notify_all();
 }
 
 void RdpEventQueue::clear()
 {
-  if (eventfd_ >= 0) {
-    uint64_t val = 0;
-    ssize_t n;
-    do {
-      n = ::read(eventfd_, &val, sizeof(val));
-    } while (n < 0 && errno == EINTR);
-  }
-
   std::lock_guard<std::mutex> lock(mutex_);
-  signaled_ = false;
+  drainSignal();
   queue_.clear();
+  queuedBytes_ = 0;
+  cancelled_ = false;
+  spaceAvailable_.notify_all();
 }
 
 size_t RdpEventQueue::approximateSize() const

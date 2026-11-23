@@ -1,5 +1,6 @@
 find_package(PkgConfig REQUIRED)
-pkg_check_modules(FREERDP3 REQUIRED IMPORTED_TARGET freerdp3 freerdp-client3 winpr3)
+pkg_check_modules(FREERDP3 REQUIRED IMPORTED_TARGET freerdp3>=3.2 freerdp-client3 winpr3)
+find_package(Threads REQUIRED)
 
 add_library(rdpvncserver_lib STATIC
   RdpPixelBuffer.cxx
@@ -25,6 +26,7 @@ target_link_libraries(rdpvncserver_lib PUBLIC
   rdr
   core
   PkgConfig::FREERDP3
+  Threads::Threads
 )
 
 add_executable(rdpvncserver

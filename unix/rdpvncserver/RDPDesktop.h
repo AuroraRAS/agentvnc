@@ -109,7 +109,9 @@ private:
   void startUpstreamSession();
   void teardownUpstreamSession();
   void handleSingleEvent(RdpEvent& ev);
+  void applyPixels(const core::Region& region, const uint8_t* pixels);
   void flushDebouncedResize();
+  void finishResize(unsigned int result);
   void finishReconnectFailure(const std::string& reason);
 
   RdpConfig rdpConfig_;
@@ -128,9 +130,12 @@ private:
   // Debounced VNC -> RDP MS-RDPEDISP resize state
   core::Timer resizeTimer_;
   bool hasPendingResize_ = false;
+  bool resizeSent_ = false;
+  uint64_t resizeId_ = 0;
   int pendingResizeWidth_ = 0;
   int pendingResizeHeight_ = 0;
   rfb::ScreenSet pendingResizeLayout_;
+  rfb::ScreenSet currentLayout_;
 
   // Idle disconnect & bounded reconnect state
   core::Timer idleTimer_;

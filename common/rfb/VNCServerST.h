@@ -84,9 +84,11 @@ namespace rfb {
     void unblockUpdates() override;
     uint64_t getMsc() override;
     void queueMsc(uint64_t target) override;
-    void setPixelBuffer(PixelBuffer* pb, const ScreenSet& layout) override;
+    void setPixelBuffer(PixelBuffer* pb, const ScreenSet& layout,
+                        bool resizeFromClient = false) override;
     void setPixelBuffer(PixelBuffer* pb) override;
     void setScreenLayout(const ScreenSet& layout) override;
+    void finishDesktopSize(unsigned int result) override;
     const PixelBuffer* getPixelBuffer() const override { return pb; }
 
     void requestClipboard() override;
@@ -213,6 +215,7 @@ namespace rfb {
     std::list<VNCSConnectionST*> clients;
     VNCSConnectionST* pointerClient;
     VNCSConnectionST* clipboardClient;
+    VNCSConnectionST* resizeRequester = nullptr;
     std::list<VNCSConnectionST*> clipboardRequestors;
 
     time_t pointerClientTime;

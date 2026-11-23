@@ -219,14 +219,15 @@ void VNCSConnectionST::processSocketWriteEvent()
   }
 }
 
-void VNCSConnectionST::pixelBufferChange()
+void VNCSConnectionST::pixelBufferChange(unsigned int reason)
 {
   try {
     if (state() != RFBSTATE_NORMAL)
       return;
-    if (client.width() && client.height() &&
-        (server->getPixelBuffer()->width() != client.width() ||
-         server->getPixelBuffer()->height() != client.height()))
+    bool dimensionsChanged =
+        server->getPixelBuffer()->width() != client.width() ||
+        server->getPixelBuffer()->height() != client.height();
+    if (dimensionsChanged)
     {
       // We need to clip the next update to the new size, but also add any
       // extra bits if it's bigger.  If we wanted to do this exactly, something
@@ -245,19 +246,24 @@ void VNCSConnectionST::pixelBufferChange()
 
       damagedCursorRegion.assign_intersect(server->getPixelBuffer()->getRect());
 
+      if (!client.supportsDesktopSize()) {
+        close(_("Client does not support resizing the desktop"));
+        return;
+      }
+
+      encodeManager.pruneLosslessRefresh(server->getPixelBuffer()->getRect());
+    }
+
+    if (dimensionsChanged || reason == reasonClient ||
+        server->getScreenLayout() != client.screenLayout()) {
       client.setDimensions(server->getPixelBuffer()->width(),
                            server->getPixelBuffer()->height(),
                            server->getScreenLayout());
-      if (state() == RFBSTATE_NORMAL) {
-        if (!client.supportsDesktopSize()) {
-          close(_("Client does not support resizing the desktop"));
-          return;
-        }
-        writer()->writeDesktopSize(reasonServer);
-      }
-
-      // Drop any lossy tracking that is now outside the framebuffer
-      encodeManager.pruneLosslessRefresh(server->getPixelBuffer()->getRect());
+      if (reason == reasonClient)
+        queueDesktopSizeReply(resultSuccess);
+      else if (dimensionsChanged ||
+               client.supportsEncoding(pseudoEncodingExtendedDesktopSize))
+        writer()->writeDesktopSize(reason);
     }
     resetH264Context();
     pendingSolidFills.clear();
@@ -290,6 +296,26 @@ void VNCSConnectionST::screenLayoutChangeOrClose(uint16_t reason)
   } catch(std::exception& e) {
     close(e.what());
   }
+}
+
+void VNCSConnectionST::finishDesktopSizeOrClose(unsigned int result)
+{
+  if (state() != RFBSTATE_NORMAL ||
+      !client.supportsEncoding(pseudoEncodingExtendedDesktopSize))
+    return;
+
+  try {
+    queueDesktopSizeReply(result);
+    writeFramebufferUpdate();
+  } catch (const std::exception& e) {
+    close(e.what());
+  }
+}
+
+void VNCSConnectionST::queueDesktopSizeReply(unsigned int result)
+{
+  writer()->writeDesktopSize(reasonClient, result);
+  pendingDesktopSizeReply = true;
 }
 
 void VNCSConnectionST::bellOrClose()
@@ -449,6 +475,18 @@ void VNCSConnectionST::add_changed(const core::Region& region)
 void VNCSConnectionST::add_copied(const core::Region& dest,
                                   const core::Point& delta)
 {
+  if (!pendingH264.empty()) {
+    core::Region source = dest;
+    source.translate(delta.negate());
+    for (const H264Rect& frame : pendingH264) {
+      if (!source.intersect(frame.rect).is_empty() ||
+          !dest.intersect(frame.rect).is_empty()) {
+        add_changed(dest);
+        return;
+      }
+    }
+  }
+
   PassthroughBatch tmp;
   tmp.solidFills.swap(pendingSolidFills);
   tmp.rawRects = pendingRawRects;
@@ -487,23 +525,23 @@ bool VNCSConnectionST::add_h264(const core::Rect& rect,
   static const size_t maxQueuedH264Bytes = 16u * 1024u * 1024u;
 
   if (!supportsH264()) {
-    updates.add_changed(fallbackDirty);
+    add_changed(fallbackDirty);
     return false;
   }
 
+  bool wasSynced = h264Synced;
+  if (flags & 0x03)
+    resetH264Context();
+
   if (!h264Synced && !isIdr) {
-    updates.add_changed(fallbackDirty);
-    return false;
+    add_changed(fallbackDirty);
+    return wasSynced;
   }
 
   if ((pendingH264.size() >= maxQueuedH264Frames) ||
       (pendingH264Bytes + len > maxQueuedH264Bytes)) {
-    bool wasSynced = h264Synced;
-    pendingH264.clear();
-    pendingH264Bytes = 0;
-    h264Synced = false;
-    h264NeedsReset = true;
-    updates.add_changed(fallbackDirty);
+    resetH264Context();
+    add_changed(fallbackDirty);
     if (server->getPixelBuffer() != nullptr)
       updates.add_changed(server->getPixelBuffer()->getRect());
     return wasSynced;
@@ -528,17 +566,15 @@ bool VNCSConnectionST::add_h264(const core::Rect& rect,
   pendingH264.push_back(std::move(hr));
   pendingH264Bytes += len;
 
-  if (!h264Synced && isIdr) {
-    updates.subtract(core::Region(rect));
-    h264Synced = true;
-    return true;
-  }
-
-  return false;
+  updates.subtract(core::Region(rect));
+  h264Synced = true;
+  return !wasSynced;
 }
 
 void VNCSConnectionST::resetH264Context()
 {
+  for (const H264Rect& frame : pendingH264)
+    add_changed(core::Region(frame.rect));
   pendingH264.clear();
   pendingH264Bytes = 0;
   h264Synced = false;
@@ -857,7 +893,7 @@ void VNCSConnectionST::setDesktopSize(int fb_width, int fb_height,
   }
 
   if (result != resultPending)
-    writer()->writeDesktopSize(reasonClient, result);
+    queueDesktopSizeReply(result);
 }
 
 void VNCSConnectionST::fence(uint32_t flags, unsigned len, const uint8_t data[])
@@ -1074,7 +1110,7 @@ void VNCSConnectionST::writeFramebufferUpdate()
 
   if (state() != RFBSTATE_NORMAL)
     return;
-  if (requested.is_empty() && !continuousUpdates)
+  if (requested.is_empty() && !continuousUpdates && !pendingDesktopSizeReply)
     return;
 
   // Check that we actually have some space on the link and retry in a
@@ -1106,6 +1142,7 @@ void VNCSConnectionST::writeNoDataUpdate()
     return;
 
   writer()->writeNoDataUpdate();
+  pendingDesktopSizeReply = false;
 
   // Make sure no data update is sent until next request
   requested.clear();
@@ -1180,6 +1217,15 @@ void VNCSConnectionST::writeDataUpdate()
     req.clear();
     ui.changed.clear();
     ui.copied.clear();
+  } else {
+    for (const H264Rect& frame : pendingH264) {
+      if (core::Region(frame.rect).subtract(req).is_empty())
+        continue;
+      resetH264Context();
+      server->clientEncodingsChanged();
+      updates.getUpdateInfo(&ui, req);
+      break;
+    }
   }
 
   // Does the client need a server-side rendered cursor?
@@ -1201,16 +1247,16 @@ void VNCSConnectionST::writeDataUpdate()
 
     // Track where we've rendered the cursor
     damagedCursorRegion.assign_union(ui.changed.intersect(renderedCursorRect));
+    if (!serverPending) {
+      for (const H264Rect& frame : pendingH264)
+        damagedCursorRegion.assign_union(frame.rect.intersect(renderedCursorRect));
+    }
   }
 
-  bool hasPassthrough = !serverPending &&
-                        ((!pendingH264.empty() && supportsH264()) ||
-                         !pendingSolidFills.empty() ||
-                         !pendingRawRects.is_empty() ||
-                         !pendingJpegRects.empty());
+  bool hasH264 = !serverPending && !pendingH264.empty() && supportsH264();
 
   // If we don't have a normal update, then try a lossless refresh
-  if (ui.is_empty() && !hasPassthrough && !writer()->needFakeUpdate()) {
+  if (ui.is_empty() && !hasH264 && !writer()->needFakeUpdate()) {
     writeLosslessRefresh();
     return;
   }

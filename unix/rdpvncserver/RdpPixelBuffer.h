@@ -20,6 +20,7 @@
 #define __RDPVNCSERVER_RDPPIXELBUFFER_H__
 
 #include <cstddef>
+#include <condition_variable>
 #include <cstdint>
 #include <deque>
 #include <memory>
@@ -36,11 +37,9 @@
 namespace rdpvnc {
 
 /**
- * Cache-line (64-byte) aligned host framebuffer shared between the FreeRDP GDI
- * context on the worker thread and TigerVNC encoders on the main thread.
- * Immutable once created with respect to dimensions, stride, and base pointer;
- * a desktop resize allocates a new AlignedBuffer instance and passes ownership
- * safely across threads via std::shared_ptr.
+ * Cache-line (64-byte) aligned framebuffer storage. FreeRDP and TigerVNC
+ * use separate buffers. A resize event transfers the newly allocated
+ * TigerVNC buffer to the main thread before the first pixel update.
  */
 class AlignedBuffer {
 public:
@@ -81,8 +80,7 @@ private:
 };
 
 /**
- * Zero-copy TigerVNC FullFramePixelBuffer wrapper pointing directly to the
- * 64-byte aligned BGRX32 primary buffer used by FreeRDP GDI.
+ * TigerVNC framebuffer with main-thread-owned BGRX32 pixels.
  */
 class RdpPixelBuffer : public rfb::FullFramePixelBuffer {
 public:
@@ -97,8 +95,7 @@ public:
   static const rfb::PixelFormat& bgrx32PixelFormat();
 
   /**
-   * Rebinds this pixel buffer to a newly allocated AlignedBuffer without
-   * copying frame contents.
+   * Rebinds this pixel buffer to a new backing buffer.
    */
   void rebind(std::shared_ptr<AlignedBuffer> buf);
 
@@ -137,6 +134,7 @@ struct RdpEvent {
     CursorNull,
     CursorPosition,
     Resize,
+    ResizeFailed,
     Connected,
     ClipboardAnnounce,
     ClipboardData,
@@ -149,6 +147,9 @@ struct RdpEvent {
 
   // FrameUpdate
   core::Region dirty;
+  // Tightly packed BGRX32 pixels for dirty.get_rects(), or for rect if
+  // this event is a CopyRect or H264Frame.
+  std::vector<uint8_t> pixels;
 
   // CopyRect, SolidFill, RawRect, JpegRect, H264Frame
   core::Rect rect;
@@ -182,6 +183,7 @@ struct RdpEvent {
   // Resize
   std::shared_ptr<AlignedBuffer> framebuffer;
   rfb::ScreenSet layout;
+  uint64_t resizeId = 0;
 
   // Clipboard
   bool clipboardAvailable = false;
@@ -206,9 +208,8 @@ public:
   int fd() const { return eventfd_; }
 
   /**
-   * Pushes an event to the queue and signals eventfd if needed. Consecutive
-   * FrameUpdate events with matching fbGeneration are coalesced without ever
-   * jumping ahead of any intervening graphics or control event.
+   * Pushes an event and signals eventfd. Waits for the consumer if queued
+   * pixel data would exceed the queue budget.
    */
   void push(RdpEvent&& ev);
 
@@ -216,6 +217,9 @@ public:
    * Drains all currently queued events in exact FIFO order and clears eventfd.
    */
   void drain(std::vector<RdpEvent>& out);
+
+  // Wake producers waiting for space during session shutdown.
+  void cancel();
 
   /**
    * Removes all pending events (e.g. during teardown).
@@ -225,10 +229,14 @@ public:
   size_t approximateSize() const;
 
 private:
+  void drainSignal();
+
   int eventfd_;
   mutable std::mutex mutex_;
+  std::condition_variable spaceAvailable_;
   std::deque<RdpEvent> queue_;
-  bool signaled_;
+  size_t queuedBytes_ = 0;
+  bool cancelled_ = false;
 };
 
 } // namespace rdpvnc
