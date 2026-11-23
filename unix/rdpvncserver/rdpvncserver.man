@@ -1,0 +1,72 @@
+.TH rdpvncserver 1 "" "TigerVNC" "Virtual Network Computing"
+.SH NAME
+rdpvncserver \- TigerVNC RDP-to-VNC bridge server
+.SH SYNOPSIS
+.B rdpvncserver
+.RI [ parameters ]
+.SH DESCRIPTION
+.B rdpvncserver
+exposes an upstream RDP session as a TigerVNC RFB desktop server using
+FreeRDP 3.x (3.2 or later).
+It hands completed pixel updates from the FreeRDP decoding worker to the TigerVNC
+.BR poll (2)
+client loop, supports BGRX32 framebuffers with hardware cursors, and
+can forward full-frame AVC420 H.264 updates to clients negotiating
+.B encodingH264 (50)
+while retaining decoded pixels for other clients and pixel-format updates.
+
+The upstream RDP session starts on demand when the first VNC client
+authenticates and disconnects when the last client leaves (or after
+.BR -RdpIdleDisconnectSec ).
+.SH PARAMETERS
+.TP
+.B \-RdpHost \fIhost\fP
+Hostname or IP address of the upstream RDP server. Default is
+.BR 127.0.0.1 .
+.TP
+.B \-RdpPort \fIport\fP
+TCP port of the upstream RDP server. Default is
+.BR 3389 .
+.TP
+.B \-RdpUser \fIuser\fP
+Username for RDP authentication (NLA/TLS/RDP).
+.TP
+.B \-RdpPassword \fIpassword\fP
+Password for RDP authentication (prefer
+.B \-RdpPasswordFile
+or
+.B RDPVNCSERVER_PASSWORD
+in production).
+.TP
+.B \-RdpPasswordFile \fIfile\fP
+Path to a file whose first line contains the upstream RDP password.
+.TP
+.B \-RdpDomain \fIdomain\fP
+Windows/Active Directory domain for NLA authentication.
+.TP
+.B \-RdpIgnoreCert
+Accept untrusted or changed upstream RDP TLS certificates.
+.TP
+.B \-RdpH264Passthrough
+Enable zero-transcode AVC420 H.264 passthrough to RFB H.264 clients.
+.TP
+.B \-RdpAllowRawPassthrough
+Allow direct BGRX32 Raw passthrough on bit-for-bit pixel format match.
+.TP
+.B \-RdpJpegPassthrough
+Allow forwarding supported JFIF rectangles to TightJPEG/JPEG VNC clients.
+.TP
+.B \-RdpResizeDebounceMs \fIms\fP
+Delay (300\(en500 ms) before forwarding VNC resize requests over MS-RDPEDISP.
+Requests rejected by the upstream channel or left incomplete after five seconds
+receive an error reply.
+.TP
+.B \-RdpIdleDisconnectSec \fIsec\fP
+Grace period after the last VNC client disconnects before tearing down RDP.
+.TP
+.B \-RdpReconnectAttempts \fIcount\fP
+Bounded reconnect retries on unexpected RDP drop before closing VNC clients.
+.SH SEE ALSO
+.BR vncviewer (1),
+.BR x0vncserver (1),
+.BR w0vncserver (1)

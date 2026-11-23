@@ -96,6 +96,10 @@ namespace rfb {
     // signalling that a good time to render new data
     virtual void frameTick(uint64_t msc) { (void)msc; }
 
+    // clientEncodingsChanged() is called when a connected client updates
+    // its supported encodings or finishes readiness/disconnects.
+    virtual void clientEncodingsChanged() {}
+
     // keyEvent() is called whenever a client sends an event that a
     // key was pressed or released.
     virtual void keyEvent(uint32_t /*keysym*/, uint32_t /*keycode*/,

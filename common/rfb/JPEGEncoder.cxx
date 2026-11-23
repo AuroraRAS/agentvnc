@@ -209,3 +209,9 @@ void JPEGEncoder::writeSolidRect(int width, int height,
   //        without having to use the default fallback which is very slow.
   Encoder::writeSolidRect(width, height, pf, colour);
 }
+
+void JPEGEncoder::resetTables()
+{
+  lastHuffmanTables.clear();
+  lastQuantTables.clear();
+}

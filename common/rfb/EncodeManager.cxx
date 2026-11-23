@@ -35,6 +35,7 @@
 #include <rfb/Palette.h>
 #include <rfb/SConnection.h>
 #include <rfb/SMsgWriter.h>
+#include <rfb/TightConstants.h>
 #include <rfb/UpdateTracker.h>
 #include <rfb/encodings.h>
 
@@ -260,6 +261,101 @@ void EncodeManager::logStats()
             ratio, _("ratio"));
 }
 
+static void writeTightCompact(uint32_t value, rdr::OutStream* os)
+{
+  uint8_t b = value & 0x7F;
+  if (value <= 0x7F) {
+    os->writeU8(b);
+  } else {
+    os->writeU8(b | 0x80);
+    b = (value >> 7) & 0x7F;
+    if (value <= 0x3FFF) {
+      os->writeU8(b);
+    } else {
+      os->writeU8(b | 0x80);
+      os->writeU8((value >> 14) & 0xFF);
+    }
+  }
+}
+
+static void splitSubRects(const core::Rect& rect,
+                          std::vector<core::Rect>* out)
+{
+  int w = rect.width();
+  int h = rect.height();
+
+  if (((w * h) < SubRectMaxArea) && (w < SubRectMaxWidth)) {
+    out->push_back(rect);
+    return;
+  }
+
+  int sw = (w <= SubRectMaxWidth) ? w : SubRectMaxWidth;
+  int sh = SubRectMaxArea / sw;
+
+  core::Rect sr;
+  for (sr.tl.y = rect.tl.y; sr.tl.y < rect.br.y; sr.tl.y += sh) {
+    sr.br.y = sr.tl.y + sh;
+    if (sr.br.y > rect.br.y)
+      sr.br.y = rect.br.y;
+
+    for (sr.tl.x = rect.tl.x; sr.tl.x < rect.br.x; sr.tl.x += sw) {
+      sr.br.x = sr.tl.x + sw;
+      if (sr.br.x > rect.br.x)
+        sr.br.x = rect.br.x;
+
+      out->push_back(sr);
+    }
+  }
+}
+
+void PassthroughBatch::clear()
+{
+  h264Rects.clear();
+  solidFills.clear();
+  rawRects.clear();
+  jpegRects.clear();
+}
+
+void PassthroughBatch::pruneOverlapping(const core::Region& region)
+{
+  if (region.is_empty())
+    return;
+
+  rawRects.assign_subtract(region);
+
+  if (!solidFills.empty()) {
+    std::vector<SolidFillRect> kept;
+    kept.reserve(solidFills.size());
+    for (size_t i = 0; i < solidFills.size(); i++) {
+      core::Region r(solidFills[i].rect);
+      if (r.intersect(region).is_empty()) {
+        kept.push_back(solidFills[i]);
+      } else {
+        core::Region rem = r.subtract(region);
+        std::vector<core::Rect> rects;
+        rem.get_rects(&rects);
+        for (size_t k = 0; k < rects.size(); k++) {
+          SolidFillRect sf;
+          sf.rect = rects[k];
+          memcpy(sf.bgrx, solidFills[i].bgrx, sizeof(sf.bgrx));
+          kept.push_back(sf);
+        }
+      }
+    }
+    solidFills.swap(kept);
+  }
+
+  if (!jpegRects.empty()) {
+    std::vector<JpegRect> kept;
+    kept.reserve(jpegRects.size());
+    for (size_t i = 0; i < jpegRects.size(); i++) {
+      if (core::Region(jpegRects[i].rect).intersect(region).is_empty())
+        kept.push_back(std::move(jpegRects[i]));
+    }
+    jpegRects.swap(kept);
+  }
+}
+
 bool EncodeManager::supported(int encoding)
 {
   switch (encoding) {
@@ -273,6 +369,12 @@ bool EncodeManager::supported(int encoding)
   default:
     return false;
   }
+}
+
+bool EncodeManager::supportsJpegPassthrough() const
+{
+  return encoders[encoderTightJPEG]->isSupported() ||
+         encoders[encoderJPEG]->isSupported();
 }
 
 bool EncodeManager::needsLosslessRefresh(const core::Region& req)
@@ -306,9 +408,11 @@ void EncodeManager::forceRefresh(const core::Region& req)
 }
 
 void EncodeManager::writeUpdate(const UpdateInfo& ui, const PixelBuffer* pb,
-                                const RenderedCursor* renderedCursor)
+                                const RenderedCursor* renderedCursor,
+                                const PassthroughBatch* passthrough)
 {
-  doUpdate(true, ui.changed, ui.copied, ui.copy_delta, pb, renderedCursor);
+  doUpdate(true, ui.changed, ui.copied, ui.copy_delta, pb,
+           renderedCursor, passthrough);
 
   recentlyChangedRegion.assign_union(ui.changed);
   recentlyChangedRegion.assign_union(ui.copied);
@@ -322,7 +426,7 @@ void EncodeManager::writeLosslessRefresh(const core::Region& req,
                                          size_t maxUpdateSize)
 {
   doUpdate(false, getLosslessRefresh(req, maxUpdateSize),
-           {}, {}, pb, renderedCursor);
+           {}, {}, pb, renderedCursor, nullptr);
 }
 
 void EncodeManager::handleTimeout(core::Timer* t)
@@ -344,7 +448,8 @@ void EncodeManager::doUpdate(bool allowLossy, const
                              const core::Region& copied,
                              const core::Point& copyDelta,
                              const PixelBuffer* pb,
-                             const RenderedCursor* renderedCursor)
+                             const RenderedCursor* renderedCursor,
+                             const PassthroughBatch* passthrough)
 {
     int nRects;
     core::Region changed, cursorRegion;
@@ -363,8 +468,91 @@ void EncodeManager::doUpdate(bool allowLossy, const
      * magical pixel buffer, so split it out from the changed region.
      */
     if (renderedCursor != nullptr) {
-      cursorRegion = changed.intersect(renderedCursor->getEffectiveRect());
-      changed.assign_subtract(renderedCursor->getEffectiveRect());
+      core::Rect effCursorRect = renderedCursor->getEffectiveRect();
+      cursorRegion = changed.intersect(effCursorRect);
+      if (passthrough != nullptr) {
+        for (size_t i = 0; i < passthrough->h264Rects.size(); i++) {
+          core::Rect overlap = passthrough->h264Rects[i].rect.intersect(effCursorRect);
+          if (!overlap.is_empty())
+            cursorRegion.assign_union(overlap);
+        }
+      }
+      changed.assign_subtract(effCursorRect);
+    }
+
+    struct FilteredSolid {
+      core::Rect rect;
+      uint8_t bgrx[4];
+    };
+    struct FilteredJpeg {
+      const JpegRect* entry;
+      bool useTight;
+    };
+
+    std::vector<const H264Rect*> h264List;
+    std::vector<FilteredSolid> solidList;
+    core::Region rawRegion;
+    std::vector<FilteredJpeg> jpegList;
+
+    if (passthrough != nullptr && !passthrough->empty()) {
+      for (size_t i = 0; i < passthrough->h264Rects.size(); i++) {
+        if (!passthrough->h264Rects[i].rect.is_empty())
+          h264List.push_back(&passthrough->h264Rects[i]);
+      }
+
+      if (!passthrough->solidFills.empty() && pb != nullptr) {
+        for (size_t i = 0; i < passthrough->solidFills.size(); i++) {
+          const SolidFillRect& sf = passthrough->solidFills[i];
+          core::Region clipped = core::Region(sf.rect).intersect(changed);
+          if (clipped.is_empty())
+            continue;
+          changed.assign_subtract(clipped);
+
+          std::vector<core::Rect> rects;
+          clipped.get_rects(&rects);
+          for (size_t r = 0; r < rects.size(); r++) {
+            std::vector<core::Rect> subs;
+            splitSubRects(rects[r], &subs);
+            for (size_t s = 0; s < subs.size(); s++) {
+              FilteredSolid fs;
+              fs.rect = subs[s];
+              memcpy(fs.bgrx, sf.bgrx, sizeof(fs.bgrx));
+              solidList.push_back(fs);
+            }
+          }
+        }
+      }
+
+      if (!passthrough->rawRects.is_empty() && pb != nullptr &&
+          conn->client.pf().trueColour && pb->getPF().trueColour &&
+          conn->client.pf() == pb->getPF() &&
+          conn->client.pf().isLittleEndian() == pb->getPF().isLittleEndian()) {
+        rawRegion = passthrough->rawRects.intersect(changed);
+        if (!rawRegion.is_empty())
+          changed.assign_subtract(rawRegion);
+      }
+
+      if (allowLossy && !passthrough->jpegRects.empty()) {
+        bool tightJpegOk = encoders[encoderTightJPEG]->isSupported();
+        bool plainJpegOk = encoders[encoderJPEG]->isSupported();
+        for (size_t i = 0; i < passthrough->jpegRects.size(); i++) {
+          const JpegRect& jr = passthrough->jpegRects[i];
+          if (jr.rect.is_empty() || jr.data.size() < 4)
+            continue;
+          bool useTight = tightJpegOk &&
+                          (jr.rect.width() <= SubRectMaxWidth) &&
+                          (jr.data.size() <= 0x3FFFFF);
+          if (!useTight && !plainJpegOk)
+            continue;
+          if (!core::Region(jr.rect).subtract(changed).is_empty())
+            continue;
+          changed.assign_subtract(jr.rect);
+          FilteredJpeg fj;
+          fj.entry = &jr;
+          fj.useTight = useTight;
+          jpegList.push_back(fj);
+        }
+      }
     }
 
     if (conn->client.supportsEncoding(pseudoEncodingLastRect))
@@ -373,6 +561,10 @@ void EncodeManager::doUpdate(bool allowLossy, const
       nRects = 0;
       if (conn->client.supportsEncoding(encodingCopyRect))
         nRects += copied.numRects();
+      nRects += static_cast<int>(h264List.size());
+      nRects += static_cast<int>(solidList.size());
+      nRects += computeNumRects(rawRegion);
+      nRects += static_cast<int>(jpegList.size());
       nRects += computeNumRects(changed);
       nRects += computeNumRects(cursorRegion);
     }
@@ -381,6 +573,91 @@ void EncodeManager::doUpdate(bool allowLossy, const
 
     if (conn->client.supportsEncoding(encodingCopyRect))
       writeCopyRects(copied, copyDelta);
+
+    for (size_t i = 0; i < h264List.size(); i++) {
+      const H264Rect& h = *h264List[i];
+      rdr::OutStream* os = conn->getOutStream();
+      conn->writer()->startRect(h.rect, encodingH264);
+      os->writeU32(static_cast<uint32_t>(h.data.size()));
+      os->writeU32(h.flags);
+      if (!h.data.empty())
+        os->writeBytes(h.data.data(), h.data.size());
+      conn->writer()->endRect();
+      lossyRegion.assign_subtract(h.rect);
+      pendingRefreshRegion.assign_subtract(h.rect);
+    }
+
+    for (size_t i = 0; i < solidList.size(); i++) {
+      const core::Rect& sr = solidList[i].rect;
+      Encoder* encoder = startRect(sr, encoderSolid);
+      if (encoder->flags & EncoderUseNativePF) {
+        encoder->writeSolidRect(sr.width(), sr.height(),
+                                pb->getPF(), solidList[i].bgrx);
+      } else {
+        uint32_t convertedBuf = 0;
+        uint8_t* converted = reinterpret_cast<uint8_t*>(&convertedBuf);
+        conn->client.pf().bufferFromBuffer(converted, pb->getPF(),
+                                           solidList[i].bgrx, 1);
+        encoder->writeSolidRect(sr.width(), sr.height(),
+                                conn->client.pf(), converted);
+      }
+      endRect();
+    }
+
+    if (!rawRegion.is_empty()) {
+      std::vector<core::Rect> rawRectsVec;
+      rawRegion.get_rects(&rawRectsVec);
+      for (size_t i = 0; i < rawRectsVec.size(); i++) {
+        std::vector<core::Rect> subs;
+        splitSubRects(rawRectsVec[i], &subs);
+        for (size_t s = 0; s < subs.size(); s++) {
+          const core::Rect& sr = subs[s];
+          PixelBuffer* ppb = preparePixelBuffer(sr, pb, false);
+          beforeLength = conn->getOutStream()->length();
+          stats[encoderRaw][encoderFullColour].rects++;
+          stats[encoderRaw][encoderFullColour].pixels += sr.area();
+          stats[encoderRaw][encoderFullColour].equivalent +=
+              12 + sr.area() * (conn->client.pf().bpp / 8);
+          conn->writer()->startRect(sr, encodingRaw);
+          encoders[encoderRaw]->writeRect(ppb, Palette());
+          conn->writer()->endRect();
+          stats[encoderRaw][encoderFullColour].bytes +=
+              conn->getOutStream()->length() - beforeLength;
+          lossyRegion.assign_subtract(sr);
+          pendingRefreshRegion.assign_subtract(sr);
+        }
+      }
+    }
+
+    for (size_t i = 0; i < jpegList.size(); i++) {
+      const JpegRect& jr = *jpegList[i].entry;
+      rdr::OutStream* os = conn->getOutStream();
+      beforeLength = os->length();
+      if (jpegList[i].useTight) {
+        stats[encoderTightJPEG][encoderFullColour].rects++;
+        stats[encoderTightJPEG][encoderFullColour].pixels += jr.rect.area();
+        stats[encoderTightJPEG][encoderFullColour].equivalent +=
+            12 + jr.rect.area() * (conn->client.pf().bpp / 8);
+        conn->writer()->startRect(jr.rect, encodingTight);
+        os->writeU8(tightJpeg << 4);
+        writeTightCompact(static_cast<uint32_t>(jr.data.size()), os);
+        os->writeBytes(jr.data.data(), jr.data.size());
+        conn->writer()->endRect();
+        stats[encoderTightJPEG][encoderFullColour].bytes += os->length() - beforeLength;
+      } else {
+        stats[encoderJPEG][encoderFullColour].rects++;
+        stats[encoderJPEG][encoderFullColour].pixels += jr.rect.area();
+        stats[encoderJPEG][encoderFullColour].equivalent +=
+            12 + jr.rect.area() * (conn->client.pf().bpp / 8);
+        conn->writer()->startRect(jr.rect, encodingJPEG);
+        os->writeBytes(jr.data.data(), jr.data.size());
+        conn->writer()->endRect();
+        static_cast<JPEGEncoder*>(encoders[encoderJPEG])->resetTables();
+        stats[encoderJPEG][encoderFullColour].bytes += os->length() - beforeLength;
+      }
+      lossyRegion.assign_union(jr.rect);
+      pendingRefreshRegion.assign_subtract(jr.rect);
+    }
 
     /*
      * We start by searching for solid rects, which are then removed

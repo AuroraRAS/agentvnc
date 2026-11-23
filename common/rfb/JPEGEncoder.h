@@ -44,6 +44,8 @@ namespace rfb {
     void writeSolidRect(int width, int height, const PixelFormat& pf,
                         const uint8_t* colour) override;
 
+    void resetTables();
+
   protected:
     JpegCompressor jc;
 

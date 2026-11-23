@@ -151,7 +151,7 @@ namespace rfb {
       RFBSTATE_INVALID
     };
 
-    stateEnum state() { return state_; }
+    stateEnum state() const { return state_; }
 
     int32_t getPreferredEncoding() { return preferredEncoding; }
 
