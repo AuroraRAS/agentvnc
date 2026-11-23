@@ -38,9 +38,9 @@ TigerVNC ``master`` branch, ensuring that no fixes from upstream are missed.
 AgentVNC Features and Usage
 ===========================
 
-Compared to upstream TigerVNC, AgentVNC adds four main feature sets across
-``vncviewer`` (plus supporting Python tools in ``tools/``) and the Unix/Linux
-``scrcpyvncserver`` server:
+Compared to upstream TigerVNC, AgentVNC adds five main feature sets across
+``vncviewer``, its supporting Python tools in ``tools/``, and the
+``scrcpyvncserver`` and ``rdpvncserver`` servers.
 
 1. An external AI agent IPC bridge with headless mode, a live action overlay,
    and human-agent collaborative takeover.
@@ -50,6 +50,8 @@ Compared to upstream TigerVNC, AgentVNC adds four main feature sets across
    (TightVNC 2.x, TightVNC 1.3.x, and UltraVNC) over standard FTP.
 4. ``scrcpyvncserver`` - a zero-transcoding VNC server bridging Android
    ``scrcpy-server`` H.264 streams over ADB to RFB Open H.264 viewers.
+5. ``rdpvncserver`` - an RDP-to-VNC bridge that exposes an RDP desktop to
+   VNC viewers.
 
 
 Agent IPC Bridge, Headless Mode, and Collaborative Control
@@ -325,6 +327,101 @@ Example::
       127.0.0.1::5900
 
 
+RDP-to-VNC Bridge (rdpvncserver)
+--------------------------------
+
+On Linux, ``rdpvncserver`` uses FreeRDP to expose a Windows or other RDP
+desktop to VNC viewers.  The first authenticated VNC client starts the RDP
+session, which viewers can share.  The bridge relays keyboard and pointer
+input and cursor updates.  It synchronizes clipboard text in both directions
+when the RDP server provides the clipboard channel.
+
+Standard VNC viewers receive decoded framebuffer updates.  The bridge can
+also forward compatible full-frame AVC420 streams directly to viewers that
+negotiate RFB Open H.264.  Dynamic resizing requires
+``ExtendedDesktopSize`` on the VNC side and the MS-RDPEDISP display-control
+channel on the RDP side.
+
+Build and Connect
+~~~~~~~~~~~~~~~~~
+
+The bridge is optional and requires FreeRDP 3.2 or later in the 3.x series
+and the ``freerdp3``, ``freerdp-client3``, and ``winpr3`` pkg-config modules.
+Build it from the repository root.
+
+.. code-block:: sh
+
+  cmake -S . -B build -DBUILD_RDPVNCSERVER=ON
+  cmake --build build --target rdpvncserver vncpasswd
+
+For a local VNC listener, create a VNC password file with ``vncpasswd``.
+Store the upstream RDP password on the first line of a separate file readable
+only by your account.  Replace the RDP hostname and username in the example.
+
+.. code-block:: sh
+
+  mkdir -p "$HOME/.config/tigervnc"
+  build/unix/vncpasswd/vncpasswd "$HOME/.config/tigervnc/rdp-bridge.passwd"
+
+  build/unix/rdpvncserver/rdpvncserver \
+      -RdpHost windows.example.com -RdpUser your-user \
+      -RdpPasswordFile "$HOME/.config/tigervnc/rdp-password" \
+      -localhost -rfbport 5901 -SecurityTypes TLSVnc \
+      -PasswordFile "$HOME/.config/tigervnc/rdp-bridge.passwd"
+
+In another terminal, connect with ``vncviewer 127.0.0.1::5901`` and enter the
+VNC password.
+
+Passwordless VNC on Loopback
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+For local testing, ``-SecurityTypes None`` disables VNC authentication and
+encryption, and ``-localhost`` limits the VNC listener to loopback.  The bridge
+still uses the upstream RDP credentials.  This example assumes a test RDP
+service on ``localhost:3390`` and uses ``-RdpIgnoreCert`` to accept its test
+certificate.
+
+.. code-block:: sh
+
+  build/unix/rdpvncserver/rdpvncserver \
+      -RdpHost localhost -RdpPort 3390 -RdpUser your-user \
+      -RdpPasswordFile "$HOME/.config/tigervnc/rdp-password" \
+      -RdpIgnoreCert -localhost -rfbport 5901 -SecurityTypes None
+
+In another terminal, open the windowed viewer.
+
+.. code-block:: sh
+
+  vncviewer -SecurityTypes=None localhost:1
+
+The viewer address ``localhost:1`` selects VNC port ``5901``.  The bridge
+selects the upstream port separately with ``-RdpPort``, which defaults to
+``3389``.  If the viewer reports ``End of stream`` after choosing security
+type ``None``, check the bridge's ``RdpSession`` log for an upstream
+connection, certificate, or authentication error.
+
+rdpvncserver Options
+~~~~~~~~~~~~~~~~~~~~
+
+* ``-RdpHost <host>`` and ``-RdpPort <port>`` select the upstream RDP server
+  (defaults to ``127.0.0.1:3389``).  Use ``-RdpDomain <domain>`` when the
+  RDP account requires a Windows domain.
+* Supply the upstream password with ``-RdpPasswordFile <path>`` or the
+  ``RDPVNCSERVER_PASSWORD`` environment variable.  ``-PasswordFile`` controls
+  VNC authentication.
+* ``-RdpIgnoreCert`` accepts untrusted or changed upstream TLS certificates.
+  Certificate verification is enabled by default.
+* ``-RdpClipboard=0``, ``-RdpDynamicResize=0``, and
+  ``-RdpH264Passthrough=0`` disable their respective features.
+* ``-RdpIdleDisconnectSec <sec>`` keeps the upstream session alive for a
+  grace period after the last viewer leaves (default ``0``).
+  ``-RdpReconnectAttempts <count>`` sets the number of retries after an
+  unexpected RDP disconnect (default ``0``).
+
+Run ``rdpvncserver --help`` or see ``rdpvncserver(1)`` for the complete
+parameter list.
+
+
 Legal
 =====
 
@@ -411,6 +508,9 @@ The Unix/Linux version of AgentVNC contains the following programs:
 * scrcpyvncserver - a zero-transcoding VNC server that bridges Android
                     ``scrcpy-server`` H.264 streams over ADB to RFB Open H.264
                     viewers.
+
+* rdpvncserver - an optional RDP-to-VNC bridge server for Linux that connects
+                 to an upstream RDP desktop using FreeRDP.
 
 It also contains the following systemd service:
 
