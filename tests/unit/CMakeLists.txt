@@ -63,6 +63,10 @@ add_executable(filetransfer filetransfer.cxx)
 target_link_libraries(filetransfer PRIVATE rfbclient ${ZLIB_LIBRARIES} GTest::gtest_main)
 gtest_discover_tests(filetransfer)
 
+add_executable(tightdecoder tightdecoder.cxx)
+target_link_libraries(tightdecoder PRIVATE rfbclient GTest::gtest_main)
+gtest_discover_tests(tightdecoder)
+
 add_executable(ftpprotocol ftpprotocol.cxx ../../vncviewer/FtpProtocol.cxx)
 target_link_libraries(ftpprotocol PRIVATE core GTest::gtest_main)
 gtest_discover_tests(ftpprotocol)
