@@ -46,6 +46,7 @@ from .executor import (
     VncDesktopExecutor,
     denormalize_x,
     denormalize_y,
+    parse_legacy_clipboard_encoding,
     summarize_for_overlay,
 )
 from .file_search import FileSearchClient, FileSearchStoreRegistry
@@ -344,6 +345,7 @@ def run_agent(args: argparse.Namespace) -> int:
                 vnc_client,
                 workspace=workspace,
                 coordinator=coordinator if assistant_enabled else None,
+                legacy_clipboard_encoding=getattr(args, "legacy_clipboard_encoding", None),
             )
             status = executor.wait_ready(timeout=15.0)
             sandboxed = is_sandboxed_local_target(args.vnc_host, args.socket)
@@ -1135,6 +1137,10 @@ def main() -> int:
     parser.add_argument("--vnc-host", default="localhost:5900", help="Target VNC server host:port")
     parser.add_argument("--vncviewer-bin", default=DEFAULT_VNCVIEWER, help="Path to built vncviewer binary")
     parser.add_argument(
+        "--legacy-clipboard-encoding",
+        help="Override Latin-1 for legacy VNC clipboard transfers (e.g. cp936 on a Chinese Windows XP server).",
+    )
+    parser.add_argument(
         "--api-key-file",
         default=os.path.join(REPO_ROOT, "gemini.key"),
         help="Path to Gemini API key file",
@@ -1289,6 +1295,11 @@ def main() -> int:
         help="Socket timeout in seconds for direct FTP file operations (default: 30.0)",
     )
     args = parser.parse_args()
+    if args.legacy_clipboard_encoding:
+        try:
+            args.legacy_clipboard_encoding = parse_legacy_clipboard_encoding(args.legacy_clipboard_encoding)
+        except ValueError as exc:
+            parser.error(f"--legacy-clipboard-encoding: {exc}")
     if args.ftp and args.no_ftp:
         parser.error("--ftp and --no-ftp cannot be used together")
     return run_agent(args)

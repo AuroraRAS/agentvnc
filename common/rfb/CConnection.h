@@ -291,6 +291,8 @@ namespace rfb {
     // server received the request.
     virtual void handleClipboardData(const char* data);
 
+    bool serverClipboardIsLegacy() const { return legacyServerClipboard; }
+
     // handleAudioBegin() and handleAudioEnd() are called when the
     // server starts and stops sending audio. There may be many such
     // periods in a single session, as the server only sends audio
@@ -370,6 +372,7 @@ namespace rfb {
     DecodeManager decoder;
 
     std::string serverClipboard;
+    bool legacyServerClipboard;
     bool hasRemoteClipboard;
     bool hasLocalClipboard;
     bool unsolicitedClipboardAttempt;

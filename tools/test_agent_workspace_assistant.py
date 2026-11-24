@@ -1048,7 +1048,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
 
     def test_system_instruction_guardrails(self) -> None:
         self.assertIn("Visual Verification Before Form Commit/Close", SYSTEM_INSTRUCTION)
-        self.assertIn("Locale Mojibake Check", SYSTEM_INSTRUCTION)
+        self.assertIn("Verify exact pasted text before saving", SYSTEM_INSTRUCTION)
         self.assertIn("Iterative Consultation", COORDINATION_SYSTEM_INSTRUCTION)
         self.assertIn("Proactively use", ASSISTANT_SYSTEM_INSTRUCTION)
 
@@ -1063,6 +1063,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
 
         res_utf8 = executor.execute("paste_text_at", {"x": 100, "y": 100, "text": "令和6年度白色申告"})
         self.assertTrue(res_utf8.get("_attach_screenshot"))
+        self.assertFalse(res_utf8["text_verified"])
 
         res_clip_no_paste = executor.execute("clipboard_set", {"text": "札幌東税務署", "paste": False})
         self.assertNotIn("_attach_screenshot", res_clip_no_paste)
@@ -1072,6 +1073,70 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
 
         res_clip_utf8 = executor.execute("clipboard_set", {"text": "札幌東税務署", "paste": True})
         self.assertTrue(res_clip_utf8.get("_attach_screenshot"))
+        self.assertFalse(res_clip_utf8["text_verified"])
+
+    def test_legacy_clipboard_encoding_is_used_only_for_legacy_transfer(self) -> None:
+        agent = mock.Mock()
+        executor = agent_mod.VncDesktopExecutor(agent, legacy_clipboard_encoding="cp936")
+        title = "Café expense reconciliation"
+        legacy_text = title.encode("cp936").decode("latin-1")
+
+        for supports_utf8 in (False, True):
+            with self.subTest(supports_utf8=supports_utf8):
+                agent.request.reset_mock()
+                agent.request.side_effect = [({"ok": True, "clipboard_utf8": supports_utf8}, b""), ({"ok": True}, b"")]
+                executor.clipboard_set(title)
+                agent.request.assert_called_with("CLIPBOARD_SET", text=title if supports_utf8 else legacy_text)
+
+        agent.request.reset_mock()
+        agent.request.side_effect = None
+        agent.request.return_value = ({"ok": True, "clipboard_utf8": False}, b"")
+        with self.assertRaisesRegex(ValueError, "cannot represent"):
+            executor.execute("paste_text_at", {"x": 100, "y": 100, "text": "☕", "clear_existing": True})
+        self.assertEqual(agent.request.call_args_list, [mock.call("GET_STATUS")])
+
+    def test_clipboard_verification_compares_fresh_copy(self) -> None:
+        agent = mock.Mock()
+        executor = agent_mod.VncDesktopExecutor(agent, legacy_clipboard_encoding="cp936")
+        title = "Café expense reconciliation"
+
+        def legacy_reply(seq: int, text: str) -> Any:
+            return ({"ok": True, "available": True, "legacy": True, "sequence": seq,
+                     "text": text.encode("cp936").decode("latin-1")}, b"")
+
+        original = legacy_reply(5, title)
+        set_clipboard = ({"ok": True}, b"")
+        agent.request.side_effect = [original, set_clipboard, original, legacy_reply(6, "Caf?expense reconciliation")]
+        with mock.patch.object(executor, "_hotkey_syms") as copy_selection:
+            result = executor.execute("clipboard_verify_selection", {"expected_text": title})
+        copy_selection.assert_called_once_with([0xFFE3, ord("c")])
+        self.assertFalse(result["matches"])
+        self.assertIn("differs", result["error"])
+
+        agent.request.side_effect = [original, set_clipboard, legacy_reply(6, "test-marker"), legacy_reply(7, title + "\r\n")]
+        with mock.patch.object(executor, "_hotkey_syms"), mock.patch("vnc_agent.executor.uuid.uuid4") as uuid4:
+            uuid4.return_value.hex = "test-marker"
+            result = executor.clipboard_verify_selection(title + "\n")
+        self.assertEqual(result, {"status": "ok", "matches": True})
+
+        agent.request.side_effect = [original, set_clipboard, original]
+        with mock.patch.object(executor, "_hotkey_syms"), mock.patch(
+            "vnc_agent.executor.time.monotonic", side_effect=[0, 0.1, 1.6]
+        ):
+            result = executor.clipboard_verify_selection(title)
+        self.assertIn("no fresh clipboard update", result["error"])
+
+    def test_text_macros_clear_legacy_filename_field(self) -> None:
+        executor = agent_mod.VncDesktopExecutor(FakeAgentClient())  # type: ignore[arg-type]
+        executor.width, executor.height = 1024, 768
+        for action in ("click_and_type", "paste_text_at"):
+            with self.subTest(action=action), mock.patch.object(executor, "_hotkey_syms") as hotkey:
+                executor.execute(action, {"x": 430, "y": 688, "text": "report.txt", "clear_existing": True})
+                self.assertEqual(hotkey.call_args_list[:3], [
+                    mock.call([0xFFE3, 0xFF50]),
+                    mock.call([0xFFE3, 0xFFE1, 0xFF57]),
+                    mock.call([0xFF08]),
+                ])
 
     def test_extract_server_tool_events_and_citations(self) -> None:
         interaction = {

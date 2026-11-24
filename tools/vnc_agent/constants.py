@@ -80,10 +80,27 @@ CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
     },
     {
         "type": "function",
+        "name": "clipboard_verify_selection",
+        "description": (
+            "Copy the current desktop text selection with Ctrl+C and compare a fresh clipboard update "
+            "to the expected text. Select the relevant text first. Use this to verify exact text in "
+            "copyable controls before saving or submitting."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "expected_text": {"type": "string", "description": "The full expected text of the selection."},
+                "intent": {"type": "string", "description": "Short reason for verifying the text."},
+            },
+            "required": ["expected_text"],
+        },
+    },
+    {
+        "type": "function",
         "name": "clipboard_set",
         "description": (
-            "Write UTF-8 text to the remote VNC clipboard via ClientCutText without typing character by character. "
-            "Optionally sends Ctrl+V afterward if paste=true. Returns text-only JSON."
+            "Send text to the remote VNC clipboard using the configured transport encoding. "
+            "Optionally sends Ctrl+V if paste=true. A non-ASCII paste returns a screenshot for verification."
         ),
         "parameters": {
             "type": "object",
@@ -99,9 +116,9 @@ CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "paste_text_at",
         "description": (
-            "Deterministic multi-step text macro: click at normalized (x, y), optionally clear existing field (Ctrl+A + BackSpace), "
-            "copy UTF-8 text (including non-ASCII/multiline) into VNC clipboard, paste with Ctrl+V, and optionally press Enter. "
-            "Preferred over click+type for reliable text entry. Returns text-only JSON on success."
+            "Click at normalized (x, y), optionally clear the existing field, "
+            "copy text into the VNC clipboard, paste with Ctrl+V, and optionally press Enter. "
+            "A non-ASCII paste returns a screenshot for verification."
         ),
         "parameters": {
             "type": "object",
@@ -109,7 +126,7 @@ CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
                 "x": {"type": "integer", "description": "Normalized X coordinate (0-1000)."},
                 "y": {"type": "integer", "description": "Normalized Y coordinate (0-1000)."},
                 "text": {"type": "string", "description": "UTF-8 text to paste into the target input."},
-                "clear_existing": {"type": "boolean", "description": "If true, select all (Ctrl+A) and delete before pasting."},
+                "clear_existing": {"type": "boolean", "description": "If true, select and delete existing field contents before pasting."},
                 "press_enter": {"type": "boolean", "description": "If true, press Enter after an ASCII paste. Verify non-ASCII text in the screenshot first."},
                 "intent": {"type": "string", "description": "Short description of why you are pasting here."},
             },
@@ -120,7 +137,7 @@ CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
         "type": "function",
         "name": "click_and_type",
         "description": (
-            "Deterministic macro: click at normalized (x, y), optionally clear existing text (Ctrl+A + BackSpace), "
+            "Click at normalized (x, y), optionally clear the existing field, "
             "type plain ASCII text directly via VNC KeyEvents, and optionally press Enter. Returns text-only JSON on success."
         ),
         "parameters": {
@@ -129,7 +146,7 @@ CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
                 "x": {"type": "integer", "description": "Normalized X coordinate (0-1000)."},
                 "y": {"type": "integer", "description": "Normalized Y coordinate (0-1000)."},
                 "text": {"type": "string", "description": "ASCII text to type into the focused widget."},
-                "clear_existing": {"type": "boolean", "description": "If true, select all (Ctrl+A) and delete before typing."},
+                "clear_existing": {"type": "boolean", "description": "If true, select and delete existing field contents before typing."},
                 "press_enter": {"type": "boolean", "description": "If true, press Enter after typing."},
                 "intent": {"type": "string", "description": "Short description of why you are typing here."},
             },
@@ -850,7 +867,7 @@ ALL_CUSTOM_FUNCTION_NAMES = (
     | COORDINATION_FUNCTION_NAMES
 )
 READ_ONLY_FUNCTIONS = (
-    frozenset({"take_screenshot", "clipboard_get", "get_desktop_status", "wait", "yield_to_user"})
+    frozenset({"take_screenshot", "clipboard_get", "clipboard_verify_selection", "get_desktop_status", "wait", "yield_to_user"})
     | FILE_READ_ONLY_FUNCTIONS
     | WORKSPACE_FUNCTION_NAMES
     | REMOTE_TRANSFER_READ_ONLY_FUNCTIONS
@@ -897,7 +914,7 @@ non-consequential task or encounter a condition defined in Rule 1.
 * **Prefer Custom Deterministic Macros:** When available, prefer `paste_text_at`, `click_and_type`, `clipboard_get`, `clipboard_set`, and `get_desktop_status` over multi-step click+type sequences; they execute deterministically and return compact text-only status results without extra round-trips.
 * **Parallel Batching & Intent:** Always provide a clear `intent` argument on actions. Only batch independent actions in a single turn when their order is deterministic and does not depend on intermediate visual layout changes.
 * **Visual Verification Before Form Commit/Close:** Do NOT batch form text/number entry (`click_and_type`, `paste_text_at`, `type`) with form-closing or commit buttons (`OK`, `Save`, `保存`, `作成完了`, `Confirm`, `Submit`) in the same turn. Enter the values first, visually verify exact cell/column placement on the resulting screenshot, and commit/close on the following turn.
-* **ASCII vs UTF-8 & Locale Mojibake Check:** Direct key-typing (`type`, `click_and_type`) supports plain ASCII characters only; use `paste_text_at` or `clipboard_set` for arbitrary UTF-8 or multi-line text. After pasting non-ASCII UTF-8 text into legacy Win32 ANSI controls on mismatched host locales, inspect the screenshot for garbled characters (mojibake); if non-essential labels/titles garble, replace them with clean ASCII or re-enter carefully, and never ignore corrupted required fields.
+* **Verify exact pasted text before saving:** Use `paste_text_at` or `clipboard_set` for non-ASCII or multiline text. A successful paste action means Ctrl+V was sent. Inspect the screenshot and compare the pasted characters and spaces with the requested text. For copyable text that must match exactly, select it and use `clipboard_verify_selection` before saving. If verification shows a mismatch, correct the text and verify again. If you cannot obtain the requested text, stop before saving or submitting and report the mismatch.
 * **Verification:** When creating or saving a file on the Desktop, make sure the file is saved and verify on the screenshot that it exists on the Desktop before finishing.
 
 # Final Response Guidelines:

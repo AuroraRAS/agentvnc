@@ -1,5 +1,6 @@
 """VNC desktop, remote file, local workspace, memory, and peer coordination executor."""
 
+import codecs
 import io
 import json
 import os
@@ -8,6 +9,7 @@ import struct
 import subprocess
 import sys
 import time
+import uuid
 import zlib
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -95,6 +97,18 @@ def summarize_for_overlay(
     return collapsed[: max(0, max_len - 3)] + "..."
 
 
+def parse_legacy_clipboard_encoding(value: str) -> str:
+    """Accept text codecs that preserve the legacy clipboard's ASCII bytes."""
+    ascii_text = "".join(chr(code) for code in range(128))
+    try:
+        name = codecs.lookup(value).name
+        if ascii_text.encode(name) == ascii_text.encode("ascii"):
+            return name
+    except (LookupError, UnicodeError):
+        pass
+    raise ValueError(f"Expected an ASCII-compatible text encoding, got {value!r}")
+
+
 class AgentPausedError(RuntimeError):
     """Raised when synthetic input is blocked by operator PAUSE_AGENT."""
 
@@ -108,11 +122,15 @@ class VncDesktopExecutor:
         ftp_client: Optional[VncFtpClient] = None,
         workspace: Optional[LocalWorkspace] = None,
         coordinator: Optional[WorkspaceCoordinator] = None,
+        legacy_clipboard_encoding: Optional[str] = None,
     ) -> None:
         self.client = client
         self.ftp_client = ftp_client
         self.workspace = workspace
         self.coordinator = coordinator
+        self.legacy_clipboard_encoding = (
+            parse_legacy_clipboard_encoding(legacy_clipboard_encoding) if legacy_clipboard_encoding else None
+        )
         self.width = 0
         self.height = 0
         self.button_mask = 0
@@ -193,26 +211,70 @@ class VncDesktopExecutor:
         if not resp.get("ok"):
             raise RuntimeError(f"RESUME_AGENT failed: {resp}")
 
-    def clipboard_get(self) -> Dict[str, Any]:
+    def _get_clipboard_reply(self) -> Dict[str, Any]:
         resp, _ = self.client.request("CLIPBOARD_GET")
         if not resp.get("ok"):
             raise RuntimeError(f"CLIPBOARD_GET failed: {resp}")
+        return resp
+
+    def _decode_clipboard_text(self, resp: Dict[str, Any]) -> str:
+        text = str(resp.get("text", ""))
+        if resp.get("legacy") and self.legacy_clipboard_encoding:
+            # The viewer maps the incoming legacy bytes to Latin-1 code points.
+            return text.encode("latin-1").decode(self.legacy_clipboard_encoding)
+        return text
+
+    def clipboard_get(self) -> Dict[str, Any]:
+        resp = self._get_clipboard_reply()
         return {
             "status": "ok",
             "available": bool(resp.get("available")),
-            "text": str(resp.get("text", "")),
+            "text": self._decode_clipboard_text(resp),
         }
 
     def clipboard_set(self, text: str) -> Dict[str, Any]:
-        resp, _ = self.client.request("CLIPBOARD_SET", text=text)
+        wire_text = text
+        if self.legacy_clipboard_encoding and not text.isascii():
+            clipboard_utf8 = self.get_status().get("clipboard_utf8")
+            if clipboard_utf8 is None:
+                raise RuntimeError("The viewer must report clipboard_utf8 to use --legacy-clipboard-encoding")
+            if not clipboard_utf8:
+                try:
+                    wire_text = text.encode(self.legacy_clipboard_encoding).decode("latin-1")
+                except UnicodeEncodeError as exc:
+                    raise ValueError(f"The legacy clipboard cannot represent the text in {self.legacy_clipboard_encoding}") from exc
+        resp, _ = self.client.request("CLIPBOARD_SET", text=wire_text)
         if not resp.get("ok"):
             if resp.get("error") == "agent_paused":
                 raise AgentPausedError(resp.get("message", "Agent input paused by operator"))
             raise RuntimeError(f"CLIPBOARD_SET failed: {resp}")
         return {
             "status": "ok",
-            "bytes": int(resp.get("bytes", len(text.encode("utf-8")))),
+            "bytes": len(text.encode("utf-8")),
         }
+
+    def clipboard_verify_selection(self, expected_text: str) -> Dict[str, Any]:
+        sequence = self._get_clipboard_reply().get("sequence")
+        if not isinstance(sequence, int):
+            return {"error": "The viewer does not report clipboard updates. Rebuild vncviewer to verify the selection."}
+
+        # Some servers suppress copies identical to the previous clipboard contents.
+        marker = uuid.uuid4().hex
+        self.clipboard_set(marker)
+        time.sleep(0.05)
+        self._hotkey_syms([0xFFE3, ord("c")])
+        expected = expected_text.replace("\r\n", "\n").replace("\r", "\n")
+        deadline = time.monotonic() + 1.5
+        while time.monotonic() < deadline:
+            resp = self._get_clipboard_reply()
+            if resp.get("available") and resp.get("sequence", 0) > sequence:
+                actual = self._decode_clipboard_text(resp).replace("\r\n", "\n").replace("\r", "\n")
+                if actual == expected:
+                    return {"status": "ok", "matches": True}
+                if actual != marker:
+                    return {"error": "The copied selection differs from the expected text.", "matches": False}
+            time.sleep(0.05)
+        return {"error": "The server sent no fresh clipboard update after Ctrl+C. The selection was not verified."}
 
     def wait_until_resumed(self, intent: Optional[str] = None) -> Tuple[int, List[str]]:
         st = self.get_status()
@@ -448,6 +510,13 @@ class VncDesktopExecutor:
         for ks in reversed(keysyms):
             self._key(ks, False)
             time.sleep(0.04)
+
+    def _clear_text_field(self) -> None:
+        # Legacy Windows edit controls, including the Save As filename box,
+        # do not always implement Ctrl+A.
+        self._hotkey_syms([KEY_MAP["ctrl"], KEY_MAP["home"]])
+        self._hotkey_syms([KEY_MAP["ctrl"], KEY_MAP["shift"], KEY_MAP["end"]])
+        self._hotkey_syms([KEY_MAP["backspace"]])
 
     def _type_text_impl(self, text: str, press_enter: bool) -> None:
         shift_held = False
@@ -838,6 +907,9 @@ class VncDesktopExecutor:
         if fname == "clipboard_get":
             return self.clipboard_get()
 
+        if fname == "clipboard_verify_selection":
+            return self.clipboard_verify_selection(str(args["expected_text"]))
+
         if fname == "clipboard_set":
             text = str(args.get("text", ""))
             paste = bool(args.get("paste", False))
@@ -845,8 +917,9 @@ class VncDesktopExecutor:
             if paste:
                 time.sleep(0.05)
                 self._hotkey_syms([0xFFE3, ord("v")])
-                if any(ord(ch) > 0x7F for ch in text):
+                if not text.isascii():
                     clip_res["_attach_screenshot"] = True
+                    clip_res["text_verified"] = False
             clip_res["pasted"] = paste
             return clip_res
 
@@ -858,14 +931,11 @@ class VncDesktopExecutor:
             needs_visual_check = not text.isascii()
             enter_requested = bool(args.get("press_enter", False))
             press_enter = enter_requested and not needs_visual_check
+            clip_res = self.clipboard_set(text)
             self._click_px(px, py, btn_bit=1, count=1)
             time.sleep(0.10)
             if clear_existing:
-                self._hotkey_syms([0xFFE3, ord("a")])
-                time.sleep(0.05)
-                self._hotkey_syms([0xFF08])
-                time.sleep(0.05)
-            clip_res = self.clipboard_set(text)
+                self._clear_text_field()
             time.sleep(0.05)
             self._hotkey_syms([0xFFE3, ord("v")])
             if press_enter:
@@ -882,6 +952,7 @@ class VncDesktopExecutor:
             }
             if needs_visual_check:
                 res_paste["_attach_screenshot"] = True
+                res_paste["text_verified"] = False
                 if enter_requested:
                     res_paste["note"] = "Enter was deferred. Verify the pasted text in the screenshot before pressing Enter."
             return res_paste
@@ -895,10 +966,7 @@ class VncDesktopExecutor:
             self._click_px(px, py, btn_bit=1, count=1)
             time.sleep(0.10)
             if clear_existing:
-                self._hotkey_syms([0xFFE3, ord("a")])
-                time.sleep(0.05)
-                self._hotkey_syms([0xFF08])
-                time.sleep(0.05)
+                self._clear_text_field()
             self._type_text_impl(text, press_enter)
             return {
                 "status": "ok",

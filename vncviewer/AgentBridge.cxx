@@ -45,6 +45,7 @@
 #include <core/LogWriter.h>
 #include <core/i18n.h>
 #include <core/string.h>
+#include <rfb/clipboardTypes.h>
 
 #include "AgentBridge.h"
 #include "CConn.h"
@@ -837,6 +838,7 @@ void AgentBridge::handleRequest(const InboundRequest& req)
     int64_t lastUpdateMs = conn_ ? conn_->getLastUpdateMs() : 0;
     bool updating = conn_ && conn_->isUpdating();
     bool hasClipboard = conn_ && conn_->getRemoteClipboard(nullptr);
+    bool utf8Clipboard = conn_ && (conn_->server.clipboardFlags() & rfb::clipboardProvide);
     bool collab = (bool)agentCollaborate;
     bool overlay = conn_ ? conn_->isAgentOverlayEnabled()
                          : ((bool)agentOverlay || (bool)agentCollaborate);
@@ -853,7 +855,7 @@ void AgentBridge::handleRequest(const InboundRequest& req)
       "\"pending_user_messages\":%llu,"
       "\"width\":%d,\"height\":%d,\"desktop_name\":%s,"
       "\"frame_seq\":%llu,\"damage_count\":%llu,\"resize_count\":%llu,"
-      "\"last_update_ms\":%lld,\"updating\":%s,\"has_clipboard\":%s",
+      "\"last_update_ms\":%lld,\"updating\":%s,\"has_clipboard\":%s,\"clipboard_utf8\":%s",
       connected ? "true" : "false",
       ready ? "true" : "false",
       (bool)headless ? "true" : "false",
@@ -872,7 +874,8 @@ void AgentBridge::handleRequest(const InboundRequest& req)
       (unsigned long long)resizeCount,
       (long long)lastUpdateMs,
       updating ? "true" : "false",
-      hasClipboard ? "true" : "false");
+      hasClipboard ? "true" : "false",
+      utf8Clipboard ? "true" : "false");
 
     enqueueResponse(req.clientId,
                     buildJsonResponse(true, cmd, idVal, fields),
@@ -1159,9 +1162,11 @@ void AgentBridge::handleRequest(const InboundRequest& req)
     std::string clipText;
     bool available = conn_->getRemoteClipboard(&clipText);
     std::string fields = core::format(
-      "\"available\":%s,\"text\":%s",
+      "\"available\":%s,\"text\":%s,\"legacy\":%s,\"sequence\":%llu",
       available ? "true" : "false",
-      jsonEscape(clipText).c_str());
+      jsonEscape(clipText).c_str(),
+      conn_->isRemoteClipboardLegacy() ? "true" : "false",
+      (unsigned long long)conn_->getRemoteClipboardSequence());
     enqueueResponse(req.clientId,
                     buildJsonResponse(true, cmd, idVal, fields),
                     std::vector<uint8_t>());
@@ -1341,6 +1346,18 @@ void AgentBridge::handleRequest(const InboundRequest& req)
                                                         "Clipboard payload must be valid UTF-8 without NUL bytes")),
                       std::vector<uint8_t>());
       return;
+    }
+
+    if (!(conn_->server.clipboardFlags() & rfb::clipboardProvide)) {
+      std::string latin1 = core::utf8ToLatin1(text.c_str(), text.size());
+      if (core::latin1ToUTF8(latin1.c_str(), latin1.size()) != text) {
+        enqueueResponse(req.clientId,
+                        buildJsonResponse(false, cmd, idVal,
+                                          buildErrorExtra("clipboard_encoding",
+                                                          "Legacy RFB clipboard cannot represent this text in Latin-1")),
+                        std::vector<uint8_t>());
+        return;
+      }
     }
 
     try {
