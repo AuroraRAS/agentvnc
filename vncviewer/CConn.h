@@ -153,6 +153,8 @@ public:
   size_t injectText(const std::string& utf8Text);
   void injectClipboard(const std::string& utf8Text);
   bool getRemoteClipboard(std::string* outText) const;
+  bool isRemoteClipboardLegacy() const { return legacyRemoteClipboard; }
+  uint64_t getRemoteClipboardSequence() const { return remoteClipboardSequence; }
   void releaseAgentKeys();
   void clearAgentClipboardOwnership();
 
@@ -256,6 +258,8 @@ private:
   bool hasAgentClipboard;
   std::string remoteClipboardText;
   bool hasRemoteClipboardData;
+  bool legacyRemoteClipboard;
+  uint64_t remoteClipboardSequence;
 
   std::string agentPauseReason;
   AgentOverlayState overlayState;

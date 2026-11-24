@@ -85,7 +85,7 @@ CConnection::CConnection()
     firstUpdate(true), pendingUpdate(false), continuousUpdates(false),
     forceNonincremental(true),
     framebuffer(nullptr), decoder(this),
-    hasRemoteClipboard(false), hasLocalClipboard(false),
+    legacyServerClipboard(false), hasRemoteClipboard(false), hasLocalClipboard(false),
     audioRequested(false),
     fileTransfer(&server)
 {
@@ -717,6 +717,7 @@ void CConnection::serverCutText(const char* str)
   hasLocalClipboard = false;
 
   serverClipboard = str;
+  legacyServerClipboard = true;
   hasRemoteClipboard = true;
 
   handleClipboardAnnounce(true);
@@ -823,6 +824,7 @@ void CConnection::clipboardProvide(uint32_t flags,
     return;
   }
   serverClipboard = core::convertLF((const char*)data[0], lengths[0]);
+  legacyServerClipboard = false;
   hasRemoteClipboard = true;
 
   // FIXME: Should probably verify that this data was actually requested

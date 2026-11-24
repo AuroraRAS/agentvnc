@@ -324,6 +324,7 @@ CConn::CConn()
     frameSeq(0), damageCount(0), resizeCount(0), lastUpdateMs(0),
     nextAgentKeyCode(0x40000000),
     hasAgentClipboard(false), hasRemoteClipboardData(false),
+    legacyRemoteClipboard(false), remoteClipboardSequence(0),
     humanActionCount(0), lastHumanInputMs(0), lastAgentButtonMask(0)
 {
   setShared(::shared);
@@ -1306,6 +1307,8 @@ void CConn::handleClipboardData(const char* data)
 {
   remoteClipboardText = data ? data : "";
   hasRemoteClipboardData = true;
+  legacyRemoteClipboard = serverClipboardIsLegacy();
+  remoteClipboardSequence++;
 
   if (desktop)
     desktop->handleClipboardData(data);
