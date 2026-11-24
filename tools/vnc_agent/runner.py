@@ -235,7 +235,8 @@ def run_agent(args: argparse.Namespace) -> int:
         if str(store_arg).strip():
             store_registry.register_store(str(store_arg).strip(), set_default=False)
 
-    assistant_enabled = not bool(getattr(args, "no_assistant", False))
+    enable_custom_tools = not bool(getattr(args, "no_custom_tools", False))
+    assistant_enabled = enable_custom_tools and not bool(getattr(args, "no_assistant", False))
     assistant_worker: Optional[ResearchAssistantWorker] = None
     if assistant_enabled:
         raw_asst_thinking = str(getattr(args, "assistant_thinking_level", "default") or "default")
@@ -253,7 +254,6 @@ def run_agent(args: argparse.Namespace) -> int:
             enable_web_search=not bool(getattr(args, "no_web_search", False)),
             log_dir=log_dir,
         )
-        assistant_worker.start()
 
     temp_dir: Optional[str] = None
     viewer_proc: Optional[subprocess.Popen] = None
@@ -338,7 +338,6 @@ def run_agent(args: argparse.Namespace) -> int:
         raw_rec_thinking = str(getattr(args, "recovery_thinking_level", "high") or "high")
         recovery_thinking_level: Optional[str] = None if raw_rec_thinking == "off" else raw_rec_thinking
         excluded_actions = parse_excluded_actions(getattr(args, "exclude_actions", None))
-        enable_custom_tools = not bool(getattr(args, "no_custom_tools", False))
 
         with AgentClient(socket_path, timeout=15.0) as vnc_client:
             executor = VncDesktopExecutor(
@@ -439,8 +438,8 @@ def run_agent(args: argparse.Namespace) -> int:
                     )
 
             enable_file_tools = ftp_active and (enable_custom_tools or bool(args.ftp))
-            enable_workspace_tools = True
-            enable_remote_transfer_tools = ftp_active
+            enable_workspace_tools = enable_custom_tools
+            enable_remote_transfer_tools = ftp_active and enable_workspace_tools
             enable_coord_tools = assistant_enabled
 
             instruction_parts = [SYSTEM_INSTRUCTION]
@@ -494,6 +493,8 @@ def run_agent(args: argparse.Namespace) -> int:
 
             collaborate_mode = bool(args.collaborate or status.get("collaborate"))
             stay_interactive = collaborate_mode and not bool(getattr(args, "one_shot", False))
+            if assistant_worker is not None:
+                assistant_worker.start()
 
             def select_thinking_level(reason: Optional[str]) -> Optional[str]:
                 if reason and recovery_thinking_level is not None and recovery_thinking_level != base_thinking_level:
@@ -655,15 +656,16 @@ def run_agent(args: argparse.Namespace) -> int:
                 wait_intent = "Awaiting next instruction"
                 turn_thinking_lv = init_thinking_lv
 
-                for task_turn in range(1, args.max_turns + 1):
+                for task_turn in range(1, args.max_turns + 2):
+                    function_calls = extract_function_calls(interaction)
+                    if task_turn > args.max_turns and function_calls:
+                        break
                     global_turn += 1
                     print(
                         f"\n--- Turn {global_turn} "
                         f"(task={task_index}.{task_turn}, interaction={interaction.get('id')}, "
                         f"status={interaction.get('status')}, thinking={turn_thinking_lv or 'default'}) ---"
                     )
-                    function_calls = extract_function_calls(interaction)
-
                     if not function_calls:
                         final_text = extract_model_text(interaction)
                         last_completed_interaction_id = interaction.get("id")
@@ -913,15 +915,21 @@ def run_agent(args: argparse.Namespace) -> int:
                                         {"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": skip_res}
                                     )
                                 break
-                            if batch_had_resize:
-                                for rem_fc in function_calls[idx + 1 :]:
-                                    rem_name = str(rem_fc.get("name", ""))
-                                    rem_id = str(rem_fc.get("id", ""))
+                            if batch_had_resize or explicit_attach:
+                                if batch_had_resize:
                                     skip_res = {
                                         "status": "skipped_after_desktop_resize",
                                         "new_size": [executor.width, executor.height],
                                     }
-                                    results.append((rem_name, rem_id, skip_res, True))
+                                else:
+                                    skip_res = {
+                                        "status": "skipped_pending_visual_verification",
+                                        "note": "Verify the pasted text in the screenshot before continuing.",
+                                    }
+                                for rem_fc in function_calls[idx + 1 :]:
+                                    rem_name = str(rem_fc.get("name", ""))
+                                    rem_id = str(rem_fc.get("id", ""))
+                                    results.append((rem_name, rem_id, dict(skip_res), False))
                                     turn_log_actions.append(
                                         {"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": skip_res}
                                     )
@@ -941,7 +949,7 @@ def run_agent(args: argparse.Namespace) -> int:
 
                     if assistant_enabled and results and not checked_peer_inbox_this_turn:
                         if coordinator.has_wake(AGENT_COMPUTER_USE):
-                            wake_doc = coordinator.consume_wake(AGENT_COMPUTER_USE)
+                            wake_doc = coordinator.peek_wake(AGENT_COMPUTER_USE)
                             unread = coordinator.unread_count(AGENT_COMPUTER_USE)
                             summaries = coordinator.peek_unread_summaries(AGENT_COMPUTER_USE, limit=5)
                             results[0][2]["peer_notification"] = {
@@ -1132,7 +1140,7 @@ def main() -> int:
         help="Path to Gemini API key file",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model name supporting computer_use")
-    parser.add_argument("--max-turns", type=int, default=20, help="Maximum agent turns per task")
+    parser.add_argument("--max-turns", type=int, default=20, help="Maximum desktop agent tool turns per task")
     parser.add_argument("--log-dir", default="/tmp/vnc_agent_run", help="Directory for trace.jsonl and PNG snapshots")
     parser.add_argument(
         "--workspace",
@@ -1154,7 +1162,7 @@ def main() -> int:
         "--assistant-max-turns",
         type=int,
         default=12,
-        help="Maximum reasoning turns per wakeup for the Research Assistant (default: 12)",
+        help="Maximum tool turns per wakeup for the Research Assistant (default: 12)",
     )
     parser.add_argument(
         "--no-assistant",
@@ -1196,7 +1204,7 @@ def main() -> int:
     parser.add_argument(
         "--no-custom-tools",
         action="store_true",
-        help="Disable registering custom deterministic VNC function declarations alongside computer_use",
+        help="Disable custom function tools and the Research Assistant. Use --ftp to enable direct remote file tools explicitly.",
     )
     parser.add_argument(
         "--auto-confirm",

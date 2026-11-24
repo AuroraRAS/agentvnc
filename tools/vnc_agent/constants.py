@@ -8,11 +8,12 @@ TOOLS_DIR = os.path.dirname(PACKAGE_DIR)
 REPO_ROOT = os.path.dirname(TOOLS_DIR)
 
 INTERACTIONS_URL = "https://generativelanguage.googleapis.com/v1beta/interactions"
+INTERACTIONS_API_REVISION = "2026-05-20"
 GENAI_API_BASE = "https://generativelanguage.googleapis.com/v1beta"
 GENAI_UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta"
 
 DEFAULT_MODEL = "gemini-4-hydrogen"
-DEFAULT_ASSISTANT_MODEL = "gemini-3.5-flash"
+DEFAULT_ASSISTANT_MODEL = "gemini-3.8-flash"
 DEFAULT_VNCVIEWER = os.path.join(REPO_ROOT, "build", "vncviewer", "vncviewer")
 
 THINKING_LEVELS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "default")
@@ -109,7 +110,7 @@ CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
                 "y": {"type": "integer", "description": "Normalized Y coordinate (0-1000)."},
                 "text": {"type": "string", "description": "UTF-8 text to paste into the target input."},
                 "clear_existing": {"type": "boolean", "description": "If true, select all (Ctrl+A) and delete before pasting."},
-                "press_enter": {"type": "boolean", "description": "If true, press Enter after pasting."},
+                "press_enter": {"type": "boolean", "description": "If true, press Enter after an ASCII paste. Verify non-ASCII text in the screenshot first."},
                 "intent": {"type": "string", "description": "Short description of why you are pasting here."},
             },
             "required": ["x", "y", "text"],
@@ -687,6 +688,7 @@ ASSISTANT_FILE_SEARCH_DECLARATIONS: List[Dict[str, Any]] = [
             "type": "object",
             "properties": {
                 "page_size": {"type": "integer", "description": "Page size (1-20, default 20)."},
+                "page_token": {"type": "string", "description": "Use next_page_token from the previous page."},
                 "intent": {"type": "string", "description": "Short reason for listing File Search stores."},
             },
         },
@@ -755,6 +757,7 @@ ASSISTANT_FILE_SEARCH_DECLARATIONS: List[Dict[str, Any]] = [
             "properties": {
                 "store_name": {"type": "string", "description": "Optional store name (defaults to workspace active store)."},
                 "page_size": {"type": "integer", "description": "Maximum documents per page (1-20, default 20)."},
+                "page_token": {"type": "string", "description": "Use next_page_token from the previous page."},
                 "intent": {"type": "string", "description": "Short reason for listing documents."},
             },
         },

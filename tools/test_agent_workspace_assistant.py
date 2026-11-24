@@ -56,6 +56,7 @@ class MockGeminiBackend:
         self.interaction_requests: List[Dict[str, Any]] = []
         self.file_search_requests: List[Dict[str, Any]] = []
         self.api_keys_seen: List[str] = []
+        self.interaction_revisions_seen: List[str] = []
         self._seq = 0
         self.scripted_handler: Optional[Any] = None
 
@@ -179,6 +180,7 @@ def start_mock_gemini_server(backend: MockGeminiBackend) -> ThreadingHTTPServer:
                 req_json = json.loads(raw_body.decode("utf-8"))
                 with backend.lock:
                     backend.api_keys_seen.append(api_key)
+                    backend.interaction_revisions_seen.append(self.headers.get("Api-Revision", ""))
                     backend.interaction_requests.append(req_json)
                     tools = req_json.get("tools", [])
                     has_builtin = any(t.get("type") in ("google_search", "file_search") for t in tools)
@@ -259,7 +261,7 @@ def start_mock_gemini_server(backend: MockGeminiBackend) -> ThreadingHTTPServer:
                     doc_id = backend.next_id("doc")
                     op_id = backend.next_id("op")
                     doc_name = f"{store_name}/documents/{doc_id}"
-                    op_name = f"{store_name}/operations/{op_id}"
+                    op_name = f"{store_name}/upload/operations/{op_id}"
                     backend.documents[doc_name] = {
                         "name": doc_name,
                         "displayName": meta.get("displayName", doc_id),
@@ -359,7 +361,11 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
         os.symlink(outside_file, symlink_path)
         with self.assertRaises(PermissionError):
             ws.read_file("escape_link")
-        os.unlink(symlink_path)
+        os.symlink("missing.txt", os.path.join(ws.root, "dangling_link"))
+        self.assertEqual(ws.search_files("secret")["matches"], [])
+        for recursive in (False, True):
+            names = {entry["name"] for entry in ws.list_dir(recursive=recursive)["entries"]}
+            self.assertTrue({"escape_link", "dangling_link"}.isdisjoint(names))
 
         # CRUD + chunked + base64 + search
         wr = ws.write_file("notes/todo.md", content="Line 1: alpha\nLine 2: beta\n", create_parents=True)
@@ -383,8 +389,9 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
         self.assertNotIn(".agent", root_names)
         self.assertIn("notes", root_names)
 
-        search_res = ws.search_files("gamma", glob_pattern="*.md")
+        search_res = ws.search_files("gamma", glob_pattern="*.md", max_matches=1)
         self.assertEqual(search_res["total_matches"], 1)
+        self.assertFalse(search_res["truncated"])
         self.assertEqual(search_res["matches"][0]["path"], "notes/todo.md")
 
         ws.rename("notes/todo.md", "notes/done.md")
@@ -409,6 +416,22 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
         self.assertGreaterEqual(len(ws2.memory_search("TigerVNC")["matches"]), 1)
         self.assertTrue(ws2.memory_delete("api_endpoint")["deleted"])
 
+    def test_invalid_memory_state_is_preserved(self) -> None:
+        ws = LocalWorkspace(os.path.join(self.tmp, "ws"))
+        invalid_index = b"incomplete JSON"
+        with open(ws.memory_entries_path, "wb") as index:
+            index.write(invalid_index)
+        with self.assertRaisesRegex(ValueError, "Invalid workspace memory index"):
+            ws.memory_write("key", "value")
+        with open(ws.memory_entries_path, "rb") as index:
+            self.assertEqual(index.read(), invalid_index)
+
+        linked_workspace = os.path.join(self.tmp, "linked-workspace")
+        os.mkdir(linked_workspace)
+        os.symlink(ws.memory_dir, os.path.join(linked_workspace, "memory"))
+        with self.assertRaises(PermissionError):
+            LocalWorkspace(linked_workspace)
+
     def test_remote_workspace_transfers_and_pause(self) -> None:
         ws = LocalWorkspace(os.path.join(self.tmp, "ws"))
         srv = MockFtpServer()
@@ -431,6 +454,20 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
 
                 with self.assertRaises(FileExistsError):
                     ws.download_from_remote(ftp_client, "/C:/Temp/remote_big.bin", "downloads/big.bin", overwrite=False)
+
+                late_file = os.path.join(ws.root, "downloads", "late.txt")
+                original_stat = ftp_client.stat
+
+                def create_destination_during_transfer(remote_path: str) -> Dict[str, Any]:
+                    with open(late_file, "w", encoding="utf-8") as f:
+                        f.write("keep this file")
+                    return original_stat(remote_path)
+
+                with mock.patch.object(ftp_client, "stat", side_effect=create_destination_during_transfer):
+                    with self.assertRaises(FileExistsError):
+                        ws.download_from_remote(ftp_client, "/C:/Temp/hello.txt", "downloads/late.txt", overwrite=False)
+                self.assertEqual(ws.read_file("downloads/late.txt")["content"], "keep this file")
+                self.assertFalse(any(name.startswith(".dl_") for name in os.listdir(os.path.dirname(late_file))))
 
                 up_res = executor.execute(
                     "workspace_upload_to_remote",
@@ -510,6 +547,29 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
         arch = coord.read_messages(AGENT_ASSISTANT, include_read=True, mark_read=False)
         self.assertEqual(len(arch["archived_messages"]), 1)
 
+    def test_inbox_only_messages_do_not_start_background_research(self) -> None:
+        ws = LocalWorkspace(os.path.join(self.tmp, "ws"))
+        coord = WorkspaceCoordinator(ws)
+        coord.send_message(AGENT_COMPUTER_USE, AGENT_ASSISTANT, "Queued", "Wait for the wake signal", wake=False)
+        self.assertTrue(coord.wait_for_wake(AGENT_ASSISTANT, timeout=0)["woken"])
+        coord = WorkspaceCoordinator(ws)
+        assistant = ResearchAssistantWorker(
+            "test-key", ws, coord, FileSearchClient("test-key"), FileSearchStoreRegistry(ws), max_turns=1,
+        )
+        self.assertTrue(coord.wait_for_wake(AGENT_ASSISTANT, timeout=0, include_inbox=False)["timed_out"])
+
+        coord.wake_peer(AGENT_COMPUTER_USE, AGENT_ASSISTANT, "Start now")
+        replies = [
+            {"id": "turn-1", "steps": [{"type": "function_call", "id": "call-1", "name": "workspace_list"}]},
+            {"id": "turn-2", "steps": [{"type": "model_output", "content": [{"type": "text", "text": "Research complete"}]}]},
+        ]
+        with mock.patch.object(assistant, "_create_interaction", side_effect=replies) as interaction:
+            assistant._process_wakeup()
+        self.assertEqual(interaction.call_count, 2)
+        self.assertIn("Start now", interaction.call_args_list[0].kwargs["input_payload"][0]["text"])
+        messages = coord.read_messages(AGENT_COMPUTER_USE)["messages"]
+        self.assertEqual([message["body"] for message in messages], ["Research complete"])
+
     def test_file_search_client_and_registry(self) -> None:
         backend = MockGeminiBackend()
         srv = start_mock_gemini_server(backend)
@@ -523,11 +583,17 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
 
             client = FileSearchClient(api_key="test-key-123", api_base=api_base, upload_base=upload_base)
             registry = FileSearchStoreRegistry(ws)
+            assistant = ResearchAssistantWorker("test-key-123", ws, WorkspaceCoordinator(ws), client, registry)
+            failed_attach = assistant._execute_tool("file_search_attach_store", {"store_name": "unavailable"})
+            self.assertIn("error", failed_attach)
+            self.assertEqual(registry.list_attached(), [])
 
             store = client.create_store("TigerVNC Docs", embedding_model="models/gemini-embedding-001")
             store_name = store["name"]
             registry.register_store(store_name, display_name=store["displayName"], set_default=True)
             self.assertEqual(registry.get_default_store(), store_name)
+            native_search = [tool for tool in assistant._build_tools() if tool["type"] != "function"]
+            self.assertEqual(native_search, [{"type": "file_search", "file_search_store_names": [store_name]}])
 
             op = client.upload_file(
                 store_name=store_name,
@@ -539,6 +605,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
                 poll_interval=0.05,
             )
             self.assertTrue(op["done"])
+            self.assertIn("/upload/operations/", op["name"])
 
             docs = client.list_documents(store_name)
             self.assertEqual(len(docs["documents"]), 1)
@@ -785,7 +852,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
-    def test_run_agent_click_and_drag_denormalize(self) -> None:
+    def test_run_agent_desktop_batches(self) -> None:
         key_file = os.path.join(self.tmp, "gemini.key")
         with open(key_file, "w", encoding="utf-8") as f:
             f.write("test-key")
@@ -794,6 +861,8 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
 
         overlay_calls: List[Dict[str, Any]] = []
         pointer_calls: List[Dict[str, Any]] = []
+        key_calls: List[Dict[str, Any]] = []
+        inputs: List[Any] = []
 
         class _StubAgentClient:
             def __init__(self, socket_path: str, timeout: float = 15.0) -> None:
@@ -836,6 +905,9 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
                     pointer_calls.append(dict(fields))
                     self.frame_seq += 1
                     self.damage_count += 1
+                    return ({"ok": True}, b"")
+                if cmd == "KEY_EVENT":
+                    key_calls.append(dict(fields))
                     return ({"ok": True}, b"")
                 if cmd == "POLL_USER_MESSAGES":
                     return ({"ok": True, "messages": [], "human_action_count": 0, "agent_paused": False}, b"")
@@ -883,6 +955,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
                 self._idx = 0
 
             def create(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
+                inputs.append(kwargs["input_payload"])
                 resp = responses[self._idx]
                 self._idx += 1
                 return resp
@@ -894,7 +967,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
             vncviewer_bin="vncviewer",
             api_key_file=key_file,
             model="gemini-4-hydrogen",
-            max_turns=5,
+            max_turns=1,
             log_dir=log_dir,
             workspace=ws_dir,
             assistant_model="gemini-2.5-flash",
@@ -938,6 +1011,40 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
             ("drag_and_drop", 100, 100, 400, 300),
         )
         self.assertGreater(len(pointer_calls), 0)
+
+        responses[0]["steps"] = [
+            {"type": "function_call", "id": "paste", "name": "paste_text_at",
+             "arguments": {"x": 100, "y": 100, "text": "日本語", "press_enter": True}},
+            {"type": "function_call", "id": "submit", "name": "press_key",
+             "arguments": {"key": "Enter"}},
+        ]
+        with mock.patch("vnc_agent.runner.AgentClient", _StubAgentClient), mock.patch(
+            "vnc_agent.runner.InteractionsClient", _StubInteractionsClient
+        ):
+            self.assertEqual(agent_mod.run_agent(ns), 0)
+        paste, submit = inputs[-1]
+        self.assertEqual(paste["call_id"], "paste")
+        self.assertEqual(paste["result"][1]["type"], "image")
+        self.assertFalse(json.loads(paste["result"][0]["text"])["press_enter"])
+        self.assertEqual(submit["call_id"], "submit")
+        self.assertEqual(json.loads(submit["result"][0]["text"])["status"], "skipped_pending_visual_verification")
+        self.assertNotIn(0xFF0D, [key["keysym"] for key in key_calls])
+
+    def test_interactions_reports_failed_response(self) -> None:
+        backend = MockGeminiBackend()
+        backend.scripted_handler = lambda req: (200, {"status": "failed", "error": {"message": "Request failed"}})
+        srv = start_mock_gemini_server(backend)
+        try:
+            host, port = srv.server_address[:2]
+            client = agent_mod.InteractionsClient(
+                "test-key", "test-model", [], "", base_url=f"http://{host}:{port}/v1beta/interactions"
+            )
+            with self.assertRaisesRegex(agent_mod.InteractionsApiError, "Request failed"):
+                client.create("Hello")
+            self.assertEqual(backend.interaction_revisions_seen, ["2026-05-20"])
+        finally:
+            srv.shutdown()
+            srv.server_close()
 
     def test_system_instruction_guardrails(self) -> None:
         self.assertIn("Visual Verification Before Form Commit/Close", SYSTEM_INSTRUCTION)

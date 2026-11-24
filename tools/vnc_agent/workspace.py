@@ -7,6 +7,7 @@ import fnmatch
 import json
 import os
 import shutil
+import stat
 import tempfile
 import threading
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -84,17 +85,34 @@ class LocalWorkspace:
         self.memory_md_path = os.path.join(self.memory_dir, "MEMORY.md")
         self.memory_entries_path = os.path.join(self.memory_dir, "entries.json")
 
-        os.makedirs(self.memory_dir, exist_ok=True)
-        os.makedirs(self.coord_dir, exist_ok=True)
-        os.makedirs(os.path.join(self.coord_dir, "inbox", "computer_use"), exist_ok=True)
-        os.makedirs(os.path.join(self.coord_dir, "inbox", "assistant"), exist_ok=True)
-        os.makedirs(os.path.join(self.coord_dir, "archive"), exist_ok=True)
-        os.makedirs(self.agent_dir, exist_ok=True)
+        for directory in (
+            self.memory_dir,
+            self.coord_dir,
+            os.path.join(self.coord_dir, "inbox"),
+            os.path.join(self.coord_dir, "inbox", "computer_use"),
+            os.path.join(self.coord_dir, "inbox", "assistant"),
+            os.path.join(self.coord_dir, "archive"),
+            self.agent_dir,
+        ):
+            if os.path.islink(directory):
+                raise PermissionError(f"Workspace state directory cannot be a symlink: {directory}")
+            os.makedirs(directory, exist_ok=True)
 
-        if not os.path.exists(self.memory_md_path):
+        if not self.state_file_exists(self.memory_md_path):
             atomic_write_bytes(self.memory_md_path, DEFAULT_MEMORY_HEADER.encode("utf-8"))
-        if not os.path.exists(self.memory_entries_path):
+        if not self.state_file_exists(self.memory_entries_path):
             atomic_write_json(self.memory_entries_path, {"version": 1, "entries": {}})
+
+    @staticmethod
+    def state_file_exists(path: str) -> bool:
+        """Check for an ordinary workspace state file without following links."""
+        try:
+            mode = os.lstat(path).st_mode
+        except FileNotFoundError:
+            return False
+        if not stat.S_ISREG(mode):
+            raise PermissionError(f"Workspace state path must be a regular file: {path}")
+        return True
 
     def resolve_path(
         self,
@@ -165,9 +183,9 @@ class LocalWorkspace:
 
         return abs_target, canon_rel
 
-    def _entry_info(self, abs_path: str, rel_path: str) -> Dict[str, Any]:
-        st = os.stat(abs_path)
-        is_dir = os.path.isdir(abs_path)
+    def _entry_info(self, abs_path: str, rel_path: str, allow_internal: bool = True) -> Dict[str, Any]:
+        st = self._entry_stat(abs_path, allow_internal=allow_internal)
+        is_dir = stat.S_ISDIR(st.st_mode)
         item: Dict[str, Any] = {
             "name": os.path.basename(abs_path) if rel_path != "." else ".",
             "path": rel_path,
@@ -179,6 +197,14 @@ class LocalWorkspace:
         if not is_dir:
             item["size"] = int(st.st_size)
         return item
+
+    def _entry_stat(self, path: str, allow_internal: bool = True) -> os.stat_result:
+        real_path = os.path.realpath(path)
+        if os.path.commonpath([self.root, real_path]) != self.root:
+            raise PermissionError(f"Path escapes local workspace: {path!r}")
+        if not allow_internal and _is_internal_rel(os.path.relpath(real_path, self.root).replace(os.sep, "/")):
+            raise PermissionError(f"Access to internal workspace path {path!r} is restricted")
+        return os.stat(path)
 
     def list_dir(
         self,
@@ -198,27 +224,21 @@ class LocalWorkspace:
                 raise NotADirectoryError(f"Workspace path is not a directory: {rel_dir}")
 
             entries: List[Dict[str, Any]] = []
-            hide_internal = rel_dir == "."
-
-            if recursive:
-                for cur_root, dirnames, filenames in os.walk(abs_dir, followlinks=False):
-                    if hide_internal:
-                        dirnames[:] = [d for d in dirnames if d not in INTERNAL_DIR_NAMES]
-                    for dname in dirnames:
-                        d_abs = os.path.join(cur_root, dname)
-                        d_rel = os.path.relpath(d_abs, self.root).replace("\\", "/")
-                        entries.append(self._entry_info(d_abs, d_rel))
-                    for fname in filenames:
-                        f_abs = os.path.join(cur_root, fname)
-                        f_rel = os.path.relpath(f_abs, self.root).replace("\\", "/")
-                        entries.append(self._entry_info(f_abs, f_rel))
-            else:
-                with os.scandir(abs_dir) as it:
-                    for de in it:
-                        if hide_internal and de.name in INTERNAL_DIR_NAMES:
-                            continue
-                        sub_rel = de.name if rel_dir == "." else f"{rel_dir}/{de.name}"
-                        entries.append(self._entry_info(de.path, sub_rel))
+            allow_internal = _is_internal_rel(rel_dir)
+            for cur_root, dirnames, filenames in os.walk(abs_dir, followlinks=False):
+                if cur_root == self.root:
+                    dirnames[:] = [name for name in dirnames if name not in INTERNAL_DIR_NAMES]
+                for name in dirnames + filenames:
+                    if cur_root == self.root and name in INTERNAL_DIR_NAMES:
+                        continue
+                    entry_path = os.path.join(cur_root, name)
+                    entry_rel = os.path.relpath(entry_path, self.root).replace(os.sep, "/")
+                    try:
+                        entries.append(self._entry_info(entry_path, entry_rel, allow_internal=allow_internal))
+                    except OSError:
+                        continue
+                if not recursive:
+                    break
 
             entries.sort(key=lambda e: (0 if e["type"] == "dir" else 1, e["path"].lower(), e["path"]))
             sliced = entries[:limit]
@@ -237,6 +257,7 @@ class LocalWorkspace:
             if not os.path.exists(abs_path):
                 return {"status": "ok", "path": rel_path, "exists": False}
             info = self._entry_info(abs_path, rel_path)
+            info["status"] = "ok"
             info["exists"] = True
             return info
 
@@ -267,7 +288,10 @@ class LocalWorkspace:
             if os.path.isdir(abs_path):
                 raise IsADirectoryError(f"Workspace path is a directory: {rel_path}")
 
-            total_size = int(os.path.getsize(abs_path))
+            st = os.stat(abs_path)
+            if not stat.S_ISREG(st.st_mode):
+                raise ValueError(f"Workspace path is not a regular file: {rel_path}")
+            total_size = st.st_size
             if offset >= total_size:
                 empty_res: Dict[str, Any] = {
                     "status": "ok",
@@ -353,6 +377,8 @@ class LocalWorkspace:
                 raise FileNotFoundError(f"Parent directory does not exist for {rel_path}")
 
             if append:
+                if os.path.exists(abs_path) and not os.path.isfile(abs_path):
+                    raise ValueError(f"Workspace path is not a regular file: {rel_path}")
                 with open(abs_path, "ab") as f:
                     f.write(raw)
                     f.flush()
@@ -429,25 +455,33 @@ class LocalWorkspace:
             truncated = False
 
             for cur_root, dirnames, filenames in os.walk(abs_dir, followlinks=False):
-                dirnames[:] = sorted(d for d in dirnames if d not in INTERNAL_DIR_NAMES)
+                if cur_root == self.root:
+                    dirnames[:] = [d for d in dirnames if d not in INTERNAL_DIR_NAMES]
+                dirnames.sort()
                 for fname in sorted(filenames):
                     if glob_pattern and not fnmatch.fnmatch(fname, glob_pattern):
                         continue
                     f_abs = os.path.join(cur_root, fname)
-                    f_rel = os.path.relpath(f_abs, self.root).replace("\\", "/")
+                    f_rel = os.path.relpath(f_abs, self.root).replace(os.sep, "/")
+                    try:
+                        st = self._entry_stat(f_abs, allow_internal=False)
+                    except OSError:
+                        continue
+                    if not stat.S_ISREG(st.st_mode):
+                        continue
 
                     if q_lower in f_rel.lower():
                         matches.append({"path": f_rel, "match_type": "filename", "line_number": 0, "snippet": f_rel})
-                        if len(matches) >= limit:
+                        if len(matches) > limit:
                             truncated = True
                             break
 
                     try:
-                        if os.path.getsize(f_abs) > MAX_FILE_READ_BYTES:
+                        if st.st_size > MAX_FILE_READ_BYTES:
                             continue
                         with open(f_abs, "rb") as f:
-                            raw = f.read()
-                        if b"\x00" in raw:
+                            raw = f.read(MAX_FILE_READ_BYTES + 1)
+                        if len(raw) > MAX_FILE_READ_BYTES or b"\x00" in raw:
                             continue
                         text = raw.decode("utf-8")
                     except (OSError, UnicodeDecodeError):
@@ -463,7 +497,7 @@ class LocalWorkspace:
                                     "snippet": line.strip()[:240],
                                 }
                             )
-                            if len(matches) >= limit:
+                            if len(matches) > limit:
                                 truncated = True
                                 break
                     if truncated:
@@ -475,25 +509,25 @@ class LocalWorkspace:
                 "status": "ok",
                 "query": query,
                 "path": rel_dir,
-                "matches": matches,
-                "total_matches": len(matches),
+                "matches": matches[:limit],
+                "total_matches": min(len(matches), limit),
                 "truncated": truncated,
             }
 
     # --- Persistent Memory Management ---
 
     def _load_entries_unlocked(self) -> Dict[str, Dict[str, Any]]:
-        if not os.path.exists(self.memory_entries_path):
+        if not self.state_file_exists(self.memory_entries_path):
             return {}
         try:
             with open(self.memory_entries_path, "r", encoding="utf-8") as f:
                 data = json.load(f)
-            entries = data.get("entries") if isinstance(data, dict) else None
-            if isinstance(entries, dict):
-                return dict(entries)
-        except (OSError, json.JSONDecodeError):
-            pass
-        return {}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid workspace memory index: memory/entries.json") from exc
+        entries = data.get("entries") if isinstance(data, dict) else None
+        if not isinstance(entries, dict) or not all(isinstance(entry, dict) for entry in entries.values()):
+            raise ValueError("Invalid workspace memory index: memory/entries.json")
+        return entries
 
     def _save_entries_unlocked(self, entries: Dict[str, Dict[str, Any]]) -> None:
         atomic_write_json(self.memory_entries_path, {"version": 1, "entries": entries})
@@ -551,6 +585,7 @@ class LocalWorkspace:
     def memory_read(self, key: Optional[str] = None) -> Dict[str, Any]:
         with self._lock:
             if key is None or not str(key).strip():
+                self.state_file_exists(self.memory_md_path)
                 with open(self.memory_md_path, "r", encoding="utf-8", errors="replace") as f:
                     md_text = f.read()
                 entries = self._load_entries_unlocked()
@@ -571,6 +606,7 @@ class LocalWorkspace:
 
             norm_key = str(key).strip()
             if norm_key in ("MEMORY.md", "memory/MEMORY.md"):
+                self.state_file_exists(self.memory_md_path)
                 with open(self.memory_md_path, "r", encoding="utf-8", errors="replace") as f:
                     md_text = f.read()
                 return {"status": "ok", "key": "MEMORY.md", "exists": True, "value": md_text}
@@ -601,7 +637,8 @@ class LocalWorkspace:
 
         with self._lock:
             if norm_key in ("MEMORY.md", "memory/MEMORY.md"):
-                if append and os.path.exists(self.memory_md_path):
+                exists = self.state_file_exists(self.memory_md_path)
+                if append and exists:
                     with open(self.memory_md_path, "r", encoding="utf-8", errors="replace") as f:
                         prev = f.read()
                     sep = "" if (not prev or prev.endswith("\n")) else "\n"
@@ -681,7 +718,7 @@ class LocalWorkspace:
 
         with self._lock:
             results: List[Dict[str, Any]] = []
-            if not tag_filter and os.path.exists(self.memory_md_path):
+            if not tag_filter and self.state_file_exists(self.memory_md_path):
                 with open(self.memory_md_path, "r", encoding="utf-8", errors="replace") as f:
                     for idx, line in enumerate(f, 1):
                         if q_lower in line.lower():
@@ -693,8 +730,8 @@ class LocalWorkspace:
                                     "snippet": line.strip()[:240],
                                 }
                             )
-                            if len(results) >= cap:
-                                return {"status": "ok", "query": query, "matches": results, "truncated": True}
+                            if len(results) > cap:
+                                return {"status": "ok", "query": query, "matches": results[:cap], "truncated": True}
 
             entries = self._load_entries_unlocked()
             for key, entry in sorted(entries.items()):
@@ -714,8 +751,8 @@ class LocalWorkspace:
                             "value": val_str[:400],
                         }
                     )
-                    if len(results) >= cap:
-                        return {"status": "ok", "query": query, "matches": results, "truncated": True}
+                    if len(results) > cap:
+                        return {"status": "ok", "query": query, "matches": results[:cap], "truncated": True}
 
             return {"status": "ok", "query": query, "matches": results, "truncated": False}
 
@@ -732,14 +769,12 @@ class LocalWorkspace:
             abs_local, rel_local = self.resolve_path(local_path, allow_root=False, allow_internal=False)
             if os.path.isdir(abs_local):
                 raise IsADirectoryError(f"Local destination is a directory: {rel_local}")
-            if not overwrite and os.path.exists(abs_local):
-                raise FileExistsError(f"Local file already exists and overwrite=false: {rel_local}")
-
-        res = ftp_client.download_to_path(
-            remote_path=remote_path,
-            local_abs_path=abs_local,
-            max_bytes=MAX_TRANSFER_BYTES,
-        )
+            res = ftp_client.download_to_path(
+                remote_path=remote_path,
+                local_abs_path=abs_local,
+                max_bytes=MAX_TRANSFER_BYTES,
+                overwrite=overwrite,
+            )
         res["local_path"] = rel_local
         return res
 
@@ -751,17 +786,17 @@ class LocalWorkspace:
         create_parents: bool = True,
     ) -> Dict[str, Any]:
         with self._lock:
-            abs_local, rel_local = self.resolve_path(local_path, allow_root=False, allow_internal=True)
+            abs_local, rel_local = self.resolve_path(local_path, allow_root=False, allow_internal=False)
             if not os.path.exists(abs_local):
                 raise FileNotFoundError(f"Local workspace file not found: {rel_local}")
             if not os.path.isfile(abs_local):
                 raise IsADirectoryError(f"Local workspace path is not a regular file: {rel_local}")
 
-        res = ftp_client.upload_from_path(
-            local_abs_path=abs_local,
-            remote_path=remote_path,
-            create_parents=create_parents,
-            max_bytes=MAX_TRANSFER_BYTES,
-        )
+            res = ftp_client.upload_from_path(
+                local_abs_path=abs_local,
+                remote_path=remote_path,
+                create_parents=create_parents,
+                max_bytes=MAX_TRANSFER_BYTES,
+            )
         res["local_path"] = rel_local
         return res

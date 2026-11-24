@@ -82,7 +82,7 @@ class WorkspaceCoordinator:
         for d in self.inbox_dirs.values():
             os.makedirs(d, exist_ok=True)
         os.makedirs(self.archive_dir, exist_ok=True)
-        if not os.path.exists(self.protocol_path):
+        if not workspace.state_file_exists(self.protocol_path):
             atomic_write_bytes(self.protocol_path, COORD_PROTOCOL_DOC.encode("utf-8"))
 
         self._lock = threading.RLock()
@@ -94,10 +94,10 @@ class WorkspaceCoordinator:
         self._seq = self._discover_max_seq()
 
         for agent in VALID_AGENTS:
-            if not os.path.exists(self._status_path(agent)):
+            if not workspace.state_file_exists(self._status_path(agent)):
                 init_state = "idle" if agent == AGENT_COMPUTER_USE else "sleeping"
                 self.set_status(agent, init_state, task="initialized")
-            if os.path.exists(self._wake_path(agent)) or self._list_inbox_files_unlocked(agent):
+            if self._read_json_safe(self._wake_path(agent)) is not None:
                 self._wake_events[agent].set()
 
     def _discover_max_seq(self) -> int:
@@ -137,13 +137,13 @@ class WorkspaceCoordinator:
 
     @staticmethod
     def _read_json_safe(path: str) -> Optional[Dict[str, Any]]:
-        if not os.path.exists(path):
-            return None
         try:
+            if not LocalWorkspace.state_file_exists(path):
+                return None
             with open(path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             return data if isinstance(data, dict) else None
-        except (OSError, json.JSONDecodeError):
+        except (OSError, UnicodeError, json.JSONDecodeError):
             return None
 
     def _list_inbox_files_unlocked(self, agent: str) -> List[str]:
@@ -290,14 +290,15 @@ class WorkspaceCoordinator:
                 "wake_marker": wake_res,
             }
 
-    def has_wake(self, agent: str) -> bool:
+    def has_wake(self, agent: str, *, include_inbox: bool = True) -> bool:
         _validate_agent(agent)
         with self._lock:
-            if self._wake_events[agent].is_set():
+            if self._read_json_safe(self._wake_path(agent)) is not None:
                 return True
-            if os.path.exists(self._wake_path(agent)):
-                return True
-            return bool(self._list_inbox_files_unlocked(agent))
+            self._wake_events[agent].clear()
+            return include_inbox and any(
+                self._read_json_safe(path) is not None for path in self._list_inbox_files_unlocked(agent)
+            )
 
     def peek_wake(self, agent: str) -> Optional[Dict[str, Any]]:
         _validate_agent(agent)
@@ -358,7 +359,7 @@ class WorkspaceCoordinator:
         with self._lock:
             inbox_paths = self._list_inbox_files_unlocked(agent)
             unread_msgs: List[Dict[str, Any]] = []
-            for path in inbox_paths[:cap]:
+            for path in inbox_paths:
                 doc = self._read_json_safe(path)
                 if doc is None:
                     continue
@@ -372,9 +373,12 @@ class WorkspaceCoordinator:
                     except OSError:
                         pass
                 unread_msgs.append(doc)
+                if len(unread_msgs) == cap:
+                    break
 
+            unread_remaining = len(self._list_inbox_files_unlocked(agent)) if mark_read else len(inbox_paths)
             wake_consumed: Optional[Dict[str, Any]] = None
-            if mark_read and not self._list_inbox_files_unlocked(agent):
+            if mark_read and (not unread_remaining or not unread_msgs):
                 wake_consumed = self.consume_wake(agent)
 
             archived_msgs: List[Dict[str, Any]] = []
@@ -397,7 +401,7 @@ class WorkspaceCoordinator:
                 "status": "ok",
                 "agent": agent,
                 "messages": unread_msgs,
-                "unread_remaining": len(self._list_inbox_files_unlocked(agent)),
+                "unread_remaining": unread_remaining,
                 "archived_messages": archived_msgs,
                 "wake_consumed": wake_consumed,
             }
@@ -408,6 +412,8 @@ class WorkspaceCoordinator:
         timeout: float = 30.0,
         poll_interval: float = 0.2,
         check_interrupt: Optional[Callable[[], Optional[Dict[str, Any]]]] = None,
+        *,
+        include_inbox: bool = True,
     ) -> Dict[str, Any]:
         """Sleep until WAKE/inbox marker arrives, stop is signaled, or check_interrupt returns a dict."""
         _validate_agent(agent)
@@ -418,13 +424,13 @@ class WorkspaceCoordinator:
             if self._stop_event.is_set():
                 return {"woken": False, "stopped": True}
 
-            if self.has_wake(agent):
-                return {"woken": True, "stopped": False}
-
             if check_interrupt is not None:
                 interrupted = check_interrupt()
                 if interrupted is not None:
                     return {"woken": False, "stopped": False, "interrupted": interrupted}
+
+            if self.has_wake(agent, include_inbox=include_inbox):
+                return {"woken": True, "stopped": False}
 
             remaining = deadline - time.monotonic()
             if remaining <= 0:

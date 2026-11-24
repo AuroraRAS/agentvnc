@@ -640,6 +640,8 @@ class VncFtpClient:
         remote_path: str,
         local_abs_path: str,
         max_bytes: int = MAX_TRANSFER_BYTES,
+        *,
+        overwrite: bool = True,
     ) -> Dict[str, Any]:
         """Stream-download a remote file to local_abs_path atomically with SHA-256."""
         norm = normalize_remote_path(remote_path)
@@ -647,6 +649,8 @@ class VncFtpClient:
             raise ValueError(f"Cannot download directory/root path: {norm}")
 
         with self._lock:
+            if not overwrite and os.path.lexists(local_abs_path):
+                raise FileExistsError(f"Local file already exists: {local_abs_path}")
             st = self.stat(norm)
             if not st.get("exists"):
                 raise FileNotFoundError(f"Remote file not found: {norm}")
@@ -661,7 +665,7 @@ class VncFtpClient:
             parent_dir = os.path.dirname(os.path.abspath(local_abs_path))
             os.makedirs(parent_dir, exist_ok=True)
 
-            def _do(ftp: ftplib.FTP) -> Tuple[int, str]:
+            def _do(ftp: ftplib.FTP) -> Tuple[str, int, str]:
                 self._ensure_binary(ftp)
                 fd, tmp_path = tempfile.mkstemp(prefix=".dl_", dir=parent_dir)
                 os.close(fd)
@@ -688,14 +692,14 @@ class VncFtpClient:
                         pass
                     conn = None
                     ftp.voidresp()
-                    os.replace(tmp_path, local_abs_path)
-                    return total, digest.hexdigest()
+                    return tmp_path, total, digest.hexdigest()
                 except Exception:
                     if conn is not None:
                         try:
                             conn.close()
                         except OSError:
                             pass
+                        self._reset()
                     try:
                         if os.path.exists(tmp_path):
                             os.unlink(tmp_path)
@@ -703,7 +707,15 @@ class VncFtpClient:
                         pass
                     raise
 
-            total_bytes, sha256_hex = self._run_with_retry(_do, idempotent=True)
+            tmp_path, total_bytes, sha256_hex = self._run_with_retry(_do, idempotent=True)
+            try:
+                if overwrite:
+                    os.replace(tmp_path, local_abs_path)
+                else:
+                    os.link(tmp_path, local_abs_path)
+            finally:
+                if os.path.lexists(tmp_path):
+                    os.unlink(tmp_path)
             return {
                 "status": "ok",
                 "remote_path": norm,
@@ -730,30 +742,30 @@ class VncFtpClient:
         if size > max_bytes:
             raise ValueError(f"Local file size ({size} bytes) exceeds max transfer limit ({max_bytes} bytes)")
 
-        digest = hashlib.sha256()
-        with open(local_abs_path, "rb") as hash_f:
-            while True:
-                blk = hash_f.read(65536)
-                if not blk:
-                    break
-                digest.update(blk)
-        sha256_hex = digest.hexdigest()
-
         with self._lock:
             if create_parents:
                 parent, _ = split_remote_path(norm)
                 if parent != "/" and not is_windows_drive_root(parent):
                     self.mkdir(parent, parents=True)
 
-            def _do(ftp: ftplib.FTP) -> None:
-                with open(local_abs_path, "rb") as in_f:
-                    ftp.storbinary(f"STOR {norm}", in_f, blocksize=65536)
-                self._is_binary = True
+            def _do(ftp: ftplib.FTP) -> Tuple[int, str]:
+                digest = hashlib.sha256()
+                size_sent = 0
 
-            self._run_with_retry(_do, idempotent=True)
+                def record_sent(block: bytes) -> None:
+                    nonlocal size_sent
+                    size_sent += len(block)
+                    digest.update(block)
+
+                with open(local_abs_path, "rb") as in_f:
+                    ftp.storbinary(f"STOR {norm}", in_f, blocksize=65536, callback=record_sent)
+                self._is_binary = True
+                return size_sent, digest.hexdigest()
+
+            size_sent, sha256_hex = self._run_with_retry(_do, idempotent=True)
             return {
                 "status": "ok",
                 "remote_path": norm,
-                "bytes_transferred": size,
+                "bytes_transferred": size_sent,
                 "sha256": sha256_hex,
             }

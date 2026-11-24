@@ -294,23 +294,6 @@ class VncDesktopExecutor:
                     print(f"\n[COLLAB] vncviewer exited (code {viewer_proc.returncode}); ending session.")
                     return None
 
-                if self.coordinator is not None and self.coordinator.has_wake(AGENT_COMPUTER_USE):
-                    wake_doc = self.coordinator.consume_wake(AGENT_COMPUTER_USE)
-                    inbox = self.coordinator.read_messages(AGENT_COMPUTER_USE, mark_read=True)
-                    msgs = inbox.get("messages", [])
-                    try:
-                        st_wake = self.get_status()
-                        end_human = int(st_wake.get("human_action_count", start_human))
-                    except Exception:
-                        end_human = start_human
-                    parts = ["[Async wakeup from Research Assistant via `.coord/` marker]"]
-                    if wake_doc:
-                        parts.append(f"Wake reason: {wake_doc.get('reason', '')}")
-                    for msg in msgs:
-                        parts.append(json.dumps(msg, ensure_ascii=False))
-                    print(f"\n[COLLAB/PEER] Woken by Research Assistant (messages={len(msgs)}).")
-                    return "\n".join(parts), max(0, end_human - start_human)
-
                 try:
                     st = self.get_status()
                 except (EOFError, ConnectionError, BrokenPipeError, OSError) as e:
@@ -334,6 +317,23 @@ class VncDesktopExecutor:
                         human_delta = max(0, end_human - start_human)
                         print(f"\n[COLLAB] Received instruction from vncviewer: {instruction}")
                         return instruction, human_delta
+
+                if (
+                    not st.get("agent_paused")
+                    and self.coordinator is not None
+                    and self.coordinator.has_wake(AGENT_COMPUTER_USE, include_inbox=False)
+                ):
+                    inbox = self.coordinator.read_messages(AGENT_COMPUTER_USE, mark_read=True)
+                    wake_doc = inbox["wake_consumed"]
+                    msgs = inbox["messages"]
+                    if wake_doc or msgs:
+                        parts = ["[Async wakeup from Research Assistant via `.coord/` marker]"]
+                        if wake_doc:
+                            parts.append(f"Wake reason: {wake_doc.get('reason', '')}")
+                        parts.extend(json.dumps(msg, ensure_ascii=False) for msg in msgs)
+                        end_human = int(st.get("human_action_count", start_human))
+                        print(f"\n[COLLAB/PEER] Woken by Research Assistant (messages={len(msgs)}).")
+                        return "\n".join(parts), max(0, end_human - start_human)
 
                 if stdin_enabled:
                     readable, _, _ = select.select([sys.stdin], [], [], poll_interval)
@@ -681,11 +681,10 @@ class VncDesktopExecutor:
             )
             self.coordinator.set_status(AGENT_COMPUTER_USE, "working", task="Resumed after peer wait")
             if wait_res.get("woken"):
-                wake_doc = self.coordinator.consume_wake(AGENT_COMPUTER_USE)
                 inbox = self.coordinator.read_messages(AGENT_COMPUTER_USE, mark_read=True)
                 return {
                     "status": "woken",
-                    "wake_marker": wake_doc,
+                    "wake_marker": inbox["wake_consumed"],
                     "messages": inbox.get("messages", []),
                     "peer_status": self.coordinator.get_status(peer)["agents"][peer],
                 }
@@ -856,7 +855,9 @@ class VncDesktopExecutor:
             py = denormalize_y(args["y"], self.height)
             text = str(args.get("text", ""))
             clear_existing = bool(args.get("clear_existing", False))
-            press_enter = bool(args.get("press_enter", False))
+            needs_visual_check = not text.isascii()
+            enter_requested = bool(args.get("press_enter", False))
+            press_enter = enter_requested and not needs_visual_check
             self._click_px(px, py, btn_bit=1, count=1)
             time.sleep(0.10)
             if clear_existing:
@@ -879,8 +880,10 @@ class VncDesktopExecutor:
                 "clear_existing": clear_existing,
                 "press_enter": press_enter,
             }
-            if any(ord(ch) > 0x7F for ch in text):
+            if needs_visual_check:
                 res_paste["_attach_screenshot"] = True
+                if enter_requested:
+                    res_paste["note"] = "Enter was deferred. Verify the pasted text in the screenshot before pressing Enter."
             return res_paste
 
         if fname == "click_and_type":

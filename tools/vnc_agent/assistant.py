@@ -104,11 +104,13 @@ class ResearchAssistantWorker:
     def _build_tools(self) -> List[Dict[str, Any]]:
         tools: List[Dict[str, Any]] = []
         if self._use_native_builtin_tools:
-            if self.enable_web_search:
-                tools.append({"type": "google_search"})
             attached_stores = self.store_registry.list_attached()
+            # Gemini can use one of these search tools alongside the functions.
+            # The other search remains available through its dedicated query function.
             if attached_stores:
                 tools.append({"type": "file_search", "file_search_store_names": attached_stores})
+            elif self.enable_web_search:
+                tools.append({"type": "google_search"})
         tools.extend(copy.deepcopy(WORKSPACE_FUNCTION_DECLARATIONS))
         tools.extend(copy.deepcopy(COORDINATION_FUNCTION_DECLARATIONS))
         tools.extend(copy.deepcopy(ASSISTANT_FILE_SEARCH_DECLARATIONS))
@@ -116,7 +118,7 @@ class ResearchAssistantWorker:
 
     def _create_interaction(
         self,
-        input_payload: Any,
+        input_payload: List[Dict[str, Any]],
         previous_interaction_id: Optional[str],
     ) -> Dict[str, Any]:
         tools = self._build_tools()
@@ -140,7 +142,8 @@ class ResearchAssistantWorker:
                     thinking_level=self.thinking_level,
                     tools_override=self._build_tools(),
                 )
-            if previous_interaction_id and exc.is_previous_interaction_error:
+            continuing_tools = any(item.get("type") == "function_result" for item in input_payload)
+            if previous_interaction_id and exc.is_previous_interaction_error and not continuing_tools:
                 self._last_interaction_id = None
                 return self._llm.create(
                     input_payload=input_payload,
@@ -336,20 +339,17 @@ class ResearchAssistantWorker:
 
         if fname == "file_search_list_stores":
             page_size = 20 if args.get("page_size") is None else int(args["page_size"])
-            remote = self.file_search_client.list_stores(page_size=page_size)
+            remote = self.file_search_client.list_stores(page_size=page_size, page_token=args.get("page_token"))
             return {
                 "status": "ok",
                 "remote_stores": remote.get("fileSearchStores", []),
+                "next_page_token": remote.get("nextPageToken"),
                 "registry": self.store_registry.get_snapshot(),
             }
 
         if fname == "file_search_attach_store":
             norm = normalize_store_name(str(args["store_name"]))
-            store_info: Dict[str, Any] = {"name": norm}
-            try:
-                store_info = self.file_search_client.get_store(norm)
-            except Exception:
-                pass
+            store_info = self.file_search_client.get_store(norm)
             reg = self.store_registry.register_store(
                 norm,
                 display_name=str(store_info.get("displayName", "")),
@@ -368,22 +368,10 @@ class ResearchAssistantWorker:
             abs_local, rel_local = self.workspace.resolve_path(
                 str(args["local_path"]),
                 allow_root=False,
-                allow_internal=True,
+                allow_internal=False,
             )
-            raw_store = args.get("store_name")
-            if raw_store and str(raw_store).strip():
-                store_name = normalize_store_name(str(raw_store))
-                self.store_registry.register_store(store_name)
-            else:
-                store_name = self.store_registry.get_default_store() or ""
-                if not store_name:
-                    created = self.file_search_client.create_store(display_name="vnc-workspace-store")
-                    store_name = str(created["name"])
-                    self.store_registry.register_store(
-                        store_name,
-                        display_name=str(created.get("displayName", "vnc-workspace-store")),
-                        set_default=True,
-                    )
+            if not os.path.isfile(abs_local):
+                raise ValueError(f"Workspace path is not a regular file: {rel_local}")
 
             custom_meta: Optional[List[Dict[str, Any]]] = None
             raw_meta = args.get("custom_metadata_json")
@@ -404,6 +392,17 @@ class ResearchAssistantWorker:
                     ws_cfg["maxOverlapTokens"] = int(max_ov)
                 chunking_cfg = {"whiteSpaceConfig": ws_cfg}
 
+            raw_store = args.get("store_name")
+            requested_store = normalize_store_name(str(raw_store)) if raw_store and str(raw_store).strip() else None
+            store_name = requested_store or self.store_registry.get_default_store()
+            if not store_name:
+                created = self.file_search_client.create_store(display_name="vnc-workspace-store")
+                store_name = str(created["name"])
+                self.store_registry.register_store(
+                    store_name,
+                    display_name=str(created.get("displayName", "vnc-workspace-store")),
+                    set_default=True,
+                )
             op = self.file_search_client.upload_file(
                 store_name=store_name,
                 local_abs_path=abs_local,
@@ -413,6 +412,8 @@ class ResearchAssistantWorker:
                 chunking_config=chunking_cfg,
                 wait=True,
             )
+            if requested_store:
+                self.store_registry.register_store(requested_store)
             return {
                 "status": "ok",
                 "local_path": rel_local,
@@ -430,8 +431,13 @@ class ResearchAssistantWorker:
             if not store_name:
                 return {"error": "No File Search store specified or attached."}
             page_size = 20 if args.get("page_size") is None else int(args["page_size"])
-            res = self.file_search_client.list_documents(store_name, page_size=page_size)
-            return {"status": "ok", "store_name": store_name, "documents": res.get("documents", [])}
+            res = self.file_search_client.list_documents(store_name, page_size=page_size, page_token=args.get("page_token"))
+            return {
+                "status": "ok",
+                "store_name": store_name,
+                "documents": res.get("documents", []),
+                "next_page_token": res.get("nextPageToken"),
+            }
 
         if fname == "file_search_delete_document":
             force = True if args.get("force") is None else bool(args["force"])
@@ -503,26 +509,24 @@ class ResearchAssistantWorker:
         inbox = self.coordinator.read_messages(AGENT_ASSISTANT, mark_read=True, limit=20)
         messages = inbox.get("messages", [])
         wake_marker = inbox.get("wake_consumed")
-        if wake_marker is None:
-            wake_marker = self.coordinator.consume_wake(AGENT_ASSISTANT)
         if not messages and wake_marker is None:
             return
 
         first_subject = messages[0].get("subject", "research task") if messages else wake_marker.get("reason", "wake")
         self.coordinator.set_status(AGENT_ASSISTANT, "working", task=str(first_subject)[:120])
-        prompt_text = self._format_wake_prompt(messages, wake_marker)
         print(f"  [ASSISTANT] Woken up (messages={len(messages)}, task={first_subject!r})")
 
         sent_peer_message = False
         try:
+            prompt_text = self._format_wake_prompt(messages, wake_marker)
             interaction = self._create_interaction(
                 input_payload=[{"type": "text", "text": prompt_text}],
                 previous_interaction_id=self._last_interaction_id,
             )
 
-            for turn_idx in range(1, self.max_turns + 1):
+            for turn_idx in range(1, self.max_turns + 2):
                 if self._stop_event.is_set():
-                    break
+                    return
                 calls = extract_function_calls(interaction)
                 server_events = extract_server_tool_events(interaction)
                 citations = extract_citations(interaction)
@@ -560,15 +564,34 @@ class ResearchAssistantWorker:
                         )
                     break
 
+                if turn_idx > self.max_turns:
+                    if not sent_peer_message:
+                        self.coordinator.send_message(
+                            sender=AGENT_ASSISTANT,
+                            recipient=AGENT_COMPUTER_USE,
+                            subject=f"Re: {first_subject} (turn limit reached)",
+                            body=f"Research Assistant reached max_turns ({self.max_turns}) while working on {first_subject!r}.",
+                            kind="update",
+                            in_reply_to=(messages[-1].get("id") if messages else None),
+                            wake=True,
+                        )
+                    break
+
                 fn_results: List[Dict[str, Any]] = []
                 turn_actions: List[Dict[str, Any]] = []
                 for fc in calls:
+                    if self._stop_event.is_set():
+                        return
                     fname = str(fc.get("name", ""))
                     call_id = str(fc.get("id", ""))
                     fc_args = fc.get("arguments") or {}
                     print(f"  [ASSISTANT] -> Tool: {fname}")
                     res = self._execute_tool(fname, fc_args)
-                    if fname == "peer_send_message" and res.get("status") == "ok":
+                    if (
+                        fname == "peer_send_message"
+                        and res.get("message", {}).get("kind") == "response"
+                        and res.get("woke_peer")
+                    ):
                         sent_peer_message = True
                     turn_actions.append({"name": fname, "args": fc_args, "result": res})
                     fn_results.append(
@@ -591,22 +614,15 @@ class ResearchAssistantWorker:
                         "actions": turn_actions,
                     }
                 )
+                if self._stop_event.is_set():
+                    return
                 interaction = self._create_interaction(
                     input_payload=fn_results,
                     previous_interaction_id=interaction.get("id"),
                 )
-            else:
-                if not sent_peer_message:
-                    self.coordinator.send_message(
-                        sender=AGENT_ASSISTANT,
-                        recipient=AGENT_COMPUTER_USE,
-                        subject=f"Re: {first_subject} (turn limit reached)",
-                        body=f"Research Assistant reached max_turns ({self.max_turns}) while working on {first_subject!r}.",
-                        kind="update",
-                        in_reply_to=(messages[-1].get("id") if messages else None),
-                        wake=True,
-                    )
         except Exception as exc:
+            if self._stop_event.is_set():
+                return
             err_msg = f"Research Assistant failed on {first_subject!r}: {exc}"
             print(f"  [ASSISTANT ERROR] {err_msg}")
             self._log_trace({"error": err_msg})
@@ -633,6 +649,7 @@ class ResearchAssistantWorker:
                 AGENT_ASSISTANT,
                 timeout=0.5,
                 poll_interval=self.poll_interval,
+                include_inbox=False,
             )
             if self._stop_event.is_set() or wait_res.get("stopped"):
                 break
@@ -649,7 +666,5 @@ class ResearchAssistantWorker:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop_event.set()
-        self.coordinator.shutdown()
         if self._thread is not None:
             self._thread.join(timeout=timeout)
-            self._thread = None

@@ -7,7 +7,7 @@ import urllib.error
 import urllib.request
 from typing import Any, Dict, List, Optional
 
-from .constants import INTERACTIONS_URL
+from .constants import INTERACTIONS_API_REVISION, INTERACTIONS_URL
 
 
 class InteractionsApiError(RuntimeError):
@@ -145,6 +145,7 @@ class InteractionsClient:
                 data=encoded,
                 headers={
                     "Content-Type": "application/json",
+                    "Api-Revision": INTERACTIONS_API_REVISION,
                     "x-goog-api-key": self.api_key,
                 },
                 method="POST",
@@ -153,9 +154,16 @@ class InteractionsClient:
                 with urllib.request.urlopen(req, timeout=self.timeout) as resp:
                     raw_resp = resp.read().decode("utf-8")
                 try:
-                    return json.loads(raw_resp)
+                    interaction = json.loads(raw_resp)
                 except json.JSONDecodeError as e:
                     raise InteractionsApiError(None, f"Invalid JSON response from Interactions API: {e}") from None
+                if not isinstance(interaction, dict):
+                    raise InteractionsApiError(None, "Expected a JSON object from the Interactions API")
+                status = interaction.get("status")
+                if status in ("failed", "cancelled", "incomplete"):
+                    err = interaction.get("error")
+                    raise InteractionsApiError(None, json.dumps(err) if err else f"Interaction {status}")
+                return interaction
             except urllib.error.HTTPError as e:
                 try:
                     err_text = e.read().decode("utf-8", errors="replace")

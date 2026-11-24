@@ -3,6 +3,7 @@
 import json
 import mimetypes
 import os
+import re
 import threading
 import time
 import urllib.error
@@ -67,15 +68,23 @@ class FileSearchApiError(RuntimeError):
         super().__init__(summary)
 
 
+_RESOURCE_ID = r"[A-Za-z0-9_-]+"
+
+
 def normalize_store_name(store_name: str) -> str:
     raw = (store_name or "").strip().strip("/")
-    if not raw:
-        raise ValueError("store_name must not be empty")
-    if raw.startswith("fileSearchStores/"):
-        return raw
-    if "/" in raw:
+    prefix = "fileSearchStores/"
+    store_id = raw[len(prefix):] if raw.startswith(prefix) else raw
+    if not re.fullmatch(_RESOURCE_ID, store_id):
         raise ValueError(f"Invalid File Search store resource name: {store_name!r}")
-    return f"fileSearchStores/{raw}"
+    return f"fileSearchStores/{store_id}"
+
+
+def _normalize_document_name(document_name: str) -> str:
+    name = document_name.strip().strip("/")
+    if not re.fullmatch(rf"fileSearchStores/{_RESOURCE_ID}/documents/{_RESOURCE_ID}", name):
+        raise ValueError(f"Invalid File Search document name: {document_name!r}")
+    return name
 
 
 def guess_mime_type(file_path: str) -> str:
@@ -124,7 +133,10 @@ class FileSearchClient:
                     raw = resp.read().decode("utf-8")
                 if not raw.strip():
                     return {}
-                return json.loads(raw)
+                result = json.loads(raw)
+                if not isinstance(result, dict):
+                    raise FileSearchApiError(None, "Expected a JSON object from the File Search API")
+                return result
             except urllib.error.HTTPError as e:
                 try:
                     err_text = e.read().decode("utf-8", errors="replace")
@@ -132,13 +144,13 @@ class FileSearchClient:
                 finally:
                     e.close()
                 api_err = FileSearchApiError(code, err_text)
-                if code in (429, 500, 502, 503, 504) and attempt < 2:
+                if attempt < 2 and (code == 429 or (method != "POST" and code in (500, 502, 503, 504))):
                     last_err = api_err
                     time.sleep(1.0 * (2**attempt))
                     continue
                 raise api_err from None
             except (urllib.error.URLError, TimeoutError, OSError) as e:
-                if attempt < 2:
+                if method != "POST" and attempt < 2:
                     last_err = e
                     time.sleep(1.0 * (2**attempt))
                     continue
@@ -182,9 +194,9 @@ class FileSearchClient:
         return self._request_json("DELETE", f"{self.api_base}/{norm}?{qs}")
 
     def get_operation(self, operation_name: str) -> Dict[str, Any]:
-        norm = operation_name.strip().lstrip("/")
-        if not norm:
-            raise ValueError("operation_name must not be empty")
+        norm = operation_name.strip().strip("/")
+        if not re.fullmatch(rf"(?:fileSearchStores/{_RESOURCE_ID}/(?:upload/)?)?operations/{_RESOURCE_ID}", norm):
+            raise ValueError(f"Invalid File Search operation name: {operation_name!r}")
         return self._request_json("GET", f"{self.api_base}/{norm}")
 
     def list_documents(
@@ -201,15 +213,11 @@ class FileSearchClient:
         return self._request_json("GET", f"{self.api_base}/{norm}/documents?{qs}")
 
     def get_document(self, document_name: str) -> Dict[str, Any]:
-        norm = document_name.strip().lstrip("/")
-        if not norm.startswith("fileSearchStores/") or "/documents/" not in norm:
-            raise ValueError(f"Invalid File Search document name: {document_name!r}")
+        norm = _normalize_document_name(document_name)
         return self._request_json("GET", f"{self.api_base}/{norm}")
 
     def delete_document(self, document_name: str, force: bool = True) -> Dict[str, Any]:
-        norm = document_name.strip().lstrip("/")
-        if not norm.startswith("fileSearchStores/") or "/documents/" not in norm:
-            raise ValueError(f"Invalid File Search document name: {document_name!r}")
+        norm = _normalize_document_name(document_name)
         qs = urllib.parse.urlencode({"force": "true" if force else "false"})
         return self._request_json("DELETE", f"{self.api_base}/{norm}?{qs}")
 
@@ -231,7 +239,11 @@ class FileSearchClient:
         if not os.path.isfile(local_abs_path):
             raise IsADirectoryError(f"Local path is not a regular file: {local_abs_path}")
 
-        num_bytes = os.path.getsize(local_abs_path)
+        with open(local_abs_path, "rb") as f:
+            num_bytes = os.fstat(f.fileno()).st_size
+            if num_bytes <= MAX_TRANSFER_BYTES:
+                file_bytes = f.read(MAX_TRANSFER_BYTES + 1)
+                num_bytes = len(file_bytes)
         if num_bytes > MAX_TRANSFER_BYTES:
             raise ValueError(
                 f"File size ({num_bytes} bytes) exceeds File Search 100 MiB limit ({MAX_TRANSFER_BYTES})"
@@ -279,9 +291,6 @@ class FileSearchClient:
         if not upload_url:
             raise FileSearchApiError(None, "Missing X-Goog-Upload-URL header in resumable upload response")
 
-        with open(local_abs_path, "rb") as f:
-            file_bytes = f.read()
-
         put_headers = {
             "Content-Length": str(len(file_bytes)),
             "X-Goog-Upload-Offset": "0",
@@ -292,7 +301,7 @@ class FileSearchClient:
         try:
             with urllib.request.urlopen(put_req, timeout=max(self.timeout, 120.0)) as resp:
                 raw_op = resp.read().decode("utf-8")
-                op = json.loads(raw_op) if raw_op.strip() else {"done": True}
+                op = json.loads(raw_op)
         except urllib.error.HTTPError as e:
             try:
                 err_text = e.read().decode("utf-8", errors="replace")
@@ -305,18 +314,25 @@ class FileSearchClient:
         except json.JSONDecodeError as e:
             raise FileSearchApiError(None, f"Invalid JSON from upload finalize: {e}") from None
 
-        if wait and isinstance(op, dict) and not op.get("done", False):
+        if not isinstance(op, dict):
+            raise FileSearchApiError(None, "Expected an operation from the File Search upload")
+        if wait and not op.get("done", False) and not op.get("error"):
             op_name = op.get("name")
             if not op_name:
-                return op
+                raise FileSearchApiError(None, "Missing operation name in the File Search upload response")
             deadline = time.monotonic() + float(timeout)
             while not op.get("done", False):
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    raise TimeoutError(f"Timed out waiting for File Search indexing operation {op_name}")
+                time.sleep(min(remaining, max(0.05, float(poll_interval))))
                 if time.monotonic() >= deadline:
                     raise TimeoutError(f"Timed out waiting for File Search indexing operation {op_name}")
-                time.sleep(max(0.05, float(poll_interval)))
                 op = self.get_operation(str(op_name))
+                if op.get("error"):
+                    break
 
-        if isinstance(op, dict) and op.get("error"):
+        if op.get("error"):
             err = op["error"]
             raise FileSearchApiError(
                 err.get("code") if isinstance(err, dict) else None,
@@ -332,18 +348,20 @@ class FileSearchStoreRegistry:
         self.workspace = workspace
         self.path = os.path.join(workspace.agent_dir, "file_search_stores.json")
         self._lock = threading.RLock()
-        if not os.path.exists(self.path):
+        if not workspace.state_file_exists(self.path):
             atomic_write_json(self.path, {"default_store": None, "stores": {}})
 
     def _load_unlocked(self) -> Dict[str, Any]:
+        if not self.workspace.state_file_exists(self.path):
+            return {"default_store": None, "stores": {}}
         try:
             with open(self.path, "r", encoding="utf-8") as f:
                 data = json.load(f)
             if isinstance(data, dict) and isinstance(data.get("stores"), dict):
                 return data
-        except (OSError, json.JSONDecodeError):
-            pass
-        return {"default_store": None, "stores": {}}
+        except (UnicodeError, json.JSONDecodeError) as exc:
+            raise ValueError("Invalid File Search store registry") from exc
+        raise ValueError("Invalid File Search store registry")
 
     def _save_unlocked(self, data: Dict[str, Any]) -> None:
         atomic_write_json(self.path, data)
