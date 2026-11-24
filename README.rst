@@ -112,8 +112,11 @@ Supported JSON ``cmd`` values are: ``PING``, ``GET_STATUS``, ``GET_FRAME``
 (returns raw ``RGB24`` or ``RGBA32`` pixel buffers in the binary payload),
 ``REQUEST_REFRESH``, ``POINTER_EVENT``, ``KEY_EVENT``, ``TEXT_TYPE``,
 ``CLIPBOARD_GET``, ``CLIPBOARD_SET``, ``PAUSE_AGENT``, ``RESUME_AGENT``,
-``AGENT_OVERLAY``, and ``POLL_USER_MESSAGES``.  When the embedded FTP bridge is
-enabled, ``GET_STATUS`` also reports ``ftp_enabled``, ``ftp_running``,
+``AGENT_OVERLAY``, and ``POLL_USER_MESSAGES``.  ``GET_STATUS`` reports whether
+the viewer can send extended UTF-8 clipboard data in ``clipboard_utf8``.
+``CLIPBOARD_GET`` includes the ``legacy`` format flag and a ``sequence`` number
+that advances when the viewer receives clipboard data.  When the embedded FTP
+bridge is enabled, ``GET_STATUS`` also reports ``ftp_enabled``, ``ftp_running``,
 ``ftp_url``, ``ftp_supported``, ``ftp_ready``, and ``ftp_protocol``.
 
 To verify a running ``-AgentSocket`` session, run the bundled Python test
@@ -126,8 +129,11 @@ Running the Gemini Computer Use Agent
 
 ``tools/vnc_computer_use_agent.py`` implements a Gemini Computer Use desktop
 agent over ``-AgentSocket`` using only the Python standard library.  Provide an
-API key via the ``GEMINI_API_KEY`` environment variable or ``--api-key-file``
-(default: ``./gemini.key``)::
+API key via ``--api-key-file`` (defaults to ``gemini.key`` in the repository
+root) or the ``GEMINI_API_KEY`` environment variable.  The file takes precedence
+when it contains a key.
+
+Example agent invocations::
 
   # Spawn a headless viewer automatically and run a task
   GEMINI_API_KEY=... python3 tools/vnc_computer_use_agent.py \
@@ -163,15 +169,51 @@ Key agent flags:
   ``file_mkdir``, ``file_delete``, ``file_rename``) backed by ``-FtpServer``.
   Pass ``--ftp`` to require FTP file tools to be available, or ``--no-ftp`` to
   disable them.
-* ``--no-custom-tools`` - Disable deterministic helper tools
-  (``clipboard_get``, ``clipboard_set``, ``paste_text_at``, ``click_and_type``,
-  ``get_desktop_status``, ``yield_to_user``).
+* ``--no-custom-tools`` - Disable custom function tools and the Research
+  Assistant.  Use ``--ftp`` to enable direct remote file tools explicitly.
+* ``--workspace <dir>`` - Shared local workspace directory for local files,
+  persistent memory (``memory/MEMORY.md``, ``memory/entries.json``), remote
+  host transfers (``workspace_download_from_remote``,
+  ``workspace_upload_to_remote``), and ``.coord/`` marker coordination
+  (defaults to ``<log-dir>/workspace``).  Remote transfers require an active
+  FTP bridge.
+* ``--log-dir <dir>`` - Directory for local traces and screenshots (defaults
+  to ``/tmp/vnc_agent_run``).
+* ``--assistant-model <name>``, ``--assistant-thinking-level <level>``,
+  ``--assistant-max-turns <n>`` - Configure the asynchronous Research
+  Assistant.  The default model is ``gemini-3.8-flash`` and the default limit is
+  12 tool turns per wakeup.
+* ``--no-assistant`` - Disable the Research Assistant.
+* ``--no-web-search`` - Disable the Research Assistant's Google Web Search
+  while retaining its Gemini File Search and workspace tools.
+* ``--file-search-store <name>`` - Attach an existing Gemini File Search store
+  to the workspace.  Repeat the option to attach multiple stores.
+* ``--legacy-clipboard-encoding <encoding>`` - Select the server's encoding for
+  legacy clipboard transfers, which default to Latin-1.  For example, use
+  ``--legacy-clipboard-encoding cp936`` with a Simplified Chinese Windows XP
+  server that uses that code page.  This option requires a viewer that reports
+  ``clipboard_utf8`` over ``-AgentSocket``.
 * ``--vncviewer-bin <path>`` - Path to the built ``vncviewer`` binary
   (default: ``build/vncviewer/vncviewer``).
 
+The desktop agent and Research Assistant share files and persistent notes in
+the workspace.  The desktop agent can send a request with ``peer_send_message``
+and continue working while the assistant runs.  The assistant uses ``.coord/``
+markers to track requests, status, and replies.  It uploads files selected for
+Gemini File Search indexing using the configured API key.
+
+The viewer uses UTF-8 when the server supports the extended clipboard protocol.
+On the legacy path, ``CLIPBOARD_SET`` returns an error if the text cannot be
+represented on the wire.  The agent attaches a screenshot after a non-ASCII
+paste.  For exact text checks before saving or submitting, select the text in
+the remote application and use ``clipboard_verify_selection`` to compare a
+fresh copy against the expected text.
+
 Run ``python3 tools/test_agent_file_io.py`` for offline unit tests of the agent
 file I/O tools (or pass ``--live --vnc-host localhost:5901`` for a live VNC
-integration test).
+integration test), and ``python3 tools/test_agent_workspace_assistant.py`` for
+offline unit tests of the local workspace, persistent memory, remote transfers,
+Gemini File Search client, and asynchronous Research Assistant coordination.
 
 
 HiDPI and Remote Desktop Scaling
