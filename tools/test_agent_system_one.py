@@ -41,6 +41,7 @@ from vnc_agent import (  # noqa: E402
     SystemOneClient,
     SystemOneHostEngine,
     VncDesktopExecutor,
+    adjudicate_predicate,
     build_tools_config,
     compute_pixel_diff_ratio,
     compute_ssim,
@@ -140,6 +141,7 @@ class ScriptedSystemOneClient:
         questions: Dict[str, Dict[str, Any]],
         image_assets: Optional[Dict[str, Tuple[bytes, str]]] = None,
         model: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         call_idx = len(self.calls)
         self.calls.append(
@@ -299,6 +301,57 @@ class SystemOneUnitTests(unittest.TestCase):
         prep_strip = prepare_image_for_system_one(big, [100, 100, 130, 900])
         self.assertGreaterEqual(prep_strip.out_width, 280)
         self.assertGreaterEqual(prep_strip.out_height, 280)
+        with mock.patch("vnc_agent.system_one_client.Image", None), mock.patch("vnc_agent.system_one_client.np", None):
+            prep_fallback = prepare_image_for_system_one(big)
+        self.assertEqual((prep_fallback.out_width, prep_fallback.out_height), (prep_big.out_width, prep_big.out_height))
+
+    def test_malformed_oracle_answers_cannot_match(self) -> None:
+        negative = normalize_predicate({"type": "noul", "instructions": "Is the gate closed?", "expected_value": False}, "read_only")
+        for answer in ({}, {"noul": None}, {"noul": False}, {"noul": -0.1}, {"noul": float("nan")}):
+            self.assertEqual(adjudicate_predicate(negative, answer, "read_only").zone, "gray")
+        self.assertEqual(adjudicate_predicate(negative, {"noul": 0.0}, "read_only").zone, "pass")
+
+        choice = normalize_predicate(
+            {"type": "choice", "instructions": "Status?", "criteria": {"ready": "Ready", "loading": "Loading"},
+             "target_choices": ["ready"]},
+            "read_only",
+        )
+        self.assertEqual(adjudicate_predicate(choice, {"choice": "unexpected", "confidence": 1}, "read_only").zone, "gray")
+        self.assertEqual(adjudicate_predicate(choice, {"choice": "loading", "confidence": 0.2}, "read_only").zone, "gray")
+
+        tightened = normalize_predicate({"type": "noul", "instructions": "Ready?", "min_confidence": 0.95}, "read_only")
+        self.assertEqual(adjudicate_predicate(tightened, {"noul": 0.9}, "read_only", prev_two_frame_hits=1).zone, "gray")
+
+        frame = make_rgb_frame(800, 50)
+        prepared = prepare_image_for_system_one(frame)
+        with self.assertRaises(ValueError):
+            prepared.map_box_to_screen_bbox({"top": 0.01, "bottom": 0.02, "left": 0.2, "right": 0.8})
+
+    def test_failed_key_and_button_releases_can_be_retried(self) -> None:
+        calls = []
+        reject_release = False
+
+        def request(command, **args):
+            calls.append((command, args))
+            held = args.get("down") or args.get("button_mask")
+            if reject_release and not held:
+                return {"ok": False, "error": "agent_paused"}, b""
+            return {"ok": True}, b""
+
+        executor = VncDesktopExecutor(mock.Mock(request=request))
+        executor._pointer(20, 30, 1)
+        executor._key(0xFF51, True)
+        reject_release = True
+        executor.release_all_inputs()
+        reject_release = False
+        executor.release_all_inputs()
+        self.assertEqual(calls[-2:], [
+            ("POINTER_EVENT", {"x": 20, "y": 30, "button_mask": 0}),
+            ("KEY_EVENT", {"keysym": 0xFF51, "down": False}),
+        ])
+        count = len(calls)
+        executor.release_all_inputs()
+        self.assertEqual(len(calls), count)
 
     def test_pixel_diff_and_ssim_metrics(self) -> None:
         f1 = make_rgb_frame(400, 300, bg=(235, 235, 235), rects=[(50, 50, 150, 150, (200, 20, 20))], frame_seq=1)
@@ -475,6 +528,19 @@ class SystemOneUnitTests(unittest.TestCase):
         )
         self.assertEqual(res_to["status"], "timeout")
         self.assertEqual(res_to["breaker_code"], CB_BUDGET_EXCEEDED)
+        self.assertEqual(res_to["metrics"]["elapsed_ms"], 900)
+
+        clock_late = FakeClock()
+
+        def answer_after_deadline(*_):
+            clock_late.sleep(0.2)
+            return {"condition": {"noul": 0.99}}
+
+        late = SystemOneHostEngine(
+            FakeFsmExecutor([base]), ScriptedSystemOneClient(answer_after_deadline),
+            sleep_fn=clock_late.sleep, monotonic_fn=clock_late.monotonic,
+        ).run_wait_until({"condition": {"type": "noul", "instructions": "Done?"}, "timeout_ms": 100})
+        self.assertEqual(late["breaker_code"], CB_BUDGET_EXCEEDED)
 
     def test_gray_zone_retry_and_unreadable_breaker(self) -> None:
         base = make_rgb_frame(640, 480, frame_seq=1)
@@ -591,6 +657,20 @@ class SystemOneUnitTests(unittest.TestCase):
         self.assertEqual(res_stall["breaker_code"], CB_STALL)
         self.assertEqual([a["type"] for a in exec_stall.actions], ["wheel_scroll", "key_press", "key_press"])
 
+        exec_small_change = FakeFsmExecutor([f0, f0])
+        engine_small_change = SystemOneHostEngine(
+            exec_small_change,
+            ScriptedSystemOneClient(lambda idx, *_: {"stop": {"noul": 0.05 if idx == 0 else 0.99}}),
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic,
+        )
+        result = engine_small_change.run_loop_until({
+            "stop_predicate": {"type": "noul", "instructions": "Found?"},
+            "step_action": {"type": "key_press", "key": "Down"},
+            "max_stalls": 1,
+        })
+        self.assertEqual(result["status"], "matched")
+        self.assertEqual(len(exec_small_change.actions), 1)
+
         # Geometry failure (< 6px degenerate box) -> CB_AMBIGUITY with zero click
         exec_geom = FakeFsmExecutor([f0])
         def bad_geom_responder(call_idx: int, state: Dict[str, Any], questions: Dict[str, Any], assets: Any) -> Dict[str, Any]:
@@ -632,6 +712,14 @@ class SystemOneUnitTests(unittest.TestCase):
         self.assertEqual(res_irr["breaker_code"], CB_SAFETY_GUARD)
         self.assertEqual(exec_irr.actions, [])
         self.assertEqual(res_irr["metrics"]["s1_calls"], 0)
+        self.assertEqual(res_irr["fsm_states"][-1], "S5_HANDOFF_TO_S2")
+        nav_guard = engine_irr.run_loop_until({
+            "stop_predicate": {"type": "noul", "instructions": "Is the report visible?"},
+            "step_action": {"type": "click", "x": 500, "y": 500},
+            "risk_tier": "irreversible",
+        })
+        self.assertEqual(nav_guard["breaker_code"], CB_SAFETY_GUARD)
+        self.assertEqual(exec_irr.actions, [])
 
         # 2. Safety keyword guardrail on reversible tier -> CB_SAFETY_GUARD
         exec_kw = FakeFsmExecutor([f0])
@@ -693,6 +781,31 @@ class SystemOneUnitTests(unittest.TestCase):
             },
         )
         self.assertEqual(res_ssim["breaker_code"], CB_INTERRUPT)
+
+    def test_loop_interrupts_on_the_gray_zone_retry_frame(self) -> None:
+        executor = FakeFsmExecutor([make_rgb_frame()])
+        clock = FakeClock()
+
+        def respond(_, state, questions, assets):
+            if "retry_pred" in questions:
+                interrupt_question = questions["interrupt_0"]["instructions"]
+                self.assertIn("`interrupt_view_0`", interrupt_question)
+                return {"retry_pred": {"noul": 0.99}, "interrupt_0": {"noul": 0.99}}
+            return {"stop": {"noul": 0.75}, "interrupt_0": {"noul": 0.01}}
+
+        engine = SystemOneHostEngine(
+            executor, ScriptedSystemOneClient(respond),
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic,
+        )
+        result = engine.run_loop_until({
+            "stop_predicate": {"type": "noul", "instructions": "Ready?"},
+            "step_action": {"type": "key_press", "key": "Down"},
+            "on_match": {"mode": "action", "action": {"type": "click", "x": 500, "y": 500}},
+            "interrupt_predicates": [{"type": "noul", "instructions": "Is the queue paused?", "roi": [100, 100, 200, 400]}],
+        })
+        self.assertEqual(result["breaker_code"], CB_INTERRUPT)
+        self.assertIn("during retry", result["detail"])
+        self.assertEqual(executor.actions, [])
 
     def test_batch_apply_parallel_eval_and_drift_breakers(self) -> None:
         # 2x2 grid on 800x600 screen, 2 items match -> 1 S1 call evaluates all 4 slots in parallel
@@ -782,6 +895,28 @@ class SystemOneUnitTests(unittest.TestCase):
         )
         self.assertEqual(res_err["breaker_code"], CB_BATCH_DRIFT)
 
+    def test_batch_returns_before_clicking_a_reordered_slot(self) -> None:
+        original = make_rgb_frame()
+        reordered = make_rgb_frame(rects=[(400, 0, 799, 599, (0, 0, 0))], frame_seq=2)
+        executor = FakeFsmExecutor([original, reordered])
+        clock = FakeClock()
+
+        def respond(_, state, questions, assets):
+            return {name: {"noul": 0.99} for name in questions}
+
+        engine = SystemOneHostEngine(
+            executor, ScriptedSystemOneClient(respond),
+            sleep_fn=clock.sleep, monotonic_fn=clock.monotonic,
+        )
+        result = engine.run_batch_apply({
+            "item_predicate": {"type": "noul", "instructions": "Is the item eligible?"},
+            "item_action": "click_relative",
+            "slot_grid": {"rows": 1, "cols": 2},
+        })
+        self.assertEqual(result["breaker_code"], CB_BATCH_DRIFT)
+        self.assertEqual(result["outcome"]["batch_summary"]["mutations_executed"], 1)
+        self.assertEqual(len(executor.actions), 1)
+
     def test_end_to_end_run_agent_with_system_one(self) -> None:
         # Spin up a tiny Unix domain socket stub speaking AgentSocket JSON framing
         sock_path = os.path.join(self.tmp, "agent.sock")
@@ -858,7 +993,10 @@ class SystemOneUnitTests(unittest.TestCase):
                 200,
                 {
                     "model": "jev-latest",
-                    "answers": {"condition": {"type": "noul", "noul": 0.72}},
+                    "answers": {
+                        "condition": {"type": "noul", "noul": 0.72},
+                        "retry_pred": {"type": "noul", "noul": 0.72},
+                    },
                 },
             )
         )
@@ -879,7 +1017,13 @@ class SystemOneUnitTests(unittest.TestCase):
                                 "settle_delay_ms": 0,
                                 "intent": "Wait for badge",
                             },
-                        }
+                        },
+                        {
+                            "type": "function_call",
+                            "id": "call_2",
+                            "name": "click",
+                            "arguments": {"x": 500, "y": 500},
+                        },
                     ],
                 }
             return 200, {
@@ -958,6 +1102,8 @@ class SystemOneUnitTests(unittest.TestCase):
             txt_payload = json.loads(fres["result"][0]["text"])
             self.assertEqual(txt_payload["breaker_code"], CB_AMBIGUITY)
             self.assertNotIn("_visual_evidence_images", txt_payload)
+            skipped = json.loads(req2["input"][1]["result"][0]["text"])
+            self.assertEqual(skipped["status"], "skipped_pending_visual_verification")
         finally:
             stop_event.set()
             t.join(timeout=2.0)

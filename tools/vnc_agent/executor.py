@@ -312,6 +312,7 @@ class VncDesktopExecutor:
             time.sleep(0.25)
         notes: List[str] = []
         if connected_ok:
+            self.release_all_inputs()
             try:
                 notes, end_human, _ = self.poll_user_messages()
             except (EOFError, ConnectionError, BrokenPipeError, OSError) as e:
@@ -453,24 +454,26 @@ class VncDesktopExecutor:
 
     def _pointer(self, x: int, y: int, mask: int) -> None:
         self._last_pointer_xy = (int(x), int(y))
-        self._last_button_mask = int(mask)
+        if mask:
+            self._last_button_mask = int(mask)
         resp, _ = self.client.request("POINTER_EVENT", x=int(x), y=int(y), button_mask=int(mask))
         if not resp.get("ok"):
             if resp.get("error") == "agent_paused":
                 raise AgentPausedError(resp.get("message", "Agent input paused by operator"))
             raise RuntimeError(f"POINTER_EVENT failed: {resp}")
+        self._last_button_mask = int(mask)
 
     def _key(self, keysym: int, down: bool) -> None:
         ks = int(keysym)
         if down:
             self._held_keysyms.add(ks)
-        else:
-            self._held_keysyms.discard(ks)
         resp, _ = self.client.request("KEY_EVENT", keysym=ks, down=bool(down))
         if not resp.get("ok"):
             if resp.get("error") == "agent_paused":
                 raise AgentPausedError(resp.get("message", "Agent input paused by operator"))
             raise RuntimeError(f"KEY_EVENT failed: {resp}")
+        if not down:
+            self._held_keysyms.discard(ks)
 
     def release_all_inputs(self) -> None:
         """Release any held mouse buttons and keyboard keys (used during S5_HANDOFF_TO_S2)."""
@@ -478,16 +481,15 @@ class VncDesktopExecutor:
             px, py = self._last_pointer_xy
             try:
                 self._pointer(px, py, 0)
-            except (EOFError, ConnectionError, BrokenPipeError, OSError, RuntimeError, AgentPausedError):
+            except (EOFError, OSError, RuntimeError):
                 pass
-            self.button_mask = 0
-            self._last_button_mask = 0
+            else:
+                self.button_mask = 0
         for ks in list(self._held_keysyms):
             try:
                 self._key(ks, False)
-            except (EOFError, ConnectionError, BrokenPipeError, OSError, RuntimeError, AgentPausedError):
+            except (EOFError, OSError, RuntimeError):
                 pass
-        self._held_keysyms.clear()
 
     def capture_rgb_frame(self) -> FrameSnapshot:
         """Capture a raw RGB24 ``FrameSnapshot`` via ``GET_FRAME`` without PNG encoding overhead."""
@@ -498,6 +500,8 @@ class VncDesktopExecutor:
         h = int(hdr.get("height", self.height) or self.height)
         if w <= 0 or h <= 0:
             raise RuntimeError(f"Invalid GET_FRAME dimensions: {w}x{h}")
+        if len(pixels) != w * h * 3:
+            raise RuntimeError(f"Invalid RGB24 payload size for {w}x{h} frame: {len(pixels)} bytes")
         self.width = w
         self.height = h
         return FrameSnapshot(

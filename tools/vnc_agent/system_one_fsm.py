@@ -4,6 +4,7 @@ from collections import deque
 from dataclasses import dataclass, field
 import json
 import math
+import re
 import time
 from typing import Any, Callable, Deque, Dict, List, Optional, Sequence, Tuple
 
@@ -166,9 +167,9 @@ UNREADABLE_OPTION_DESC = "The region is blank, occluded, blurred, cut off, or to
 
 
 def _clamp_int(val: Any, lo: int, hi: int, name: str) -> int:
-    if isinstance(val, bool) or not isinstance(val, (int, float)):
-        raise ValueError(f"{name} must be a number, got {val!r}")
-    return max(lo, min(hi, int(round(float(val)))))
+    if isinstance(val, bool) or not isinstance(val, (int, float)) or (isinstance(val, float) and not math.isfinite(val)):
+        raise ValueError(f"{name} must be a finite number, got {val!r}")
+    return int(round(max(lo, min(hi, val))))
 
 
 def _clamp_float(val: Any, lo: float, hi: float, name: str) -> float:
@@ -189,7 +190,7 @@ def _normalize_risk_tier(raw_tier: Optional[str], default: str = "read_only") ->
 def _contains_irreversible_keyword(text: str) -> Optional[str]:
     low = " ".join((text or "").lower().split())
     for kw in IRREVERSIBLE_SAFETY_KEYWORDS:
-        if kw in low:
+        if re.search(r"\b" + re.escape(kw) + r"\b", low):
             return kw
     return None
 
@@ -341,6 +342,8 @@ def normalize_predicate(
         caller_val = _clamp_float(caller_min, 0.0, 1.0, f"{name}.min_confidence")
         # Callers may tighten thresholds, NEVER loosen below system floors.
         tau_high = max(floor_high, caller_val)
+        if two_frame is not None:
+            two_frame = max(two_frame, caller_val)
     else:
         tau_high = floor_high
 
@@ -354,14 +357,18 @@ def normalize_predicate(
         if raw_tc is not None:
             if not isinstance(raw_tc, (list, tuple)):
                 raise ValueError(f"{name}.target_choices must be a list of choice labels")
-            target_choices = [str(c).strip() for c in raw_tc if str(c).strip()]
+            target_choices = list(dict.fromkeys(str(c).strip() for c in raw_tc if str(c).strip()))
+            if not target_choices:
+                raise ValueError(f"{name}.target_choices must contain at least one label")
             for c in target_choices:
                 if c == UNREADABLE_OPTION_KEY:
                     raise ValueError(f"{name}.target_choices cannot target 'unreadable'")
                 if c not in criteria:
                     raise ValueError(f"{name}.target_choices contains unknown option {c!r}")
 
-    expected_val = bool(raw_pred.get("expected_value", True))
+    expected_val = raw_pred.get("expected_value", True)
+    if not isinstance(expected_val, bool):
+        raise ValueError(f"{name}.expected_value must be a boolean")
     return NormalizedPredicate(
         pred_type=ptype,
         instructions=instructions,
@@ -384,6 +391,7 @@ class AdjudicationResult:
     score: float
     label: str
     unreadable: bool = False
+    invalid: bool = False
     two_frame_eligible: bool = False
     reason: str = ""
 
@@ -395,11 +403,16 @@ def adjudicate_predicate(
     prev_two_frame_hits: int = 0,
 ) -> AdjudicationResult:
     """Apply three-zone hysteresis (``tau_low``, ``tau_high``) to a System One answer."""
-    if not isinstance(answer, dict):
-        return AdjudicationResult(zone="reject", score=0.0, label="missing", reason="missing answer")
+    invalid = AdjudicationResult(
+        zone="gray", score=0.0, label="invalid", invalid=True, reason="missing or malformed answer"
+    )
+    if not isinstance(answer, dict) or answer.get("type", pred.pred_type) != pred.pred_type:
+        return invalid
 
     if pred.pred_type == "noul":
-        raw_p = float(answer.get("noul", 0.0) or 0.0)
+        raw_p = _probability(answer.get("noul"))
+        if raw_p is None:
+            return invalid
         score = raw_p if pred.expected_value else (1.0 - raw_p)
         label = "true" if raw_p >= 0.5 else "false"
     elif pred.pred_type == "choice":
@@ -407,8 +420,10 @@ def adjudicate_predicate(
         probs = answer.get("probabilities") if isinstance(answer.get("probabilities"), dict) else {}
         raw_conf = answer.get("confidence")
         if raw_conf is None:
-            raw_conf = probs.get(chosen, 0.0)
-        conf = float(raw_conf or 0.0)
+            raw_conf = probs.get(chosen)
+        conf = _probability(raw_conf)
+        if conf is None or chosen not in (pred.criteria or {}):
+            return invalid
 
         if chosen == UNREADABLE_OPTION_KEY:
             # Rule: Treat "unreadable" as gray-zone/fail regardless of score.
@@ -420,25 +435,21 @@ def adjudicate_predicate(
                 reason="choice returned unreadable",
             )
 
-        if pred.target_choices is not None:
-            if chosen in pred.target_choices:
-                score = conf
-            else:
-                target_prob_sum = sum(float(probs.get(tc, 0.0) or 0.0) for tc in pred.target_choices)
-                if conf >= pred.tau_low and target_prob_sum < pred.tau_low:
-                    return AdjudicationResult(
-                        zone="reject",
-                        score=target_prob_sum,
-                        label=chosen,
-                        reason=f"choice {chosen!r} not in target_choices {pred.target_choices}",
-                    )
-                score = target_prob_sum
-        else:
-            score = conf
-        label = chosen or "unknown"
+        if pred.target_choices is not None and chosen not in pred.target_choices:
+            return AdjudicationResult(
+                zone="reject" if conf >= pred.tau_high else "gray",
+                score=conf,
+                label=chosen,
+                reason=f"choice {chosen!r} not in target_choices {pred.target_choices}",
+            )
+        score = conf
+        label = chosen
     else:
-        raw_conf = answer.get("confidence")
-        score = float(raw_conf) if raw_conf is not None else 0.0
+        score = _probability(answer.get("confidence"))
+        if score is None:
+            return invalid
+        if not _box_edges_valid(answer.get("box")):
+            return invalid if score >= pred.tau_low else AdjudicationResult("reject", score, "box")
         label = "box"
 
     if risk_tier == "irreversible":
@@ -480,16 +491,32 @@ def adjudicate_predicate(
     return AdjudicationResult(zone="reject", score=score, label=label, reason="score < tau_low")
 
 
+def _probability(value: Any) -> Optional[float]:
+    if isinstance(value, bool) or not isinstance(value, (int, float)) or not 0 <= value <= 1:
+        return None
+    return float(value)
+
+
+def _box_edges_valid(box: Any) -> bool:
+    if not isinstance(box, dict):
+        return False
+    top, bottom, left, right = (_probability(box.get(edge)) for edge in ("top", "bottom", "left", "right"))
+    return None not in (top, bottom, left, right) and top < bottom and left < right
+
+
 def _extract_box_norm_and_conf(
     answer: Optional[Dict[str, Any]],
     prepared: PreparedImage,
 ) -> Tuple[Optional[List[int]], float]:
-    if not isinstance(answer, dict) or not isinstance(answer.get("box"), dict):
+    if not isinstance(answer, dict) or answer.get("type", "box") != "box":
         return None, 0.0
-    raw_conf = answer.get("confidence")
-    conf = float(raw_conf) if raw_conf is not None else 0.0
-    box_norm = prepared.map_box_to_screen_bbox(answer["box"])
-    return box_norm, conf
+    conf = _probability(answer.get("confidence"))
+    if conf is None or not _box_edges_valid(answer.get("box")):
+        return None, 0.0
+    try:
+        return prepared.map_box_to_screen_bbox(answer["box"]), conf
+    except ValueError:
+        return None, 0.0
 
 
 def _box_center_in_roi(box_norm: Sequence[int], roi_norm: Sequence[int]) -> bool:
@@ -570,13 +597,13 @@ class SystemOneHostEngine:
 
     def _check_interrupts(
         self,
-        interrupt_preds: List[NormalizedPredicate],
+        interrupt_preds: Sequence[NormalizedPredicate],
         answers: Dict[str, Any],
     ) -> Optional[Dict[str, Any]]:
         for idx, ipred in enumerate(interrupt_preds):
             key = f"interrupt_{idx}"
             adj = adjudicate_predicate(ipred, answers.get(key), "interrupt")
-            if adj.score >= ipred.tau_high and adj.zone == "pass":
+            if adj.zone == "pass" or adj.invalid or adj.unreadable:
                 return {
                     "index": idx,
                     "label": ipred.raw_label,
@@ -591,10 +618,35 @@ class SystemOneHostEngine:
         questions: Dict[str, Dict[str, Any]],
         image_assets: Dict[str, Tuple[bytes, str]],
         metrics: Dict[str, int],
+        deadline: Optional[float] = None,
     ) -> Dict[str, Any]:
+        timeout = None if deadline is None else deadline - self.monotonic()
+        if timeout is not None and timeout <= 0:
+            raise TimeoutError("Wait deadline reached before inference")
         metrics["s1_calls"] += 1
-        resp = self.s1_client.query(state=state, questions=questions, image_assets=image_assets)
+        resp = self.s1_client.query(state=state, questions=questions, image_assets=image_assets, timeout=timeout)
+        if deadline is not None and self.monotonic() >= deadline:
+            raise TimeoutError("Wait deadline reached during inference")
         return resp.get("answers", {})
+
+    def _add_interrupt_questions(
+        self,
+        frame: FrameSnapshot,
+        predicates: Sequence[NormalizedPredicate],
+        state: Dict[str, Any],
+        questions: Dict[str, Dict[str, Any]],
+        assets: Dict[str, Tuple[bytes, str]],
+    ) -> None:
+        refs: Dict[Tuple[int, ...], str] = {}
+        for i, pred in enumerate(predicates):
+            roi = tuple(pred.roi)
+            if roi not in refs:
+                ref = f"interrupt_view_{i}"
+                prep = prepare_image_for_system_one(frame, roi)
+                refs[roi] = ref
+                state[ref] = ref
+                assets[ref] = (prep.image_bytes, prep.image_format)
+            questions[f"interrupt_{i}"] = pred.to_system_one_question(image_ref_name=refs[roi])
 
     def _run_gray_zone_retry(
         self,
@@ -606,26 +658,30 @@ class SystemOneHostEngine:
         recent_confs: Deque[Dict[str, Any]],
         step: int,
         prev_two_frame_hits: int = 0,
-    ) -> Tuple[AdjudicationResult, FrameSnapshot]:
+        interrupt_preds: Sequence[NormalizedPredicate] = (),
+        deadline: Optional[float] = None,
+    ) -> Tuple[AdjudicationResult, FrameSnapshot, Optional[Dict[str, Any]]]:
         """Run 1x local retry on a 1.5x padded ROI crop after ``settle_delay_ms``."""
         if settle_delay_ms > 0:
-            self.sleep(settle_delay_ms / 1000.0)
+            delay = settle_delay_ms / 1000.0
+            if deadline is not None and delay >= deadline - self.monotonic():
+                raise TimeoutError("Gray-zone retry would exceed the wait deadline")
+            self.sleep(delay)
         fresh = self._capture_frame()
         padded_roi = pad_bbox_norm(roi_or_box, GRAY_RETRY_ROI_SCALE, mode="scale")
         prep = prepare_image_for_system_one(fresh, padded_roi)
         ref = "retry_roi_img"
         q = pred.to_system_one_question(image_ref_name="roi_crop")
-        answers = self._query_s1(
-            state={"roi_crop": ref},
-            questions={"retry_pred": q},
-            image_assets={ref: (prep.image_bytes, prep.image_format)},
-            metrics=metrics,
-        )
+        state = {"roi_crop": ref}
+        questions = {"retry_pred": q}
+        assets = {ref: (prep.image_bytes, prep.image_format)}
+        self._add_interrupt_questions(fresh, interrupt_preds, state, questions, assets)
+        answers = self._query_s1(state, questions, assets, metrics, deadline=deadline)
         adj = adjudicate_predicate(
             pred, answers.get("retry_pred"), risk_tier, prev_two_frame_hits=prev_two_frame_hits
         )
         self._record_confidence(recent_confs, step, f"{pred.pred_type}:retry", adj.label, adj.score, adj.zone)
-        return adj, fresh
+        return adj, fresh, self._check_interrupts(interrupt_preds, answers)
 
     def _verify_box_geometry_and_crop(
         self,
@@ -684,7 +740,9 @@ class SystemOneHostEngine:
             image_assets={ref: (prep.image_bytes, prep.image_format)},
             metrics=metrics,
         )
-        noul_score = float((answers.get("confirm_noul") or {}).get("noul", 0.0) or 0.0)
+        noul_answer = answers.get("confirm_noul")
+        noul_score = _probability(noul_answer.get("noul")) if isinstance(noul_answer, dict) else None
+        noul_score = noul_score or 0.0
         self._record_confidence(
             recent_confs,
             step,
@@ -697,8 +755,7 @@ class SystemOneHostEngine:
             return False, f"20%-padded crop noul confirmation {noul_score:.3f} < {noul_floor:.2f}"
 
         if include_crop_box_check:
-            crop_box_raw = answers.get("confirm_box")
-            crop_box_conf = float(crop_box_raw.get("confidence") or 0.0) if isinstance(crop_box_raw, dict) else 0.0
+            crop_box, crop_box_conf = _extract_box_norm_and_conf(answers.get("confirm_box"), prep)
             tau_low = float(tier_cfg["tau_low"] if tier_cfg["tau_low"] is not None else 0.65)
             self._record_confidence(
                 recent_confs,
@@ -722,8 +779,7 @@ class SystemOneHostEngine:
                     image_assets={"box_crop_retry_img": (prep_retry.image_bytes, prep_retry.image_format)},
                     metrics=metrics,
                 )
-                retry_raw = retry_ans.get("confirm_box")
-                crop_box_conf = float(retry_raw.get("confidence") or 0.0) if isinstance(retry_raw, dict) else 0.0
+                crop_box, crop_box_conf = _extract_box_norm_and_conf(retry_ans.get("confirm_box"), prep_retry)
                 self._record_confidence(
                     recent_confs,
                     step,
@@ -734,6 +790,8 @@ class SystemOneHostEngine:
                 )
             if crop_box_conf < crop_floor:
                 return False, f"20%-padded crop box confidence {crop_box_conf:.3f} < {crop_floor:.2f}"
+            if crop_box is None or not _box_center_in_roi(box_norm, crop_box):
+                return False, "crop-localized target does not contain the proposed click"
 
         return True, "ok"
 
@@ -885,6 +943,7 @@ class SystemOneHostEngine:
 
             poll_ms = _clamp_int(args.get("poll_interval_ms", WAIT_DEFAULT_POLL_MS), WAIT_MIN_POLL_MS, WAIT_MAX_POLL_MS, "poll_interval_ms")
             timeout_ms = _clamp_int(args.get("timeout_ms", WAIT_DEFAULT_TIMEOUT_MS), 100, WAIT_TIMEOUT_CAP_MS, "timeout_ms")
+            deadline = start_time + timeout_ms / 1000.0
             diff_gate = _clamp_float(args.get("diff_gate_threshold", WAIT_DEFAULT_DIFF_GATE), 0.0, 1.0, "diff_gate_threshold")
             heartbeat_n = _clamp_int(args.get("heartbeat_every_n", WAIT_DEFAULT_HEARTBEAT_N), 1, 100, "heartbeat_every_n")
             require_stable = _clamp_int(args.get("require_stable_frames", 1), 1, 10, "require_stable_frames")
@@ -917,6 +976,8 @@ class SystemOneHostEngine:
             poll_idx = 0
 
             while True:
+                if self.monotonic() >= deadline:
+                    raise TimeoutError("Wait deadline reached before the next poll")
                 self._check_collaborate_pause(collaborate_mode)
                 fsm_trace.append("S1_CAPTURE_AND_GATE")
 
@@ -934,7 +995,7 @@ class SystemOneHostEngine:
                         break
 
                 should_infer = True
-                if poll_idx > 0 and last_eval_frame is not None:
+                if poll_idx > 0 and last_eval_frame is not None and not interrupt_preds:
                     delta = compute_pixel_diff_ratio(last_eval_frame, cur_frame, roi=watch_roi)
                     if delta < diff_gate:
                         consecutive_skips += 1
@@ -958,18 +1019,8 @@ class SystemOneHostEngine:
                     if locate_desc:
                         questions["locate_box"] = {"type": "box", "instructions": f"the {locate_desc} in `roi`"}
 
-                    if interrupt_preds:
-                        if watch_roi == [0, 0, 1000, 1000]:
-                            screen_ref_key = "roi"
-                        else:
-                            prep_full = prepare_image_for_system_one(cur_frame, [0, 0, 1000, 1000])
-                            assets["full_img"] = (prep_full.image_bytes, prep_full.image_format)
-                            state_obj["screen"] = "full_img"
-                            screen_ref_key = "screen"
-                        for i, ip in enumerate(interrupt_preds):
-                            questions[f"interrupt_{i}"] = ip.to_system_one_question(image_ref_name=screen_ref_key)
-
-                    answers = self._query_s1(state_obj, questions, assets, metrics)
+                    self._add_interrupt_questions(cur_frame, interrupt_preds, state_obj, questions, assets)
+                    answers = self._query_s1(state_obj, questions, assets, metrics, deadline=deadline)
 
                     # S3_ADJUDICATE
                     fsm_trace.append("S3_ADJUDICATE")
@@ -977,9 +1028,10 @@ class SystemOneHostEngine:
                     if intr is not None:
                         status = "interrupted"
                         breaker_code = CB_INTERRUPT
-                        detail = f"Interrupt predicate matched: {intr['label']} (score={intr['score']})"
+                        detail = f"Interrupt check: {intr['label']} ({intr['answer_label']}, score={intr['score']})"
                         break
 
+                    matched_box = None
                     if "locate_box" in answers:
                         cand_box, cand_conf = _extract_box_norm_and_conf(answers.get("locate_box"), prep_roi)
                         if cand_box is not None and cand_conf >= 0.5:
@@ -992,7 +1044,7 @@ class SystemOneHostEngine:
                     if adj.zone == "gray":
                         # S4_ACT_OR_RECOVER: 1x gray-zone retry
                         fsm_trace.append("S4_ACT_OR_RECOVER")
-                        retry_adj, retry_frame = self._run_gray_zone_retry(
+                        retry_adj, retry_frame, intr = self._run_gray_zone_retry(
                             pred,
                             risk_tier,
                             watch_roi,
@@ -1001,8 +1053,15 @@ class SystemOneHostEngine:
                             recent_confs,
                             poll_idx,
                             prev_two_frame_hits=(1 if adj.two_frame_eligible else 0),
+                            interrupt_preds=interrupt_preds,
+                            deadline=deadline,
                         )
                         final_frame = retry_frame
+                        matched_box = None
+                        if intr is not None:
+                            status, breaker_code = "interrupted", CB_INTERRUPT
+                            detail = f"Interrupt check during retry: {intr['label']} ({intr['answer_label']}, score={intr['score']})"
+                            break
                         if capture_transient:
                             transient_buf.append(retry_frame)
                         matched_label = retry_adj.label
@@ -1016,6 +1075,18 @@ class SystemOneHostEngine:
                             )
                             break
                         adj = retry_adj
+                        if locate_desc:
+                            prep = prepare_image_for_system_one(retry_frame, watch_roi)
+                            box_answers = self._query_s1(
+                                {"roi": "roi_img"},
+                                {"locate_box": {"type": "box", "instructions": f"the {locate_desc} in `roi`"}},
+                                {"roi_img": (prep.image_bytes, prep.image_format)},
+                                metrics,
+                                deadline=deadline,
+                            )
+                            box, confidence = _extract_box_norm_and_conf(box_answers.get("locate_box"), prep)
+                            if confidence >= 0.5:
+                                matched_box = box
 
                     if adj.zone == "pass":
                         if risk_tier == "irreversible":
@@ -1040,16 +1111,14 @@ class SystemOneHostEngine:
                 # S4_ACT_OR_RECOVER: check budget & sleep poll_interval
                 fsm_trace.append("S4_ACT_OR_RECOVER")
                 metrics["steps_executed"] += 1
-                elapsed_ms = (self.monotonic() - start_time) * 1000.0
-                if elapsed_ms >= timeout_ms:
-                    status = "timeout"
-                    breaker_code = CB_BUDGET_EXCEEDED
-                    detail = f"wait_until timed out after {int(round(elapsed_ms))}ms (cap={timeout_ms}ms)"
-                    break
-
                 poll_idx += 1
-                self.sleep(poll_ms / 1000.0)
+                remaining = deadline - self.monotonic()
+                if remaining > 0:
+                    self.sleep(min(poll_ms / 1000.0, remaining))
 
+        except TimeoutError as exc:
+            status, breaker_code = "timeout", CB_BUDGET_EXCEEDED
+            detail = f"wait_until deadline ({timeout_ms}ms): {exc}"
         except SystemOneApiError as exc:
             status = "error"
             breaker_code = None
@@ -1132,12 +1201,12 @@ class SystemOneHostEngine:
             risk_tier = _normalize_risk_tier(args.get("risk_tier"), default=default_tier)
             stop_pred = normalize_predicate(args.get("stop_predicate"), risk_tier=risk_tier, default_roi=roi, name="stop_predicate")
 
-            # Reject irreversible auto-clicks immediately at S0_INIT_VALIDATE
-            if risk_tier == "irreversible" and on_match_mode != "none":
+            keyword = _contains_irreversible_keyword(on_match_desc) or _contains_irreversible_keyword(stop_pred.instructions)
+            if risk_tier == "irreversible" or (on_match_mode != "none" and keyword is not None):
                 final_frame = self._capture_frame()
                 status = "blocked"
                 breaker_code = CB_SAFETY_GUARD
-                detail = "Hard block: irreversible risk_tier prohibits host-side on_match clicks/actions."
+                detail = f"Safety guard prohibits host-side loop input ({keyword or 'irreversible risk tier'})."
                 return self._build_handoff_result(
                     tool_name="loop_until",
                     status=status,
@@ -1149,7 +1218,7 @@ class SystemOneHostEngine:
                     recent_confs=recent_confs,
                     annotated_crop_frame=final_frame,
                     annotated_crop_roi=roi,
-                    fsm_trace=fsm_trace,
+                    fsm_trace=[*fsm_trace, "S5_HANDOFF_TO_S2"],
                 )
 
             step_action: Optional[Dict[str, Any]] = None
@@ -1193,6 +1262,7 @@ class SystemOneHostEngine:
             for step_idx in range(max_steps + 1):
                 self._check_collaborate_pause(collaborate_mode)
                 fsm_trace.append("S1_CAPTURE_AND_GATE")
+                stall_detail = None
 
                 cur_frame = baseline if step_idx == 0 else self._capture_frame()
                 final_frame = cur_frame
@@ -1217,13 +1287,10 @@ class SystemOneHostEngine:
                                 post_fallback_stalls += 1
                             stalls_to_check = post_fallback_stalls if using_fallback else consecutive_stalls
                             if stalls_to_check >= max_stalls:
-                                status = "stalled"
-                                breaker_code = CB_STALL
-                                detail = (
+                                stall_detail = (
                                     f"progress_roi SSIM={prog_ssim:.4f} >= {ssim_stall:.3f} "
                                     f"for {stalls_to_check} consecutive frame(s)"
                                 )
-                                break
                     else:
                         consecutive_stalls = 0
                         post_fallback_stalls = 0
@@ -1239,7 +1306,7 @@ class SystemOneHostEngine:
 
                 box_prep = prep_roi
                 screen_ref_key = "roi"
-                if on_match_mode == "click_target_box" or interrupt_preds:
+                if on_match_mode == "click_target_box":
                     if roi != [0, 0, 1000, 1000]:
                         prep_full = prepare_image_for_system_one(cur_frame, [0, 0, 1000, 1000])
                         assets["full_img"] = (prep_full.image_bytes, prep_full.image_format)
@@ -1252,9 +1319,7 @@ class SystemOneHostEngine:
                         "type": "box",
                         "instructions": f"the {on_match_desc} in `{screen_ref_key}`",
                     }
-                if interrupt_preds:
-                    for i, ip in enumerate(interrupt_preds):
-                        questions[f"interrupt_{i}"] = ip.to_system_one_question(image_ref_name=screen_ref_key)
+                self._add_interrupt_questions(cur_frame, interrupt_preds, state_obj, questions, assets)
 
                 answers = self._query_s1(state_obj, questions, assets, metrics)
 
@@ -1264,7 +1329,7 @@ class SystemOneHostEngine:
                 if intr is not None:
                     status = "interrupted"
                     breaker_code = CB_INTERRUPT
-                    detail = f"Interrupt predicate matched: {intr['label']} (score={intr['score']})"
+                    detail = f"Interrupt check: {intr['label']} ({intr['answer_label']}, score={intr['score']})"
                     break
 
                 cand_box: Optional[List[int]] = None
@@ -1281,7 +1346,7 @@ class SystemOneHostEngine:
                 used_stop_retry = False
                 if adj.zone == "gray":
                     fsm_trace.append("S4_ACT_OR_RECOVER")
-                    retry_adj, retry_frame = self._run_gray_zone_retry(
+                    retry_adj, retry_frame, intr = self._run_gray_zone_retry(
                         stop_pred,
                         risk_tier,
                         roi,
@@ -1290,8 +1355,13 @@ class SystemOneHostEngine:
                         recent_confs,
                         step_idx,
                         prev_two_frame_hits=(1 if adj.two_frame_eligible else 0),
+                        interrupt_preds=interrupt_preds,
                     )
                     final_frame = retry_frame
+                    if intr is not None:
+                        status, breaker_code = "interrupted", CB_INTERRUPT
+                        detail = f"Interrupt check during retry: {intr['label']} ({intr['answer_label']}, score={intr['score']})"
+                        break
                     matched_label = retry_adj.label
                     if retry_adj.zone != "pass":
                         status = "escalated"
@@ -1307,22 +1377,7 @@ class SystemOneHostEngine:
                     used_stop_retry = True
 
                 if adj.zone == "pass":
-                    if risk_tier == "irreversible":
-                        status = "blocked"
-                        breaker_code = CB_SAFETY_GUARD
-                        annotated_frame = cur_frame
-                        detail = "Irreversible target matched; returning candidate only with zero input injection."
-                        break
-
                     if on_match_mode == "click_target_box":
-                        kw = _contains_irreversible_keyword(on_match_desc) or _contains_irreversible_keyword(stop_pred.instructions)
-                        if kw is not None:
-                            status = "blocked"
-                            breaker_code = CB_SAFETY_GUARD
-                            annotated_frame = cur_frame
-                            detail = f"Safety guardrail triggered by keyword {kw!r}; zero input injection."
-                            break
-
                         tier_cfg = RISK_TIER_THRESHOLDS[risk_tier]
                         global_floor = max(
                             float(tier_cfg["box_global"] if tier_cfg["box_global"] is not None else 0.85),
@@ -1333,8 +1388,6 @@ class SystemOneHostEngine:
                             fsm_trace.append("S4_ACT_OR_RECOVER")
                             if not used_stop_retry and settle_ms > 0:
                                 self.sleep(settle_ms / 1000.0)
-                                cur_frame = self._capture_frame()
-                                final_frame = cur_frame
                             prep_retry_full = prepare_image_for_system_one(cur_frame, [0, 0, 1000, 1000])
                             retry_box_ans = self._query_s1(
                                 state={"screen": "full_img"},
@@ -1381,6 +1434,14 @@ class SystemOneHostEngine:
                             break
 
                         assert cand_box is not None
+                        final_frame = self._capture_frame()
+                        if (
+                            compute_pixel_diff_ratio(cur_frame, final_frame, roi=roi) > 0.0
+                            or compute_pixel_diff_ratio(cur_frame, final_frame, roi=cand_box) > 0.0
+                        ):
+                            status, breaker_code = "interrupted", CB_INTERRUPT
+                            detail = "Target changed after box confirmation and before the click."
+                            break
                         cy = int(round((cand_box[0] + cand_box[2]) / 2.0))
                         cx = int(round((cand_box[1] + cand_box[3]) / 2.0))
                         fsm_trace.append("S4_ACT_OR_RECOVER")
@@ -1400,14 +1461,12 @@ class SystemOneHostEngine:
                                 detail = "on_match click produced zero post-click pixel delta."
                                 break
                     elif on_match_mode == "action" and on_match_action is not None:
-                        kw = _contains_irreversible_keyword(stop_pred.instructions)
-                        if kw is not None:
-                            status = "blocked"
-                            breaker_code = CB_SAFETY_GUARD
-                            annotated_frame = cur_frame
-                            detail = f"Safety guardrail triggered by keyword {kw!r}; zero input injection."
-                            break
                         fsm_trace.append("S4_ACT_OR_RECOVER")
+                        final_frame = self._capture_frame()
+                        if compute_pixel_diff_ratio(cur_frame, final_frame, roi=roi) > 0.0:
+                            status, breaker_code = "interrupted", CB_INTERRUPT
+                            detail = "Stop predicate region changed before the on-match action."
+                            break
                         self.executor.execute_host_action(on_match_action)
                         if settle_ms > 0:
                             self.sleep(settle_ms / 1000.0)
@@ -1422,6 +1481,10 @@ class SystemOneHostEngine:
 
                 # S4_ACT_OR_RECOVER: check step budget and inject next step action
                 fsm_trace.append("S4_ACT_OR_RECOVER")
+                if stall_detail is not None:
+                    status, breaker_code = "stalled", CB_STALL
+                    detail = stall_detail
+                    break
                 if metrics["steps_executed"] >= max_steps:
                     status = "budget_exceeded"
                     breaker_code = CB_BUDGET_EXCEEDED
@@ -1523,11 +1586,11 @@ class SystemOneHostEngine:
                 else list(page_roi)
             )
 
-            if risk_tier == "irreversible" and item_action != "noop_collect":
+            if risk_tier == "irreversible" and (item_action != "noop_collect" or args.get("next_page_action") is not None):
                 final_frame = self._capture_frame()
                 status = "blocked"
                 breaker_code = CB_SAFETY_GUARD
-                detail = "Hard block: irreversible risk_tier prohibits host-side mutating batch_apply clicks."
+                detail = "Irreversible risk tier prohibits batch item actions and pagination input."
                 return self._build_handoff_result(
                     tool_name="batch_apply",
                     status=status,
@@ -1540,7 +1603,7 @@ class SystemOneHostEngine:
                     batch_summary=batch_summary,
                     annotated_crop_frame=final_frame,
                     annotated_crop_roi=page_roi,
-                    fsm_trace=fsm_trace,
+                    fsm_trace=[*fsm_trace, "S5_HANDOFF_TO_S2"],
                 )
 
             item_pred = normalize_predicate(args.get("item_predicate"), risk_tier=risk_tier, default_roi=page_roi, name="item_predicate")
@@ -1562,6 +1625,8 @@ class SystemOneHostEngine:
                             s_roi = validate_bbox(s, name=f"slots[{idx}]")
                             s_id = f"slot_{idx}"
                         fixed_slots.append({"id": s_id, "roi": s_roi})
+                    if len({slot["id"] for slot in fixed_slots}) != len(fixed_slots):
+                        raise ValueError("slots must have unique IDs")
                 elif args.get("slot_grid") is not None:
                     grid = args["slot_grid"]
                     if not isinstance(grid, dict):
@@ -1714,12 +1779,7 @@ class SystemOneHostEngine:
                             "instructions": f"the {target_desc} in `{slot_ref}`",
                         }
 
-                if interrupt_preds:
-                    prep_full = prepare_image_for_system_one(cur_frame, [0, 0, 1000, 1000])
-                    batch_assets["asset_screen"] = (prep_full.image_bytes, prep_full.image_format)
-                    batch_state["screen"] = "asset_screen"
-                    for i, ip in enumerate(interrupt_preds):
-                        batch_questions[f"interrupt_{i}"] = ip.to_system_one_question(image_ref_name="screen")
+                self._add_interrupt_questions(cur_frame, interrupt_preds, batch_state, batch_questions, batch_assets)
 
                 answers = self._query_s1(batch_state, batch_questions, batch_assets, metrics)
 
@@ -1729,7 +1789,7 @@ class SystemOneHostEngine:
                 if intr is not None:
                     status = "interrupted"
                     breaker_code = CB_INTERRUPT
-                    detail = f"Interrupt predicate matched: {intr['label']} (score={intr['score']})"
+                    detail = f"Interrupt check: {intr['label']} ({intr['answer_label']}, score={intr['score']})"
                     break
 
                 page_errors = 0
@@ -1737,6 +1797,8 @@ class SystemOneHostEngine:
                 working_frame = cur_frame
 
                 for slot in page_slots:
+                    if page_errors / len(page_slots) > max_error_ratio:
+                        break
                     sid = slot["id"]
                     s_roi = slot["roi"]
                     batch_summary["items_evaluated"] += 1
@@ -1746,11 +1808,16 @@ class SystemOneHostEngine:
 
                     if adj.zone == "gray":
                         fsm_trace.append("S4_ACT_OR_RECOVER")
-                        retry_adj, retry_frame = self._run_gray_zone_retry(
-                            item_pred, risk_tier, s_roi, settle_ms, metrics, recent_confs, page_idx
+                        retry_adj, retry_frame, intr = self._run_gray_zone_retry(
+                            item_pred, risk_tier, s_roi, settle_ms, metrics, recent_confs, page_idx,
+                            interrupt_preds=interrupt_preds,
                         )
                         working_frame = retry_frame
                         final_frame = retry_frame
+                        if intr is not None:
+                            aborted_breaker = CB_INTERRUPT
+                            detail = f"Interrupt check during retry: {intr['label']} ({intr['answer_label']}, score={intr['score']})"
+                            break
                         if retry_adj.zone != "pass":
                             page_errors += 1
                             batch_summary["errors"] += 1
@@ -1810,6 +1877,13 @@ class SystemOneHostEngine:
                         detail = f"Reached max_mutations={max_mutations}"
                         break
 
+                    working_frame = self._capture_frame()
+                    final_frame = working_frame
+                    if compute_pixel_diff_ratio(cur_frame, working_frame, roi=s_roi) > 0.0:
+                        aborted_breaker = CB_BATCH_DRIFT
+                        detail = f"Slot {sid} changed after page evaluation. Re-evaluate the current layout."
+                        break
+
                     kw = _contains_irreversible_keyword(target_desc) or _contains_irreversible_keyword(item_pred.instructions)
                     if kw is not None or risk_tier == "irreversible":
                         matched_box = s_roi
@@ -1851,15 +1925,7 @@ class SystemOneHostEngine:
                         click_box = cand_box
                     else:
                         # click_relative inside slot ROI, still guarded by geometry + 20% crop confirm
-                        sy0, sx0, sy1, sx1 = s_roi
-                        cy_rel = int(round(sy0 + (sy1 - sy0) * rel_y))
-                        cx_rel = int(round(sx0 + (sx1 - sx0) * rel_x))
-                        click_box = s_roi
                         matched_box = s_roi
-                        if not _box_center_in_roi([cy_rel - 1, cx_rel - 1, cy_rel + 1, cx_rel + 1], s_roi):
-                            page_errors += 1
-                            batch_summary["errors"] += 1
-                            continue
                         geom_ok, geom_msg = self._verify_box_geometry_and_crop(
                             frame=working_frame,
                             box_norm=s_roi,
@@ -1890,11 +1956,17 @@ class SystemOneHostEngine:
                         cy_click = int(round((click_box[0] + click_box[2]) / 2.0))
                         cx_click = int(round((click_box[1] + click_box[3]) / 2.0))
                     else:
-                        cy_click = int(round(s_roi[0] + (s_roi[2] - s_roi[0]) * rel_y))
-                        cx_click = int(round(s_roi[1] + (s_roi[3] - s_roi[1]) * rel_x))
+                        y0, x0, y1, x1 = s_roi
+                        cy_click = min(y1 - 1, int(round(y0 + (y1 - y0) * rel_y)))
+                        cx_click = min(x1 - 1, int(round(x0 + (x1 - x0) * rel_x)))
 
                     fsm_trace.append("S4_ACT_OR_RECOVER")
-                    pre_click_frame = working_frame
+                    pre_click_frame = self._capture_frame()
+                    final_frame = pre_click_frame
+                    if compute_pixel_diff_ratio(working_frame, pre_click_frame, roi=s_roi) > 0.0:
+                        aborted_breaker = CB_BATCH_DRIFT
+                        detail = f"Slot {sid} changed after crop confirmation and before the click."
+                        break
                     self.executor.execute_host_action(
                         {"type": "click", "x": cx_click, "y": cy_click, "button": "left", "count": 1}
                     )
@@ -1908,7 +1980,7 @@ class SystemOneHostEngine:
                     final_frame = post_click_frame
 
                     if verify_after_action:
-                        delta = compute_pixel_diff_ratio(pre_click_frame, post_click_frame, channel_threshold=2)
+                        delta = compute_pixel_diff_ratio(pre_click_frame, post_click_frame, roi=s_roi, channel_threshold=2)
                         if delta <= 0.0:
                             consecutive_zero_delta_clicks += 1
                         else:
@@ -1934,11 +2006,12 @@ class SystemOneHostEngine:
 
                 if aborted_breaker is not None:
                     breaker_code = aborted_breaker
-                    status = (
-                        "blocked"
-                        if aborted_breaker == CB_SAFETY_GUARD
-                        else ("budget_exceeded" if aborted_breaker == CB_BUDGET_EXCEEDED else "batch_drift")
-                    )
+                    status = {
+                        CB_SAFETY_GUARD: "blocked",
+                        CB_BUDGET_EXCEEDED: "budget_exceeded",
+                        CB_INTERRUPT: "interrupted",
+                        CB_BATCH_DRIFT: "batch_drift",
+                    }[aborted_breaker]
                     break
 
                 err_ratio = page_errors / max(1, len(page_slots))

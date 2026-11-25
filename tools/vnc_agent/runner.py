@@ -869,7 +869,10 @@ def run_agent(args: argparse.Namespace) -> int:
                             time.sleep(action_delay)
 
                         is_remote_file_mutating = fname in REMOTE_MUTATING_FUNCTIONS
-                        is_gui_modifying = (fname not in READ_ONLY_FUNCTIONS) and (not is_remote_file_mutating)
+                        is_s1_tool = fname in SYSTEM_ONE_FUNCTION_NAMES
+                        is_gui_modifying = (
+                            fname not in READ_ONLY_FUNCTIONS and not is_remote_file_mutating and not is_s1_tool
+                        )
                         pre_status: Dict[str, Any] = executor.get_status() if is_gui_modifying else {}
 
                         try:
@@ -914,7 +917,6 @@ def run_agent(args: argparse.Namespace) -> int:
 
                         explicit_attach = bool(action_result.pop("_attach_screenshot", False))
                         s1_evidence = action_result.pop("_visual_evidence_images", None)
-                        is_s1_tool = fname in SYSTEM_ONE_FUNCTION_NAMES
                         if isinstance(s1_evidence, list) and s1_evidence:
                             s1_evidence_map[len(results)] = s1_evidence[:2]
                         if "error" in action_result:
@@ -924,6 +926,8 @@ def run_agent(args: argparse.Namespace) -> int:
                             if is_s1_tool:
                                 if action_result.get("breaker_code"):
                                     s1_breaker_reason = f"system_one_{str(action_result['breaker_code']).lower()}"
+                                elif action_result.get("status") == "error":
+                                    s1_breaker_reason = "system_one_error"
                                 item_needs_screenshot = not bool(s1_evidence)
                             else:
                                 if is_gui_modifying:
@@ -962,11 +966,16 @@ def run_agent(args: argparse.Namespace) -> int:
                                         {"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": skip_res}
                                     )
                                 break
-                            if batch_had_resize or explicit_attach:
+                            if batch_had_resize or explicit_attach or is_s1_tool:
                                 if batch_had_resize:
                                     skip_res = {
                                         "status": "skipped_after_desktop_resize",
                                         "new_size": [executor.width, executor.height],
+                                    }
+                                elif is_s1_tool:
+                                    skip_res = {
+                                        "status": "skipped_pending_visual_verification",
+                                        "note": f"Inspect the {fname} result and visual evidence before continuing.",
                                     }
                                 else:
                                     skip_res = {
@@ -1093,6 +1102,9 @@ def run_agent(args: argparse.Namespace) -> int:
                                     ev_path = os.path.join(log_dir, f"turn_{global_turn:02d}_s1_{i}_{ev_idx}_{ev_label}.png")
                                     with open(ev_path, "wb") as f:
                                         f.write(ev_png)
+                                    if ev_label == "final_fullscreen" and post_b64 is None:
+                                        with open(os.path.join(log_dir, "final.png"), "wb") as f:
+                                            f.write(ev_png)
                                 res_blocks.append(
                                     {
                                         "type": "image",

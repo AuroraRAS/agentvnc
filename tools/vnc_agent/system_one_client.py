@@ -249,6 +249,8 @@ class PreparedImage:
         bottom = float(box_edges["bottom"])
         left = float(box_edges["left"])
         right = float(box_edges["right"])
+        if not (0 <= top < bottom <= 1 and 0 <= left < right <= 1):
+            raise ValueError("System One box edges must be ordered within 0..1")
 
         px_left = left * self.out_width
         px_right = right * self.out_width
@@ -260,10 +262,8 @@ class PreparedImage:
         rel_top = max(0.0, min(1.0, (px_top - self.pad_y) / max(1.0, float(self.content_height))))
         rel_bottom = max(0.0, min(1.0, (px_bottom - self.pad_y) / max(1.0, float(self.content_height))))
 
-        if rel_right <= rel_left:
-            rel_right = min(1.0, rel_left + (1.0 / max(1, self.content_width)))
-        if rel_bottom <= rel_top:
-            rel_bottom = min(1.0, rel_top + (1.0 / max(1, self.content_height)))
+        if rel_right <= rel_left or rel_bottom <= rel_top:
+            raise ValueError("System One box is outside the image content")
 
         cy0, cx0, cy1, cx1 = self.crop_bbox_norm
         span_y = cy1 - cy0
@@ -362,23 +362,19 @@ def prepare_image_for_system_one(
                 arr = canvas
             img_bytes = _encode_rgb_png(out_w, out_h, arr.tobytes())
         else:
-            content_w, content_h = cw, ch
-            out_w = max(TYPESAFE_MIN_IMAGE_DIM, cw)
-            out_h = max(TYPESAFE_MIN_IMAGE_DIM, ch)
-            pad_x = (out_w - cw) // 2
-            pad_y = (out_h - ch) // 2
-            if (out_w, out_h) == (cw, ch):
-                img_bytes = _encode_rgb_png(out_w, out_h, cropped_rgb)
-            else:
-                row_pad_l = b"\x80\x80\x80" * pad_x
-                row_pad_r = b"\x80\x80\x80" * (out_w - cw - pad_x)
-                blank_row = b"\x80\x80\x80" * out_w
-                rows = [blank_row] * pad_y
-                stride = cw * 3
-                for yy in range(ch):
-                    rows.append(row_pad_l + cropped_rgb[yy * stride : (yy + 1) * stride] + row_pad_r)
-                rows.extend([blank_row] * (out_h - ch - pad_y))
-                img_bytes = _encode_rgb_png(out_w, out_h, b"".join(rows))
+            pad_l = b"\x80\x80\x80" * pad_x
+            pad_r = b"\x80\x80\x80" * (out_w - content_w - pad_x)
+            blank_row = b"\x80\x80\x80" * out_w
+            rows = [blank_row] * pad_y
+            columns = [3 * (x * cw // content_w) for x in range(content_w)]
+            stride = cw * 3
+            for y in range(content_h):
+                offset = (y * ch // content_h) * stride
+                source = cropped_rgb[offset : offset + stride]
+                row = source if cw == content_w else b"".join(source[x : x + 3] for x in columns)
+                rows.append(pad_l + row + pad_r)
+            rows.extend([blank_row] * (out_h - content_h - pad_y))
+            img_bytes = _encode_rgb_png(out_w, out_h, b"".join(rows))
         img_fmt = "png"
 
     return PreparedImage(
@@ -677,10 +673,12 @@ class SystemOneClient:
         questions: Dict[str, Dict[str, Any]],
         image_assets: Optional[Dict[str, Tuple[bytes, str]]] = None,
         model: Optional[str] = None,
+        timeout: Optional[float] = None,
     ) -> Dict[str, Any]:
         """Evaluate ``questions`` in parallel against ``state`` via ``POST /v1/systemone``."""
         if not questions:
             raise ValueError("System One query requires at least one question")
+        deadline = time.monotonic() + timeout if timeout is not None else None
 
         req_payload: Dict[str, Any] = {
             "model": str(model or self.model),
@@ -700,7 +698,6 @@ class SystemOneClient:
         if use_images_hdr:
             headers[TYPESAFE_IMAGES_HEADER] = "true"
 
-        last_err: Optional[Exception] = None
         for attempt in range(3):
             req = urllib.request.Request(
                 self.base_url,
@@ -708,8 +705,11 @@ class SystemOneClient:
                 headers=headers,
                 method="POST",
             )
+            remaining = deadline - time.monotonic() if deadline is not None else self.timeout
+            if remaining <= 0:
+                raise TimeoutError("System One query exceeded the caller's deadline")
             try:
-                with urllib.request.urlopen(req, timeout=self.timeout) as resp:
+                with urllib.request.urlopen(req, timeout=min(self.timeout, remaining)) as resp:
                     raw_resp = resp.read().decode("utf-8")
                 try:
                     parsed = json.loads(raw_resp)
@@ -725,18 +725,16 @@ class SystemOneClient:
                 finally:
                     e.close()
                 api_err = SystemOneApiError(code, err_text)
-                if api_err.is_retryable and attempt < 2:
-                    last_err = api_err
-                    time.sleep(0.5 * (2**attempt))
-                    continue
-                raise api_err from None
-            except (urllib.error.URLError, TimeoutError, OSError) as e:
-                if attempt < 2:
-                    last_err = e
-                    time.sleep(0.5 * (2**attempt))
-                    continue
-                raise SystemOneApiError(None, f"Network error: {e}") from None
+                if not api_err.is_retryable or attempt == 2:
+                    raise api_err from None
+            except OSError as e:
+                if deadline is not None and time.monotonic() >= deadline:
+                    raise TimeoutError("System One query exceeded the caller's deadline") from None
+                if attempt == 2:
+                    raise SystemOneApiError(None, f"Network error: {e}") from None
+            backoff = 0.5 * (2**attempt)
+            if deadline is not None and deadline - time.monotonic() <= backoff:
+                raise TimeoutError("System One retry would exceed the caller's deadline")
+            time.sleep(backoff)
 
-        if isinstance(last_err, SystemOneApiError):
-            raise last_err
-        raise SystemOneApiError(None, f"System One API failed after retries: {last_err}")
+        raise SystemOneApiError(None, "System One API failed after retries")
