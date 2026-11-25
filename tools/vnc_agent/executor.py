@@ -27,10 +27,12 @@ from .constants import (
     REMOTE_TRANSFER_MUTATING_FUNCTIONS,
     SHIFTED_ASCII,
     SHIFT_KEYSYMS,
+    SYSTEM_ONE_FUNCTION_NAMES,
     WORKSPACE_FUNCTION_NAMES,
 )
 from .coordination import WorkspaceCoordinator
 from .ftp_client import VncFtpClient
+from .system_one_client import FrameSnapshot
 from .workspace import LocalWorkspace
 
 
@@ -123,17 +125,22 @@ class VncDesktopExecutor:
         workspace: Optional[LocalWorkspace] = None,
         coordinator: Optional[WorkspaceCoordinator] = None,
         legacy_clipboard_encoding: Optional[str] = None,
+        system_one_engine: Optional[Any] = None,
     ) -> None:
         self.client = client
         self.ftp_client = ftp_client
         self.workspace = workspace
         self.coordinator = coordinator
+        self.system_one_engine = system_one_engine
         self.legacy_clipboard_encoding = (
             parse_legacy_clipboard_encoding(legacy_clipboard_encoding) if legacy_clipboard_encoding else None
         )
         self.width = 0
         self.height = 0
         self.button_mask = 0
+        self._last_button_mask = 0
+        self._last_pointer_xy: Tuple[int, int] = (0, 0)
+        self._held_keysyms: set = set()
 
     def wait_ready(self, timeout: float = 15.0) -> Dict[str, Any]:
         deadline = time.monotonic() + timeout
@@ -445,6 +452,8 @@ class VncDesktopExecutor:
             return None
 
     def _pointer(self, x: int, y: int, mask: int) -> None:
+        self._last_pointer_xy = (int(x), int(y))
+        self._last_button_mask = int(mask)
         resp, _ = self.client.request("POINTER_EVENT", x=int(x), y=int(y), button_mask=int(mask))
         if not resp.get("ok"):
             if resp.get("error") == "agent_paused":
@@ -452,11 +461,120 @@ class VncDesktopExecutor:
             raise RuntimeError(f"POINTER_EVENT failed: {resp}")
 
     def _key(self, keysym: int, down: bool) -> None:
-        resp, _ = self.client.request("KEY_EVENT", keysym=int(keysym), down=bool(down))
+        ks = int(keysym)
+        if down:
+            self._held_keysyms.add(ks)
+        else:
+            self._held_keysyms.discard(ks)
+        resp, _ = self.client.request("KEY_EVENT", keysym=ks, down=bool(down))
         if not resp.get("ok"):
             if resp.get("error") == "agent_paused":
                 raise AgentPausedError(resp.get("message", "Agent input paused by operator"))
             raise RuntimeError(f"KEY_EVENT failed: {resp}")
+
+    def release_all_inputs(self) -> None:
+        """Release any held mouse buttons and keyboard keys (used during S5_HANDOFF_TO_S2)."""
+        if self._last_button_mask or self.button_mask:
+            px, py = self._last_pointer_xy
+            try:
+                self._pointer(px, py, 0)
+            except (EOFError, ConnectionError, BrokenPipeError, OSError, RuntimeError, AgentPausedError):
+                pass
+            self.button_mask = 0
+            self._last_button_mask = 0
+        for ks in list(self._held_keysyms):
+            try:
+                self._key(ks, False)
+            except (EOFError, ConnectionError, BrokenPipeError, OSError, RuntimeError, AgentPausedError):
+                pass
+        self._held_keysyms.clear()
+
+    def capture_rgb_frame(self) -> FrameSnapshot:
+        """Capture a raw RGB24 ``FrameSnapshot`` via ``GET_FRAME`` without PNG encoding overhead."""
+        hdr, pixels = self.client.request("GET_FRAME", format="RGB24")
+        if not hdr.get("ok") or not pixels:
+            raise RuntimeError(f"GET_FRAME failed: {hdr}")
+        w = int(hdr.get("width", self.width) or self.width)
+        h = int(hdr.get("height", self.height) or self.height)
+        if w <= 0 or h <= 0:
+            raise RuntimeError(f"Invalid GET_FRAME dimensions: {w}x{h}")
+        self.width = w
+        self.height = h
+        return FrameSnapshot(
+            width=w,
+            height=h,
+            rgb_bytes=pixels,
+            frame_seq=int(hdr.get("frame_seq", 0) or 0),
+            timestamp=time.monotonic(),
+        )
+
+    def execute_host_action(self, action: Dict[str, Any]) -> Dict[str, Any]:
+        """Execute a validated closed-set ``HostAction`` primitive."""
+        atype = str(action.get("type", "")).strip().lower()
+        if atype == "hover":
+            px = denormalize_x(action["x"], self.width)
+            py = denormalize_y(action["y"], self.height)
+            self._pointer(px, py, 0)
+            self.button_mask = 0
+            return {"status": "ok", "type": "hover", "pixel_x": px, "pixel_y": py}
+        if atype == "click":
+            px = denormalize_x(action["x"], self.width)
+            py = denormalize_y(action["y"], self.height)
+            btn = str(action.get("button", "left")).strip().lower()
+            btn_bit = {"left": 1, "middle": 2, "right": 4}[btn]
+            count = int(action.get("count", 1))
+            self._click_px(px, py, btn_bit=btn_bit, count=count)
+            return {"status": "ok", "type": "click", "pixel_x": px, "pixel_y": py, "button": btn, "count": count}
+        if atype == "wheel_scroll":
+            px = denormalize_x(action["x"], self.width)
+            py = denormalize_y(action["y"], self.height)
+            direction = str(action.get("direction", "down")).strip().lower()
+            magnitude = int(action.get("magnitude", 300))
+            wheel_bits = {"up": 8, "down": 16, "left": 32, "right": 64}
+            bit = wheel_bits[direction]
+            pulses = max(1, min(15, int(round(magnitude / 100.0))))
+            self._pointer(px, py, 0)
+            time.sleep(0.03)
+            for _ in range(pulses):
+                self._pointer(px, py, bit)
+                self._pointer(px, py, 0)
+                time.sleep(0.02)
+            self.button_mask = 0
+            return {"status": "ok", "type": "wheel_scroll", "pulses": pulses, "direction": direction}
+        if atype == "key_press":
+            raw_key = str(action["key"])
+            ks = resolve_keysym(raw_key)
+            needs_shift = len(raw_key) == 1 and raw_key in SHIFTED_ASCII
+            if needs_shift:
+                self._key(0xFFE1, True)
+                time.sleep(0.03)
+            try:
+                self._key(ks, True)
+                time.sleep(0.04)
+                self._key(ks, False)
+            finally:
+                if needs_shift:
+                    time.sleep(0.03)
+                    self._key(0xFFE1, False)
+            return {"status": "ok", "type": "key_press", "keysym": ks}
+        if atype == "drag_step":
+            sx = denormalize_x(action["start_x"], self.width)
+            sy = denormalize_y(action["start_y"], self.height)
+            ex = denormalize_x(action["end_x"], self.width)
+            ey = denormalize_y(action["end_y"], self.height)
+            self._pointer(sx, sy, 0)
+            time.sleep(0.04)
+            self._pointer(sx, sy, 1)
+            steps = 8
+            for i in range(1, steps + 1):
+                ix = int(round(sx + (ex - sx) * (i / steps)))
+                iy = int(round(sy + (ey - sy) * (i / steps)))
+                self._pointer(ix, iy, 1)
+                time.sleep(0.02)
+            self._pointer(ex, ey, 0)
+            self.button_mask = 0
+            return {"status": "ok", "type": "drag_step", "start": [sx, sy], "end": [ex, ey]}
+        raise ValueError(f"Unsupported HostAction type: {atype!r}")
 
     def _type_char(self, ch: str) -> None:
         resp, _ = self.client.request("TEXT_TYPE", text=ch)
@@ -1100,6 +1218,16 @@ class VncDesktopExecutor:
 
         if fname in COORDINATION_FUNCTION_NAMES:
             return self._execute_coordination_tool(fname, args)
+
+        if fname in SYSTEM_ONE_FUNCTION_NAMES:
+            if self.system_one_engine is None:
+                return {
+                    "error": (
+                        f"System One tool {fname!r} is unavailable "
+                        "(TypeSafe API key not configured or --no-system-one set)."
+                    )
+                }
+            return self.system_one_engine.execute_tool(fname, args, collaborate_mode=collaborate_mode)
 
         if fname == "yield_to_user":
             reason = str(args.get("reason", "Agent requested human assistance")).strip()

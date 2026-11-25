@@ -14,6 +14,8 @@ GENAI_UPLOAD_BASE = "https://generativelanguage.googleapis.com/upload/v1beta"
 
 DEFAULT_MODEL = "gemini-4-hydrogen"
 DEFAULT_ASSISTANT_MODEL = "gemini-3.8-flash"
+DEFAULT_SYSTEM_ONE_MODEL = "jev-latest"
+TYPESAFE_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_VNCVIEWER = os.path.join(REPO_ROOT, "build", "vncviewer", "vncviewer")
 
 THINKING_LEVELS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "default")
@@ -838,6 +840,272 @@ ASSISTANT_FILE_SEARCH_DECLARATIONS: List[Dict[str, Any]] = [
     },
 ]
 
+SYSTEM_ONE_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
+    {
+        "type": "function",
+        "name": "wait_until",
+        "description": (
+            "Host-side deterministic wait loop backed by TypeSafe System One (stateless single-frame visual oracle). "
+            "Polls watch_roi with pixel-diff gating (skipping System One when delta < diff_gate_threshold with periodic "
+            "heartbeat calibration) until condition passes or a circuit breaker trips. Supports require_stable_frames "
+            "and ring-buffered capture_transient for fleeting toasts/spinners."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "condition": {
+                    "type": "object",
+                    "description": (
+                        "Atomic single-frame predicate: {type: 'noul'|'choice', instructions: string, "
+                        "criteria?: object (for choice; 'unreadable' is auto-appended), expected_value?: boolean, "
+                        "target_choices?: string[], min_confidence?: number}."
+                    ),
+                },
+                "watch_roi": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Normalized BBox [ymin, xmin, ymax, xmax] in 0..1000 (default [0, 0, 1000, 1000]).",
+                },
+                "poll_interval_ms": {
+                    "type": "integer",
+                    "description": "Polling interval in ms (default 500; use 150-250 for transient toasts).",
+                },
+                "timeout_ms": {
+                    "type": "integer",
+                    "description": "Maximum wait duration in ms (default 30000, hard cap 180000).",
+                },
+                "diff_gate_threshold": {
+                    "type": "number",
+                    "description": "Minimum pixel-diff ratio in watch_roi to trigger System One (default 0.005).",
+                },
+                "heartbeat_every_n": {
+                    "type": "integer",
+                    "description": "Force a calibration System One check after this many gated skips (default 6).",
+                },
+                "require_stable_frames": {
+                    "type": "integer",
+                    "description": "Consecutive passing evaluations required before returning matched (default 1).",
+                },
+                "capture_transient": {
+                    "type": "boolean",
+                    "description": "If true, buffer recent frames and attach the transient match crop in visual_evidence.",
+                },
+                "locate_box": {
+                    "type": "string",
+                    "description": "Optional UI element description to locate with a System One box question on match.",
+                },
+                "risk_tier": {
+                    "type": "string",
+                    "description": "Risk tier: 'read_only' (default), 'reversible', or 'irreversible'.",
+                },
+                "settle_delay_ms": {
+                    "type": "integer",
+                    "description": "Settle delay before gray-zone 1x retry in ms (default 250).",
+                },
+                "interrupt_predicates": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional list of atomic interrupt/abort predicates checked on every inference.",
+                },
+                "ignore_scene_change": {
+                    "type": "boolean",
+                    "description": "If true, do not trip CB_INTERRUPT when full-screen SSIM drops below 0.50.",
+                },
+                "intent": {"type": "string", "description": "Short reason for waiting on this UI state."},
+            },
+            "required": ["condition"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "loop_until",
+        "description": (
+            "Host-side bounded search/convergence loop (e.g. long dropdowns, calendars, sliders) backed by "
+            "TypeSafe System One. Runs closed-set HostAction step_action (or directional_actions) until "
+            "stop_predicate matches, switching to fallback_action on the first progress_roi SSIM stall. "
+            "Supports on_match closed-loop click_target_box/action unless risk_tier is irreversible."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "stop_predicate": {
+                    "type": "object",
+                    "description": (
+                        "Atomic single-frame stop predicate: {type: 'noul'|'choice', instructions: string, "
+                        "criteria?: object, expected_value?: boolean, target_choices?: string[], min_confidence?: number}."
+                    ),
+                },
+                "step_action": {
+                    "type": "object",
+                    "description": (
+                        "Closed-set HostAction primitive: {type: 'hover'|'click'|'wheel_scroll'|'key_press'|'drag_step', ...} "
+                        "with normalized 0..1000 coordinates."
+                    ),
+                },
+                "fallback_action": {
+                    "type": "object",
+                    "description": "Optional closed-set HostAction (e.g. key_press PageDown) switched to on first stall.",
+                },
+                "directional_actions": {
+                    "type": "object",
+                    "description": "Optional map of stop_predicate choice label -> closed-set HostAction.",
+                },
+                "roi": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Target search BBox [ymin, xmin, ymax, xmax] in 0..1000 (default [0, 0, 1000, 1000]).",
+                },
+                "progress_roi": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "BBox monitored via SSIM for scroll/step progress (defaults to roi).",
+                },
+                "ssim_stall_threshold": {
+                    "type": "number",
+                    "description": "SSIM threshold at or above which consecutive frames count as stalled (default 0.992).",
+                },
+                "max_stalls": {
+                    "type": "integer",
+                    "description": "Max consecutive post-fallback stalls before tripping CB_STALL (default 2).",
+                },
+                "max_steps": {
+                    "type": "integer",
+                    "description": "Maximum step iterations before CB_BUDGET_EXCEEDED (default 15, hard cap 50).",
+                },
+                "settle_delay_ms": {
+                    "type": "integer",
+                    "description": "Delay in ms after each action before re-capturing (default 250).",
+                },
+                "on_match": {
+                    "type": "object",
+                    "description": (
+                        "Optional post-match closed-loop execution: {mode: 'none'|'click_target_box'|'action', "
+                        "target_description?: string, action?: HostAction, button?: 'left'|'middle'|'right', count?: integer}."
+                    ),
+                },
+                "risk_tier": {
+                    "type": "string",
+                    "description": "Risk tier: 'read_only', 'reversible' (default when on_match acts), or 'irreversible'.",
+                },
+                "interrupt_predicates": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional list of atomic interrupt/abort predicates checked on every step.",
+                },
+                "ignore_scene_change": {
+                    "type": "boolean",
+                    "description": "If true, do not trip CB_INTERRUPT when full-screen SSIM drops below 0.50.",
+                },
+                "intent": {"type": "string", "description": "Short reason for running this search loop."},
+            },
+            "required": ["stop_predicate"],
+        },
+    },
+    {
+        "type": "function",
+        "name": "batch_apply",
+        "description": (
+            "Single- or multi-page bulk visual evaluation and action tool backed by TypeSafe System One Parallel Questions. "
+            "Locates items via fixed_slots or dynamic_box, evaluates all visible slots in one batched System One call, "
+            "and runs noop_collect, click_target_box, or click_relative with max_pages (20), max_mutations, "
+            "max_error_ratio (0.25), and post-click pixel-change drift guards."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "item_predicate": {
+                    "type": "object",
+                    "description": "Atomic single-frame predicate evaluated per visible slot.",
+                },
+                "item_action": {
+                    "type": "string",
+                    "description": "Action on matched slots: 'noop_collect', 'click_target_box', or 'click_relative'.",
+                },
+                "locate_mode": {
+                    "type": "string",
+                    "description": "Slot location mode: 'fixed_slots' or 'dynamic_box'.",
+                },
+                "slots": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "For fixed_slots: list of {id?: string, roi: [ymin, xmin, ymax, xmax]} slot objects.",
+                },
+                "slot_grid": {
+                    "type": "object",
+                    "description": "For fixed_slots: {rows: integer, cols: integer} grid subdividing page_roi.",
+                },
+                "dynamic_box_prompts": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": "For dynamic_box: descriptions of target item slots to locate via System One box.",
+                },
+                "page_roi": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Normalized BBox [ymin, xmin, ymax, xmax] containing the batch items.",
+                },
+                "progress_roi": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "BBox monitored via SSIM when paginating between pages.",
+                },
+                "relative_offset": {
+                    "type": "array",
+                    "items": {"type": "number"},
+                    "description": "For click_relative: [rel_y, rel_x] in 0..1 within each matched slot ROI (default [0.5, 0.5]).",
+                },
+                "target_description": {
+                    "type": "string",
+                    "description": "Description of the element to locate/confirm inside each matched slot.",
+                },
+                "next_page_action": {
+                    "type": "object",
+                    "description": "Optional closed-set HostAction to advance to the next page.",
+                },
+                "fallback_next_page_action": {
+                    "type": "object",
+                    "description": "Optional fallback closed-set HostAction on pagination stall.",
+                },
+                "max_pages": {
+                    "type": "integer",
+                    "description": "Maximum pages to process (default 1, hard cap 20).",
+                },
+                "max_mutations": {
+                    "type": "integer",
+                    "description": "Maximum mutating clicks across the batch before CB_BUDGET_EXCEEDED.",
+                },
+                "max_error_ratio": {
+                    "type": "number",
+                    "description": "Maximum per-page failure/gray ratio before CB_BATCH_DRIFT (default/cap 0.25).",
+                },
+                "verify_after_action": {
+                    "type": "boolean",
+                    "description": "If true (default), verify pixel change after each click and trip CB_BATCH_DRIFT on 2 consecutive zero-delta clicks.",
+                },
+                "risk_tier": {
+                    "type": "string",
+                    "description": "Risk tier: 'read_only', 'reversible', or 'irreversible'.",
+                },
+                "settle_delay_ms": {
+                    "type": "integer",
+                    "description": "Delay in ms after clicks/pagination (default 250).",
+                },
+                "interrupt_predicates": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional list of atomic interrupt/abort predicates checked per page.",
+                },
+                "ignore_scene_change": {
+                    "type": "boolean",
+                    "description": "If true, do not trip CB_INTERRUPT when full-screen SSIM drops below 0.50.",
+                },
+                "intent": {"type": "string", "description": "Short reason for running this batch evaluation/action."},
+            },
+            "required": ["item_predicate", "item_action", "locate_mode"],
+        },
+    },
+]
+
 CUSTOM_FUNCTION_NAMES = frozenset(d["name"] for d in CUSTOM_FUNCTION_DECLARATIONS)
 FILE_READ_ONLY_FUNCTIONS = frozenset({"file_list", "file_stat", "file_read"})
 FILE_MUTATING_FUNCTIONS = frozenset({"file_write", "file_mkdir", "file_delete", "file_rename"})
@@ -857,6 +1125,7 @@ REMOTE_TRANSFER_FUNCTION_NAMES = REMOTE_TRANSFER_READ_ONLY_FUNCTIONS | REMOTE_TR
 
 COORDINATION_FUNCTION_NAMES = frozenset(d["name"] for d in COORDINATION_FUNCTION_DECLARATIONS)
 ASSISTANT_FILE_SEARCH_FUNCTION_NAMES = frozenset(d["name"] for d in ASSISTANT_FILE_SEARCH_DECLARATIONS)
+SYSTEM_ONE_FUNCTION_NAMES = frozenset(d["name"] for d in SYSTEM_ONE_FUNCTION_DECLARATIONS)
 
 REMOTE_MUTATING_FUNCTIONS = FILE_MUTATING_FUNCTIONS | REMOTE_TRANSFER_MUTATING_FUNCTIONS
 ALL_CUSTOM_FUNCTION_NAMES = (
@@ -865,9 +1134,20 @@ ALL_CUSTOM_FUNCTION_NAMES = (
     | WORKSPACE_FUNCTION_NAMES
     | REMOTE_TRANSFER_FUNCTION_NAMES
     | COORDINATION_FUNCTION_NAMES
+    | SYSTEM_ONE_FUNCTION_NAMES
 )
 READ_ONLY_FUNCTIONS = (
-    frozenset({"take_screenshot", "clipboard_get", "clipboard_verify_selection", "get_desktop_status", "wait", "yield_to_user"})
+    frozenset(
+        {
+            "take_screenshot",
+            "clipboard_get",
+            "clipboard_verify_selection",
+            "get_desktop_status",
+            "wait",
+            "wait_until",
+            "yield_to_user",
+        }
+    )
     | FILE_READ_ONLY_FUNCTIONS
     | WORKSPACE_FUNCTION_NAMES
     | REMOTE_TRANSFER_READ_ONLY_FUNCTIONS
@@ -942,6 +1222,16 @@ COORDINATION_SYSTEM_INSTRUCTION = """## Asynchronous Research Assistant & Marker
 * **Delegating Asynchronously:** Use `peer_send_message(..., wake=true)` to ask the assistant to search the web, create/manage File Search stores, index files you downloaded into the workspace, or synthesize research. You can continue working on the remote desktop while the assistant works in parallel.
 * **Iterative Consultation:** Treat `assistant` as an ongoing specialist partner across the entire task, not a one-shot query. Whenever you encounter ambiguous domain rules, multi-document reconciliations (e.g., Balance Sheet vs. Profit & Loss discrepancies), uncertain column/row placements, or unindexed PDFs/binary documents, send a follow-up `peer_send_message(..., wake=true)` request for verification before committing.
 * **Checking & Waiting:** Use `peer_get_status` to inspect the assistant's status marker (`sleeping`, `working`, `done`, `error`), `peer_read_messages` when notified of unread messages, or `peer_wait_for_message` when you need to sleep until the assistant wakes you up with a reply.
+"""
+
+SYSTEM_ONE_SYSTEM_INSTRUCTION = """## Host-Side System One Tools (`wait_until`, `loop_until`, `batch_apply`):
+* **Strict Decoupling:** Emit declarative tool parameters only; the host executes a deterministic 6-state FSM (`S0_INIT_VALIDATE`..`S5_HANDOFF_TO_S2`) and calls TypeSafe System One (`noul`, `choice`, `box`) as a stateless single-frame visual oracle.
+* **When to Use:**
+  - `wait_until`: Wait for spinners, progress bars, page loads, or fleeting toasts (`poll_interval_ms=150..250`, `capture_transient=true`) without burning System 2 turns.
+  - `loop_until`: Bounded scrolling/stepping through long dropdowns, calendars, lists, or sliders (`step_action`, `fallback_action` on first stall, `on_match` closed-loop click unless `irreversible`).
+  - `batch_apply`: Evaluate or act on multiple visible items/checkboxes/rows on one or more pages in one batched Parallel Questions call per page.
+* **Normalized Coordinates & Closed-Set `HostAction`:** All `BBox` values are `[ymin, xmin, ymax, xmax]` in `0..1000`. Actions in `step_action`, `fallback_action`, `directional_actions`, `next_page_action`, and `on_match.action` MUST use closed-set primitives: `hover`, `click`, `wheel_scroll`, `key_press`, or `drag_step`.
+* **Risk Tiers & Circuit Breakers:** Choose `read_only`, `reversible`, or `irreversible` accurately. Never expect host auto-clicks on `irreversible` targets (`CB_SAFETY_GUARD` blocks input and returns the annotated candidate box for your review). On `CB_AMBIGUITY`, `CB_STALL`, `CB_INTERRUPT`, `CB_SAFETY_GUARD`, `CB_BUDGET_EXCEEDED`, or `CB_BATCH_DRIFT`, inspect the returned `HostToolResult` and `visual_evidence` (max 2 images) before deciding the next step.
 """
 
 ASSISTANT_SYSTEM_INSTRUCTION = """You are the asynchronous **Research Assistant** collaborating with the **Computer Use Agent** (`computer_use`) via a shared local workspace and `.coord/` coordination markers.
