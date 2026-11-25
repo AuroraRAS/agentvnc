@@ -25,6 +25,7 @@ from .constants import (
     CUSTOM_FUNCTION_DECLARATIONS,
     DEFAULT_ASSISTANT_MODEL,
     DEFAULT_MODEL,
+    DEFAULT_SYSTEM_ONE_MODEL,
     DEFAULT_VNCVIEWER,
     FILE_FUNCTION_DECLARATIONS,
     FTP_PROTOCOLS,
@@ -36,7 +37,11 @@ from .constants import (
     REMOTE_TRANSFER_FUNCTION_DECLARATIONS,
     REPO_ROOT,
     SYSTEM_INSTRUCTION,
+    SYSTEM_ONE_FUNCTION_DECLARATIONS,
+    SYSTEM_ONE_FUNCTION_NAMES,
+    SYSTEM_ONE_SYSTEM_INSTRUCTION,
     THINKING_LEVELS,
+    TYPESAFE_SYSTEM_ONE_URL,
     WORKSPACE_FUNCTION_DECLARATIONS,
     WORKSPACE_SYSTEM_INSTRUCTION,
 )
@@ -64,6 +69,12 @@ from .interactions import (
     extract_model_text,
     load_api_key,
 )
+from .system_one_client import (
+    SystemOneClient,
+    load_typesafe_api_key,
+    try_load_typesafe_api_key,
+)
+from .system_one_fsm import SystemOneHostEngine
 from .workspace import LocalWorkspace
 
 
@@ -93,6 +104,7 @@ def build_tools_config(
     enable_workspace_tools: bool = False,
     enable_remote_transfer_tools: bool = False,
     enable_coord_tools: bool = False,
+    enable_system_one_tools: bool = False,
 ) -> List[Dict[str, Any]]:
     cu_cfg: Dict[str, Any] = {
         "type": "computer_use",
@@ -115,6 +127,8 @@ def build_tools_config(
         tools.extend(copy.deepcopy(REMOTE_TRANSFER_FUNCTION_DECLARATIONS))
     if enable_coord_tools:
         tools.extend(copy.deepcopy(COORDINATION_FUNCTION_DECLARATIONS))
+    if enable_system_one_tools:
+        tools.extend(copy.deepcopy(SYSTEM_ONE_FUNCTION_DECLARATIONS))
     return tools
 
 
@@ -444,6 +458,22 @@ def run_agent(args: argparse.Namespace) -> int:
             enable_remote_transfer_tools = ftp_active and enable_workspace_tools
             enable_coord_tools = assistant_enabled
 
+            no_s1 = bool(getattr(args, "no_system_one", False))
+            require_s1 = bool(getattr(args, "system_one", False))
+            s1_key_file = getattr(args, "typesafe_key_file", None)
+            s1_model = str(getattr(args, "system_one_model", DEFAULT_SYSTEM_ONE_MODEL) or DEFAULT_SYSTEM_ONE_MODEL)
+            s1_url = str(getattr(args, "system_one_url", TYPESAFE_SYSTEM_ONE_URL) or TYPESAFE_SYSTEM_ONE_URL)
+            s1_key: Optional[str] = None
+            if (enable_custom_tools and not no_s1) or require_s1:
+                s1_key = load_typesafe_api_key(s1_key_file) if require_s1 else try_load_typesafe_api_key(s1_key_file)
+
+            system_one_engine: Optional[SystemOneHostEngine] = None
+            if s1_key:
+                s1_client = SystemOneClient(api_key=s1_key, model=s1_model, base_url=s1_url)
+                system_one_engine = SystemOneHostEngine(executor=executor, s1_client=s1_client)
+                executor.system_one_engine = system_one_engine
+            enable_system_one_tools = system_one_engine is not None
+
             instruction_parts = [SYSTEM_INSTRUCTION]
             if enable_file_tools:
                 instruction_parts.append(FTP_SYSTEM_INSTRUCTION)
@@ -451,6 +481,8 @@ def run_agent(args: argparse.Namespace) -> int:
                 instruction_parts.append(WORKSPACE_SYSTEM_INSTRUCTION)
             if enable_coord_tools:
                 instruction_parts.append(COORDINATION_SYSTEM_INSTRUCTION)
+            if enable_system_one_tools:
+                instruction_parts.append(SYSTEM_ONE_SYSTEM_INSTRUCTION)
             system_instruction = "\n".join(instruction_parts)
 
             tools = build_tools_config(
@@ -461,6 +493,7 @@ def run_agent(args: argparse.Namespace) -> int:
                 enable_workspace_tools=enable_workspace_tools,
                 enable_remote_transfer_tools=enable_remote_transfer_tools,
                 enable_coord_tools=enable_coord_tools,
+                enable_system_one_tools=enable_system_one_tools,
             )
 
             llm = InteractionsClient(
@@ -478,11 +511,12 @@ def run_agent(args: argparse.Namespace) -> int:
                 if assistant_worker is not None
                 else "off"
             )
+            s1_banner = f"on ({s1_model})" if enable_system_one_tools else "off"
             print(
                 f"Session config: model={args.model} | thinking={raw_base_thinking} "
                 f"(recovery={raw_rec_thinking}) | custom_tools={'on' if enable_custom_tools else 'off'} "
                 f"| file_tools={'on' if enable_file_tools else 'off'} | ftp={ftp_banner} "
-                f"| workspace={workspace.root} | assistant={asst_banner} "
+                f"| workspace={workspace.root} | assistant={asst_banner} | system_one={s1_banner} "
                 f"| excluded={excluded_actions or 'none'} | prompt_injection_detection=on "
                 f"| strict_safety={'on' if args.strict_safety else 'off'} | target={endpoint_desc} "
                 f"({'local/sandboxed' if sandboxed else 'NON-LOOPBACK'})"
@@ -715,6 +749,8 @@ def run_agent(args: argparse.Namespace) -> int:
 
                     halted_reason: Optional[str] = None
                     results: List[Tuple[str, str, Dict[str, Any], bool]] = []
+                    s1_evidence_map: Dict[int, List[Tuple[str, bytes]]] = {}
+                    s1_breaker_reason: Optional[str] = None
                     turn_log_actions: List[Dict[str, Any]] = []
                     collab_notes: List[str] = []
                     collaborator_intervened = False
@@ -833,7 +869,10 @@ def run_agent(args: argparse.Namespace) -> int:
                             time.sleep(action_delay)
 
                         is_remote_file_mutating = fname in REMOTE_MUTATING_FUNCTIONS
-                        is_gui_modifying = (fname not in READ_ONLY_FUNCTIONS) and (not is_remote_file_mutating)
+                        is_s1_tool = fname in SYSTEM_ONE_FUNCTION_NAMES
+                        is_gui_modifying = (
+                            fname not in READ_ONLY_FUNCTIONS and not is_remote_file_mutating and not is_s1_tool
+                        )
                         pre_status: Dict[str, Any] = executor.get_status() if is_gui_modifying else {}
 
                         try:
@@ -877,25 +916,35 @@ def run_agent(args: argparse.Namespace) -> int:
                             action_result["error"] = str(e)
 
                         explicit_attach = bool(action_result.pop("_attach_screenshot", False))
+                        s1_evidence = action_result.pop("_visual_evidence_images", None)
+                        if isinstance(s1_evidence, list) and s1_evidence:
+                            s1_evidence_map[len(results)] = s1_evidence[:2]
                         if "error" in action_result:
                             batch_had_error = True
-                            item_needs_screenshot = True
+                            item_needs_screenshot = not bool(s1_evidence)
                         else:
-                            if is_gui_modifying:
-                                verify = executor.verify_action_effect(pre_status)
-                                action_result["verification"] = verify
-                                any_modifying_action = True
-                                if verify["frame_changed"]:
-                                    any_frame_changed = True
-                                if verify["resized"]:
-                                    batch_had_resize = True
-                            elif is_remote_file_mutating:
-                                any_file_mutating_success = True
-                            item_needs_screenshot = (
-                                explicit_attach
-                                or collaborator_intervened
-                                or (fname not in ALL_CUSTOM_FUNCTION_NAMES)
-                            )
+                            if is_s1_tool:
+                                if action_result.get("breaker_code"):
+                                    s1_breaker_reason = f"system_one_{str(action_result['breaker_code']).lower()}"
+                                elif action_result.get("status") == "error":
+                                    s1_breaker_reason = "system_one_error"
+                                item_needs_screenshot = not bool(s1_evidence)
+                            else:
+                                if is_gui_modifying:
+                                    verify = executor.verify_action_effect(pre_status)
+                                    action_result["verification"] = verify
+                                    any_modifying_action = True
+                                    if verify["frame_changed"]:
+                                        any_frame_changed = True
+                                    if verify["resized"]:
+                                        batch_had_resize = True
+                                elif is_remote_file_mutating:
+                                    any_file_mutating_success = True
+                                item_needs_screenshot = (
+                                    explicit_attach
+                                    or collaborator_intervened
+                                    or (fname not in ALL_CUSTOM_FUNCTION_NAMES)
+                                )
 
                         results.append((fname, call_id, action_result, item_needs_screenshot))
                         log_entry = {"name": fname, "args": fc_args, "result": action_result}
@@ -917,11 +966,16 @@ def run_agent(args: argparse.Namespace) -> int:
                                         {"name": rem_name, "args": rem_fc.get("arguments") or {}, "result": skip_res}
                                     )
                                 break
-                            if batch_had_resize or explicit_attach:
+                            if batch_had_resize or explicit_attach or is_s1_tool:
                                 if batch_had_resize:
                                     skip_res = {
                                         "status": "skipped_after_desktop_resize",
                                         "new_size": [executor.width, executor.height],
+                                    }
+                                elif is_s1_tool:
+                                    skip_res = {
+                                        "status": "skipped_pending_visual_verification",
+                                        "note": f"Inspect the {fname} result and visual evidence before continuing.",
                                     }
                                 else:
                                     skip_res = {
@@ -996,6 +1050,8 @@ def run_agent(args: argparse.Namespace) -> int:
                         escalation_reason = "desktop_resized"
                     elif collaborator_intervened:
                         escalation_reason = "human_takeover"
+                    elif s1_breaker_reason:
+                        escalation_reason = s1_breaker_reason
                     elif consecutive_no_change_turns >= 2:
                         escalation_reason = "stalled_ui"
 
@@ -1040,7 +1096,23 @@ def run_agent(args: argparse.Namespace) -> int:
                     function_responses = []
                     for i, (fname, call_id, res, _) in enumerate(results):
                         res_blocks: List[Dict[str, Any]] = [{"type": "text", "text": json.dumps(res)}]
-                        if post_b64 is not None and i == last_img_idx:
+                        if i in s1_evidence_map:
+                            for ev_idx, (ev_label, ev_png) in enumerate(s1_evidence_map[i][:2]):
+                                if log_dir:
+                                    ev_path = os.path.join(log_dir, f"turn_{global_turn:02d}_s1_{i}_{ev_idx}_{ev_label}.png")
+                                    with open(ev_path, "wb") as f:
+                                        f.write(ev_png)
+                                    if ev_label == "final_fullscreen" and post_b64 is None:
+                                        with open(os.path.join(log_dir, "final.png"), "wb") as f:
+                                            f.write(ev_png)
+                                res_blocks.append(
+                                    {
+                                        "type": "image",
+                                        "data": base64.b64encode(ev_png).decode("ascii"),
+                                        "mime_type": "image/png",
+                                    }
+                                )
+                        elif post_b64 is not None and i == last_img_idx:
                             res_blocks.append({"type": "image", "data": post_b64, "mime_type": "image/png"})
                         function_responses.append(
                             {
@@ -1294,6 +1366,31 @@ def main() -> int:
         default=30.0,
         help="Socket timeout in seconds for direct FTP file operations (default: 30.0)",
     )
+    parser.add_argument(
+        "--typesafe-key-file",
+        default=os.path.join(REPO_ROOT, "typesafe.key"),
+        help="Path to TypeSafe System One API key file (default: <repo>/typesafe.key)",
+    )
+    parser.add_argument(
+        "--system-one-model",
+        default=DEFAULT_SYSTEM_ONE_MODEL,
+        help=f"TypeSafe System One model ID (default: {DEFAULT_SYSTEM_ONE_MODEL})",
+    )
+    parser.add_argument(
+        "--system-one-url",
+        default=TYPESAFE_SYSTEM_ONE_URL,
+        help=f"TypeSafe System One endpoint URL (default: {TYPESAFE_SYSTEM_ONE_URL})",
+    )
+    parser.add_argument(
+        "--system-one",
+        action="store_true",
+        help="Require TypeSafe System One host tools (wait_until, loop_until, batch_apply)",
+    )
+    parser.add_argument(
+        "--no-system-one",
+        action="store_true",
+        help="Disable TypeSafe System One host tools even if typesafe.key is present",
+    )
     args = parser.parse_args()
     if args.legacy_clipboard_encoding:
         try:
@@ -1302,4 +1399,6 @@ def main() -> int:
             parser.error(f"--legacy-clipboard-encoding: {exc}")
     if args.ftp and args.no_ftp:
         parser.error("--ftp and --no-ftp cannot be used together")
+    if args.system_one and args.no_system_one:
+        parser.error("--system-one and --no-system-one cannot be used together")
     return run_agent(args)

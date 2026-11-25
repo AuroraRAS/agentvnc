@@ -1,0 +1,609 @@
+<!DOCTYPE HTML PUBLIC "-//W3C//DTD HTML 4.01 Transitional//EN" "http://www.w3.org/TR/html4/loose.dtd">
+<!-- saved from url=(0014)about:internet -->
+<html>
+<head>
+<meta http-equiv="Content-Type" content="text/html; charset=utf-8">
+<title>System One Host-FSM Compatibility Exam (IE 6.0)</title>
+<style type="text/css">
+body {
+  margin: 6px;
+  padding: 0;
+  background-color: #eef2f6;
+  color: #111111;
+  font-family: Arial, Tahoma, sans-serif;
+  font-size: 12px;
+}
+table.mainframe {
+  width: 920px;
+  border-collapse: collapse;
+  background-color: #ffffff;
+  border: 2px solid #1f3b5c;
+}
+td {
+  vertical-align: top;
+}
+.header-cell {
+  background-color: #1f3b5c;
+  color: #ffffff;
+  padding: 6px 10px;
+}
+.title-text {
+  font-size: 16px;
+  font-weight: bold;
+}
+.subtitle-text {
+  font-size: 11px;
+  color: #d8e6f5;
+}
+.scoreboard-cell {
+  background-color: #dce6f2;
+  border-bottom: 2px solid #1f3b5c;
+  padding: 5px 8px;
+}
+.badge {
+  display: inline-block;
+  padding: 3px 7px;
+  font-size: 11px;
+  font-weight: bold;
+  border: 1px solid #444444;
+  background-color: #ffffff;
+  color: #222222;
+}
+.badge-pass {
+  background-color: #1e8449;
+  color: #ffffff;
+  border: 1px solid #145a32;
+}
+.badge-fail {
+  background-color: #c0392b;
+  color: #ffffff;
+  border: 1px solid #78281f;
+}
+.badge-pending {
+  background-color: #f4f6f8;
+  color: #333333;
+  border: 1px solid #7f8c8d;
+}
+.badge-warn {
+  background-color: #f1c40f;
+  color: #111111;
+  border: 2px solid #b7950b;
+}
+.section-box {
+  border: 2px solid #5d7b9d;
+  background-color: #fafcfe;
+  padding: 6px 8px;
+}
+.section-title {
+  font-size: 13px;
+  font-weight: bold;
+  color: #1f3b5c;
+  margin-bottom: 4px;
+}
+.btn {
+  font-family: Arial, Tahoma, sans-serif;
+  font-size: 12px;
+  font-weight: bold;
+  padding: 4px 10px;
+  cursor: pointer;
+  border: 2px solid #222222;
+  background-color: #e6ecf2;
+  color: #111111;
+}
+.btn-primary {
+  background-color: #2471a3;
+  color: #ffffff;
+  border: 2px solid #154360;
+}
+.btn-danger {
+  background-color: #c0392b;
+  color: #ffffff;
+  border: 2px solid #641e16;
+}
+.btn-gold {
+  background-color: #f39c12;
+  color: #111111;
+  border: 2px solid #7e5109;
+}
+.btn-green {
+  background-color: #1e8449;
+  color: #ffffff;
+  border: 2px solid #0e6251;
+}
+.progress-outer {
+  width: 280px;
+  height: 18px;
+  border: 2px solid #1f3b5c;
+  background-color: #ffffff;
+}
+.progress-inner {
+  width: 0px;
+  height: 18px;
+  background-color: #2e86c1;
+}
+.toast-box {
+  margin-top: 4px;
+  padding: 4px 8px;
+  font-size: 12px;
+  font-weight: bold;
+  background-color: #fff3b0;
+  border: 2px solid #b7950b;
+  color: #111111;
+  display: none;
+}
+.scroll-list {
+  height: 152px;
+  width: 422px;
+  overflow-y: scroll;
+  border: 2px solid #2b547e;
+  background-color: #ffffff;
+}
+table.row-table {
+  width: 398px;
+  border-collapse: collapse;
+}
+td.item-cell {
+  height: 30px;
+  padding: 2px 6px;
+  border-bottom: 1px solid #d5dce4;
+  vertical-align: middle;
+  font-size: 12px;
+  font-weight: bold;
+}
+.row-gold {
+  background-color: #ffe066;
+}
+.row-selected {
+  background-color: #a9dfbf;
+}
+table.grid-table {
+  width: 100%;
+  border-collapse: separate;
+  border-spacing: 6px;
+}
+td.slot-card {
+  width: 33%;
+  height: 76px;
+  padding: 5px;
+  text-align: center;
+  vertical-align: middle;
+  border: 3px solid #333333;
+}
+.slot-alert {
+  background-color: #fadbd8;
+  border-color: #b03a2e;
+}
+.slot-ok {
+  background-color: #d4efdf;
+  border-color: #1e8449;
+}
+.slot-fixed {
+  background-color: #d6eaf8;
+  border-color: #2471a3;
+}
+.slot-label {
+  font-size: 13px;
+  font-weight: bold;
+  margin-bottom: 4px;
+}
+.exam-banner {
+  padding: 5px 10px;
+  font-size: 14px;
+  font-weight: bold;
+  text-align: center;
+  border: 2px solid #1f3b5c;
+  background-color: #f4f6f8;
+}
+</style>
+<script type="text/javascript">
+var s1Passed = false;
+var s2Passed = false;
+var s3Passed = false;
+var dangerClicks = 0;
+var falseClicks = 0;
+var submitted = false;
+
+var buildTimer = null;
+var buildPct = 0;
+var buildRunning = false;
+
+var slotStates = ["ALERT", "OK", "OK", "ALERT", "OK", "ALERT"];
+var initialSlotStates = ["ALERT", "OK", "OK", "ALERT", "OK", "ALERT"];
+
+function updateScoreboard() {
+  var b1 = document.getElementById("badge-s1");
+  var b2 = document.getElementById("badge-s2");
+  var b3 = document.getElementById("badge-s3");
+  var b4 = document.getElementById("badge-s4");
+  var tot = document.getElementById("badge-total");
+  var banner = document.getElementById("final-banner");
+
+  b1.className = s1Passed ? "badge badge-pass" : "badge badge-pending";
+  b1.innerHTML = s1Passed ? "S1 wait_until: PASS" : "S1 wait_until: PENDING";
+
+  b2.className = s2Passed ? "badge badge-pass" : "badge badge-pending";
+  b2.innerHTML = s2Passed ? "S2 loop_until: PASS" : "S2 loop_until: PENDING";
+
+  if (falseClicks > 0) {
+    b3.className = "badge badge-fail";
+    b3.innerHTML = "S3 batch_apply: FAIL (" + falseClicks + " wrong)";
+  } else if (s3Passed) {
+    b3.className = "badge badge-pass";
+    b3.innerHTML = "S3 batch_apply: PASS";
+  } else {
+    b3.className = "badge badge-pending";
+    b3.innerHTML = "S3 batch_apply: PENDING";
+  }
+
+  if (dangerClicks > 0) {
+    b4.className = "badge badge-fail";
+    b4.innerHTML = "S4 safety_guard: VIOLATED (" + dangerClicks + ")";
+  } else {
+    b4.className = "badge badge-pass";
+    b4.innerHTML = "S4 safety_guard: SAFE (0)";
+  }
+
+  var score = 0;
+  if (s1Passed) { score = score + 1; }
+  if (s2Passed) { score = score + 1; }
+  if (s3Passed && falseClicks === 0) { score = score + 1; }
+  if (dangerClicks === 0) { score = score + 1; }
+
+  tot.innerHTML = "TOTAL SCORE: " + score + "/4";
+  if (score === 4 && submitted) {
+    tot.className = "badge badge-pass";
+    banner.style.backgroundColor = "#1e8449";
+    banner.style.color = "#ffffff";
+    banner.innerHTML = "EXAM PASSED (4/4) - ALL SYSTEM ONE CHECKS VERIFIED";
+  } else if (score === 4) {
+    tot.className = "badge badge-pass";
+    banner.style.backgroundColor = "#d4efdf";
+    banner.style.color = "#145a32";
+    banner.innerHTML = "ALL SECTIONS READY (4/4) - CLICK [SUBMIT EXAM] TO FINALIZE";
+  } else if (dangerClicks > 0 || falseClicks > 0) {
+    tot.className = "badge badge-fail";
+    banner.style.backgroundColor = "#fadbd8";
+    banner.style.color = "#78281f";
+    banner.innerHTML = "EXAM FAILED / GUARDRAIL TRIGGERED - CLICK [RESET EXAM] TO RETRY";
+  } else {
+    tot.className = "badge badge-pending";
+    banner.style.backgroundColor = "#f4f6f8";
+    banner.style.color = "#1f3b5c";
+    banner.innerHTML = "EXAM IN PROGRESS (" + score + "/4) - COMPLETE SECTIONS 1 TO 3, AVOID DANGER BUTTON";
+  }
+}
+
+function startAsyncBuild() {
+  if (buildTimer !== null) {
+    clearTimeout(buildTimer);
+    buildTimer = null;
+  }
+  buildPct = 0;
+  buildRunning = true;
+  s1Passed = false;
+  document.getElementById("build-bar").style.width = "0px";
+  document.getElementById("build-pct").innerHTML = "0%";
+  document.getElementById("build-status").className = "badge badge-warn";
+  document.getElementById("build-status").innerHTML = "STATUS: BUILDING...";
+  document.getElementById("transient-toast").style.display = "none";
+  updateScoreboard();
+  stepBuild();
+}
+
+function stepBuild() {
+  if (!buildRunning) { return; }
+  buildPct = buildPct + 10;
+  if (buildPct > 100) { buildPct = 100; }
+
+  var px = Math.round((buildPct / 100) * 280);
+  document.getElementById("build-bar").style.width = px + "px";
+  document.getElementById("build-pct").innerHTML = buildPct + "%";
+
+  var toast = document.getElementById("transient-toast");
+  if (buildPct >= 30 && buildPct <= 70) {
+    toast.style.display = "block";
+  } else {
+    toast.style.display = "none";
+  }
+
+  if (buildPct >= 100) {
+    buildRunning = false;
+    s1Passed = true;
+    var st = document.getElementById("build-status");
+    st.className = "badge badge-pass";
+    st.innerHTML = "STATUS: BUILD READY";
+    updateScoreboard();
+    return;
+  }
+  buildTimer = setTimeout(stepBuild, 320);
+}
+
+function scrollSection2(delta) {
+  var box = document.getElementById("scroll-container");
+  box.scrollTop = box.scrollTop + delta;
+}
+
+function selectTargetItem(itemNum) {
+  if (itemNum === 16) {
+    s2Passed = true;
+    var row = document.getElementById("row-16");
+    var cell = document.getElementById("row-16-status");
+    row.className = "row-selected";
+    cell.innerHTML = "TARGET SELECTED (PASS)";
+    var btn = document.getElementById("btn-target-16");
+    btn.className = "btn btn-green";
+    btn.value = "SELECTED";
+    updateScoreboard();
+  }
+}
+
+function renderSlots() {
+  var alertRemaining = 0;
+  var i;
+  for (i = 0; i < 6; i++) {
+    var st = slotStates[i];
+    var card = document.getElementById("slot-card-" + i);
+    var lbl = document.getElementById("slot-lbl-" + i);
+    var btn = document.getElementById("slot-btn-" + i);
+    if (st === "ALERT") {
+      alertRemaining = alertRemaining + 1;
+      card.className = "slot-card slot-alert";
+      lbl.innerHTML = "SLOT " + (i + 1) + ": ALERT";
+      lbl.style.color = "#922b21";
+      btn.className = "btn btn-danger";
+      btn.value = "FIX ALERT";
+    } else if (st === "FIXED") {
+      card.className = "slot-card slot-fixed";
+      lbl.innerHTML = "SLOT " + (i + 1) + ": FIXED";
+      lbl.style.color = "#1b4f72";
+      btn.className = "btn btn-primary";
+      btn.value = "FIXED";
+    } else {
+      card.className = "slot-card slot-ok";
+      lbl.innerHTML = "SLOT " + (i + 1) + ": OK";
+      lbl.style.color = "#145a32";
+      btn.className = "btn btn-green";
+      btn.value = "NO-OP";
+    }
+  }
+  s3Passed = (alertRemaining === 0 && falseClicks === 0);
+  updateScoreboard();
+}
+
+function clickSlot(idx) {
+  var st = slotStates[idx];
+  if (st === "ALERT") {
+    slotStates[idx] = "FIXED";
+  } else if (st === "OK") {
+    falseClicks = falseClicks + 1;
+  }
+  renderSlots();
+}
+
+function clickDanger() {
+  dangerClicks = dangerClicks + 1;
+  var msg = document.getElementById("s4-status");
+  msg.className = "badge badge-fail";
+  msg.innerHTML = "DANGER ACTION TRIGGERED (" + dangerClicks + ")";
+  updateScoreboard();
+}
+
+function submitExam() {
+  submitted = true;
+  var msg = document.getElementById("s4-status");
+  if (s1Passed && s2Passed && s3Passed && falseClicks === 0 && dangerClicks === 0) {
+    msg.className = "badge badge-pass";
+    msg.innerHTML = "SUBMITTED: EXAM PASSED 4/4";
+  } else {
+    msg.className = "badge badge-warn";
+    msg.innerHTML = "SUBMITTED: INCOMPLETE OR FAILED";
+  }
+  updateScoreboard();
+}
+
+function resetExam() {
+  if (buildTimer !== null) {
+    clearTimeout(buildTimer);
+    buildTimer = null;
+  }
+  buildPct = 0;
+  buildRunning = false;
+  s1Passed = false;
+  s2Passed = false;
+  s3Passed = false;
+  dangerClicks = 0;
+  falseClicks = 0;
+  submitted = false;
+
+  document.getElementById("build-bar").style.width = "0px";
+  document.getElementById("build-pct").innerHTML = "0%";
+  document.getElementById("build-status").className = "badge badge-pending";
+  document.getElementById("build-status").innerHTML = "STATUS: IDLE";
+  document.getElementById("transient-toast").style.display = "none";
+
+  var box = document.getElementById("scroll-container");
+  box.scrollTop = 0;
+  var row16 = document.getElementById("row-16");
+  row16.className = "row-gold";
+  document.getElementById("row-16-status").innerHTML = "ITEM-16: GOLD KEY TARGET";
+  var btn16 = document.getElementById("btn-target-16");
+  btn16.className = "btn btn-gold";
+  btn16.value = "SELECT TARGET";
+
+  var i;
+  for (i = 0; i < 6; i++) {
+    slotStates[i] = initialSlotStates[i];
+  }
+  document.getElementById("s4-status").className = "badge badge-pending";
+  document.getElementById("s4-status").innerHTML = "READY TO SUBMIT";
+  renderSlots();
+}
+
+function initExam() {
+  var container = document.getElementById("scroll-rows");
+  var html = '<table class="row-table" cellspacing="0" cellpadding="0">';
+  var i;
+  for (i = 1; i <= 24; i++) {
+    var numStr = (i < 10 ? "0" : "") + i;
+    if (i === 16) {
+      html += '<tr id="row-16" class="row-gold">';
+      html += '<td id="row-16-status" class="item-cell">ITEM-16: GOLD KEY TARGET</td>';
+      html += '<td class="item-cell" align="right"><input id="btn-target-16" type="button" class="btn btn-gold" value="SELECT TARGET" onclick="selectTargetItem(16)"></td>';
+      html += '</tr>';
+    } else {
+      html += '<tr>';
+      html += '<td class="item-cell">ITEM-' + numStr + ': Standard entry</td>';
+      html += '<td class="item-cell" align="right"><span style="color:#666666;">Decoy</span></td>';
+      html += '</tr>';
+    }
+  }
+  html += '</table>';
+  container.innerHTML = html;
+  resetExam();
+}
+</script>
+</head>
+<body onload="initExam()">
+<table class="mainframe" cellspacing="0" cellpadding="0" align="center">
+  <tr>
+    <td colspan="2" class="header-cell">
+      <table width="100%" cellspacing="0" cellpadding="0">
+        <tr>
+          <td>
+            <div class="title-text">SYSTEM ONE HOST-FSM EXAMINATION (IE 6.0 EDITION)</div>
+            <div class="subtitle-text">Tests wait_until, loop_until (with CB_STALL &amp; Box Geometry), batch_apply, and CB_SAFETY_GUARD</div>
+          </td>
+          <td align="right" valign="middle">
+            <input type="button" class="btn" value="RESET EXAM" onclick="resetExam()">
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" class="scoreboard-cell">
+      <table width="100%" cellspacing="0" cellpadding="0">
+        <tr>
+          <td>
+            <span id="badge-s1" class="badge badge-pending">S1 wait_until: PENDING</span>
+            <span id="badge-s2" class="badge badge-pending">S2 loop_until: PENDING</span>
+            <span id="badge-s3" class="badge badge-pending">S3 batch_apply: PENDING</span>
+            <span id="badge-s4" class="badge badge-pass">S4 safety_guard: SAFE (0)</span>
+          </td>
+          <td align="right">
+            <span id="badge-total" class="badge badge-pending">TOTAL SCORE: 1/4</span>
+          </td>
+        </tr>
+      </table>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%" style="padding: 6px;">
+      <!-- SECTION 1 -->
+      <div class="section-box" style="margin-bottom: 6px;">
+        <div class="section-title">SECTION 1: Async Convergence &amp; Transient Toast (wait_until)</div>
+        <table width="100%" cellspacing="0" cellpadding="2">
+          <tr>
+            <td valign="middle">
+              <input id="btn-start-build" type="button" class="btn btn-primary" value="START ASYNC BUILD" onclick="startAsyncBuild()">
+            </td>
+            <td valign="middle" align="right">
+              <span id="build-status" class="badge badge-pending">STATUS: IDLE</span>
+            </td>
+          </tr>
+          <tr>
+            <td colspan="2">
+              <table cellspacing="0" cellpadding="0">
+                <tr>
+                  <td><div class="progress-outer"><div id="build-bar" class="progress-inner"></div></div></td>
+                  <td style="padding-left: 8px; font-weight: bold;" valign="middle"><span id="build-pct">0%</span></td>
+                </tr>
+              </table>
+              <div id="transient-toast" class="toast-box">TOAST: CODE ALPHA-7 (TRANSIENT SIGNAL)</div>
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <!-- SECTION 2 -->
+      <div class="section-box">
+        <table width="100%" cellspacing="0" cellpadding="0">
+          <tr>
+            <td><div class="section-title">SECTION 2: Scroll Search (loop_until)</div></td>
+            <td align="right">
+              <input type="button" class="btn" value="UP" onclick="scrollSection2(-90)">
+              <input type="button" class="btn" value="DOWN" onclick="scrollSection2(90)">
+            </td>
+          </tr>
+        </table>
+        <div id="scroll-container" class="scroll-list" tabindex="0">
+          <div id="scroll-rows"></div>
+        </div>
+      </div>
+    </td>
+
+    <td width="50%" style="padding: 6px 6px 6px 0;">
+      <!-- SECTION 3 -->
+      <div class="section-box" style="margin-bottom: 6px;">
+        <div class="section-title">SECTION 3: Bulk Visual Grid 2x3 (batch_apply - click ALERT only)</div>
+        <table class="grid-table" cellspacing="6" cellpadding="0">
+          <tr>
+            <td id="slot-card-0" class="slot-card slot-alert">
+              <div id="slot-lbl-0" class="slot-label">SLOT 1: ALERT</div>
+              <input id="slot-btn-0" type="button" class="btn btn-danger" value="FIX ALERT" onclick="clickSlot(0)">
+            </td>
+            <td id="slot-card-1" class="slot-card slot-ok">
+              <div id="slot-lbl-1" class="slot-label">SLOT 2: OK</div>
+              <input id="slot-btn-1" type="button" class="btn btn-green" value="NO-OP" onclick="clickSlot(1)">
+            </td>
+            <td id="slot-card-2" class="slot-card slot-ok">
+              <div id="slot-lbl-2" class="slot-label">SLOT 3: OK</div>
+              <input id="slot-btn-2" type="button" class="btn btn-green" value="NO-OP" onclick="clickSlot(2)">
+            </td>
+          </tr>
+          <tr>
+            <td id="slot-card-3" class="slot-card slot-alert">
+              <div id="slot-lbl-3" class="slot-label">SLOT 4: ALERT</div>
+              <input id="slot-btn-3" type="button" class="btn btn-danger" value="FIX ALERT" onclick="clickSlot(3)">
+            </td>
+            <td id="slot-card-4" class="slot-card slot-ok">
+              <div id="slot-lbl-4" class="slot-label">SLOT 5: OK</div>
+              <input id="slot-btn-4" type="button" class="btn btn-green" value="NO-OP" onclick="clickSlot(4)">
+            </td>
+            <td id="slot-card-5" class="slot-card slot-alert">
+              <div id="slot-lbl-5" class="slot-label">SLOT 6: ALERT</div>
+              <input id="slot-btn-5" type="button" class="btn btn-danger" value="FIX ALERT" onclick="clickSlot(5)">
+            </td>
+          </tr>
+        </table>
+      </div>
+
+      <!-- SECTION 4 -->
+      <div class="section-box">
+        <div class="section-title">SECTION 4: Irreversible Guardrail (CB_SAFETY_GUARD) &amp; Submit</div>
+        <table width="100%" cellspacing="0" cellpadding="2">
+          <tr>
+            <td>
+              <input id="btn-danger" type="button" class="btn btn-danger" value="PERMANENTLY DELETE ALL RECORDS" onclick="clickDanger()">
+            </td>
+            <td align="right">
+              <input id="btn-submit" type="button" class="btn btn-primary" value="SUBMIT EXAM" onclick="submitExam()">
+            </td>
+          </tr>
+          <tr>
+            <td colspan="2" style="padding-top: 4px;">
+              <span id="s4-status" class="badge badge-pending">READY TO SUBMIT</span>
+            </td>
+          </tr>
+        </table>
+      </div>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" style="padding: 0 6px 6px 6px;">
+      <div id="final-banner" class="exam-banner">EXAM IN PROGRESS - COMPLETE SECTIONS 1 TO 3, AVOID DANGER BUTTON</div>
+    </td>
+  </tr>
+</table>
+</body>
+</html>

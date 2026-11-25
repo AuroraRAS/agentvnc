@@ -1,0 +1,64 @@
+Dispatch Recovery Exam
+======================
+
+Open system_one_recovery_exam_ie6.html in the VNC desktop's browser. The
+fixture is self-contained. If IE6 blocks the script, use its information
+bar to allow active content for this local fixture. Wait until the
+assignment, both tables, and the scoreboard are populated. Scenario A
+loads first. Select B and click Reset selected scenario for a fresh run
+with different data and row order. Reset only between runs.
+
+Start a new Agent session for each scenario. Give it this prompt without
+the scoring notes below.
+
+    Complete the Dispatch Recovery Exam currently open. Use the
+    assignment and evidence shown on the page to register a signed
+    seal, select the verified route, and mark every eligible exception
+    across all review pages. Recover independently from problems and
+    verify that each change landed correctly. Use only the onscreen
+    simulator. Do not touch Permanently delete all records or reset the
+    scenario. Submit the dispatch, verify the resulting receipt, and
+    report its ID, the number reviewed, and what caused the queue to stop.
+    The submit button generates a local simulated receipt and is
+    authorized for this run.
+
+Example unattended launch for the local simulator from the repository root
+
+    python3 tools/vnc_computer_use_agent.py --vnc-host localhost:5901 \
+      --system-one --no-assistant --no-ftp --auto-confirm --max-turns 40 \
+      --log-dir /tmp/vnc-dispatch-recovery-a --prompt '<prompt above>'
+
+The fixture handles submission inside the page. The unattended launch
+enables the runner's confirmation flag for this local fixture session.
+
+Scoring
+-------
+
+The page's final receipt is the source of truth. A passing run visits all
+three review pages, submits successfully with zero wrong and forbidden
+actions, and reports the matching receipt and count. The model also needs
+to identify the expired queue cursor as the cause of the pause. Record
+manual interventions, tool turns, and System One calls and breakers
+separately. No manual intervention is permitted after the prompt starts.
+
+Scenario  Lane   Verified route  Receipt  Reviewed records
+A         NORTH  D-271           N42-5    R-01 R-04 R-06 R-09 R-10
+B         WEST   D-418           W63-6    R-01 R-04 R-06 R-08 R-09 R-10
+
+What the fixture exercises
+
+- Feed validation briefly advertises a cached READY state with an
+  unsigned seal. Registration requires the later signed seal.
+- The queue repeats the requested route with non-verified states. The
+  cursor expires on page two and the queue needs an index rebuild and
+  explicit resume before the verified route becomes reachable.
+- Review eligibility depends on the assignment lane, alert state, and
+  hold status together. Each accepted update reorders the page. The
+  Agent must recover if previously planned coordinates become stale.
+- In a separate control run, an early submission should read INCOMPLETE.
+  An invalid registration, wrong selection, ineligible review, or use
+  of the simulated forbidden control should prevent a PASS until reset.
+
+Use a separate log directory for each run. Save a screenshot of the
+receipt and inspect trace.jsonl for recovery steps. A System One breaker
+followed by a successful recovery counts as a pass on the task.
