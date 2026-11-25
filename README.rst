@@ -128,10 +128,10 @@ Running the Gemini Computer Use Agent
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
 ``tools/vnc_computer_use_agent.py`` implements a Gemini Computer Use desktop
-agent over ``-AgentSocket`` using only the Python standard library.  Provide an
-API key via ``--api-key-file`` (defaults to ``gemini.key`` in the repository
-root) or the ``GEMINI_API_KEY`` environment variable.  The file takes precedence
-when it contains a key.
+agent over ``-AgentSocket`` and can run with the Python standard library.
+Provide an API key via ``--api-key-file`` (defaults to ``gemini.key`` in the
+repository root) or the ``GEMINI_API_KEY`` environment variable.  The file
+takes precedence when it contains a key.
 
 Example agent invocations::
 
@@ -170,7 +170,8 @@ Key agent flags:
   Pass ``--ftp`` to require FTP file tools to be available, or ``--no-ftp`` to
   disable them.
 * ``--no-custom-tools`` - Disable custom function tools and the Research
-  Assistant.  Use ``--ftp`` to enable direct remote file tools explicitly.
+  Assistant.  Use ``--ftp`` or ``--system-one`` to enable their respective
+  tools explicitly.
 * ``--workspace <dir>`` - Shared local workspace directory for local files,
   persistent memory (``memory/MEMORY.md``, ``memory/entries.json``), remote
   host transfers (``workspace_download_from_remote``,
@@ -214,6 +215,53 @@ file I/O tools (or pass ``--live --vnc-host localhost:5901`` for a live VNC
 integration test), and ``python3 tools/test_agent_workspace_assistant.py`` for
 offline unit tests of the local workspace, persistent memory, remote transfers,
 Gemini File Search client, and asynchronous Research Assistant coordination.
+
+TypeSafe System One Visual Tools
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+
+The Gemini desktop agent can delegate visual checks and bounded sequences
+of GUI actions to the host.  The host sends desktop frames or crops with
+visual questions to the TypeSafe System One API.  It evaluates the answers
+and runs the configured actions through ``-AgentSocket``.  Gemini receives
+the result, any circuit breaker reason, and up to two images so it can
+inspect the current state before continuing.
+
+* ``wait_until`` polls for a visual condition such as a progress bar
+  completing.  It can require several passing evaluations and capture a
+  transient notification.
+* ``loop_until`` repeats a bounded action such as scrolling until a target
+  appears.  It can try a fallback action if progress stalls.
+* ``batch_apply`` evaluates several visible items together, optionally
+  applies a reversible action to matching items, and can paginate.  It
+  stops applying actions when it detects a change to a pending target.
+
+With custom tools enabled, the agent enables System One when it finds a
+TypeSafe API key.  Store the key in ``typesafe.key`` in the repository root
+or set ``TYPESAFE_API_KEY``.  Use ``--typesafe-key-file <path>`` to choose a
+different file.  The runner checks the file before the environment
+variable.  Pass ``--system-one`` to require a key at startup or
+``--no-system-one`` to disable the tools.  ``--system-one-model <id>`` and
+``--system-one-url <url>`` override the default model (``jev-latest``) and
+endpoint.  The ``system_one`` field in the startup banner shows whether the
+tools are active.  Pillow, NumPy, and SciPy are optional at runtime.
+
+This example uses the Gemini and TypeSafe key files in the repository root.
+
+.. code-block:: sh
+
+  python3 tools/vnc_computer_use_agent.py --vnc-host localhost:5901 --system-one \
+      --prompt "Wait for the status panel to show Ready, then report it."
+
+Run ``python3 tools/test_agent_system_one.py`` for the offline System One
+tests with mocked API calls.  The test suite requires Pillow.
+
+For live testing, open the `IE6 compatibility exam <tools/system_one_exam_ie6.html>`_
+or the `Dispatch Recovery Exam <tools/system_one_recovery_exam_ie6.html>`_
+in the VNC desktop's browser.  The recovery exam has two self-scoring
+scenarios that exercise stale status messages, stalled pagination, and
+rows that reorder after an update.  The `recovery exam guide
+<tools/system_one_recovery_exam.txt>`_ provides setup, a sample prompt,
+and scoring criteria.
 
 
 HiDPI and Remote Desktop Scaling
