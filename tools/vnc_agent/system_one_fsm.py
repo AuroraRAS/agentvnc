@@ -953,7 +953,13 @@ class SystemOneHostEngine:
     # Tool 1: wait_until
     # -----------------------------------------------------------------------
 
-    def run_wait_until(self, args: Dict[str, Any], collaborate_mode: bool = False) -> Dict[str, Any]:
+    def run_wait_until(
+        self,
+        args: Dict[str, Any],
+        collaborate_mode: bool = False,
+        *,
+        _skip_handoff_png: bool = False,
+    ) -> Dict[str, Any]:
         start_time = self.monotonic()
         metrics = {"steps_executed": 0, "s1_calls": 0}
         recent_confs: Deque[Dict[str, Any]] = deque(maxlen=MAX_RECENT_CONFIDENCES)
@@ -1177,6 +1183,7 @@ class SystemOneHostEngine:
             annotated_crop_roi=watch_roi,
             transient_frame=transient_frame,
             transient_roi=watch_roi,
+            skip_visual_encoding=_skip_handoff_png,
             fsm_trace=fsm_trace,
         )
 
@@ -1191,6 +1198,8 @@ class SystemOneHostEngine:
         *,
         _include_crop_box_check: bool = True,
         _confirm_crop_roi: Optional[Sequence[int]] = None,
+        _max_actions: Optional[int] = None,
+        _skip_handoff_png: bool = False,
     ) -> Dict[str, Any]:
         start_time = self.monotonic()
         metrics = {"steps_executed": 0, "s1_calls": 0}
@@ -1419,6 +1428,10 @@ class SystemOneHostEngine:
                     used_stop_retry = True
 
                 if adj.zone == "pass":
+                    if on_match_mode != "none" and _max_actions is not None and metrics["steps_executed"] >= _max_actions:
+                        status, breaker_code = "budget_exceeded", CB_BUDGET_EXCEEDED
+                        detail = "Reconciliation action budget exhausted before the on-match action."
+                        break
                     if on_match_mode == "click_target_box":
                         tier_cfg = RISK_TIER_THRESHOLDS[risk_tier]
                         global_floor = max(
@@ -1495,6 +1508,7 @@ class SystemOneHostEngine:
                         self.executor.execute_host_action(
                             {"type": "click", "x": cx, "y": cy, "button": on_match_button, "count": on_match_count}
                         )
+                        metrics["steps_executed"] += 1
                         if settle_ms > 0:
                             self.sleep(settle_ms / 1000.0)
                         post_click = self._capture_frame()
@@ -1515,6 +1529,7 @@ class SystemOneHostEngine:
                             detail = "Stop predicate region changed before the on-match action."
                             break
                         self.executor.execute_host_action(on_match_action)
+                        metrics["steps_executed"] += 1
                         if settle_ms > 0:
                             self.sleep(settle_ms / 1000.0)
                         final_frame = self._capture_frame()
@@ -1536,6 +1551,10 @@ class SystemOneHostEngine:
                     status = "budget_exceeded"
                     breaker_code = CB_BUDGET_EXCEEDED
                     detail = f"loop_until reached max_steps={max_steps} without matching."
+                    break
+                if _max_actions is not None and metrics["steps_executed"] >= _max_actions:
+                    status, breaker_code = "budget_exceeded", CB_BUDGET_EXCEEDED
+                    detail = "Reconciliation action budget exhausted before the next loop step."
                     break
 
                 chosen_action: Optional[Dict[str, Any]] = None
@@ -1580,6 +1599,7 @@ class SystemOneHostEngine:
             recent_confs=recent_confs,
             annotated_crop_frame=annotated_frame,
             annotated_crop_roi=roi,
+            skip_visual_encoding=_skip_handoff_png,
             fsm_trace=fsm_trace,
         )
 

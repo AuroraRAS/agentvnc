@@ -255,6 +255,25 @@ class ReconcileUiStateTests(unittest.TestCase):
             self.assertEqual(rep[bad_field["id"]]["status"], "uncertain")
             self.assertEqual(rep["child"]["status"], "skipped_dependency")
 
+    def test_read_only_reconciliation_never_focuses_edits_or_scrolls(self) -> None:
+        for risk_args in ({"risk_level": "read_only"}, {"risk_level": "reversible"}):
+            with self.subTest(risk_args=risk_args):
+                executor = ReconcileFakeExecutor([make_rgb_frame(640, 480)])
+                client = ScriptedSystemOneClient(lambda *_: {"q": {"type": "noul", "noul": 0.01}})
+                engine = SystemOneHostEngine(executor, client)
+                field_risk = "read_only" if risk_args["risk_level"] == "reversible" else "reversible"
+                result = engine.run_reconcile_ui_state({
+                    **risk_args,
+                    "allow_scroll": True,
+                    "fields": [{
+                        "id": "name", "control_type": "text", "locator_prompt": "Name field",
+                        "desired_value": "Jane", "risk_level": field_risk,
+                    }],
+                })
+                self.assertEqual(result["breaker_code"], CB_AMBIGUITY)
+                self.assertEqual(executor.actions, [])
+                self.assertEqual(executor.copy_calls + executor.type_calls + executor.paste_calls, 0)
+
     # 4. DAG waves + batched binary observation, idempotent skip, pixel-diff + choice verify, disabled block
     def test_binary_controls_dag_batch_idempotent_and_disabled(self) -> None:
         # Frame 0: cb1 checked (already_matched), cb2 unchecked (needs click), cb3 disabled
@@ -708,6 +727,13 @@ class ReconcileUiStateTests(unittest.TestCase):
         self.assertEqual(rep["desired_value"], "<redacted>")
         self.assertEqual(rep["observed_value"], "<redacted>")
 
+        from vnc_agent.runner import trace_action_args
+
+        args = {"fields": [{"control_type": " Secret_Text ", "desired_value": secret}]}
+        logged = trace_action_args("reconcile_ui_state", args)
+        self.assertEqual(logged["fields"][0]["desired_value"], "<redacted>")
+        self.assertEqual(args["fields"][0]["desired_value"], secret)
+
     # 11. commit_on_blur validation error (CB_VALIDATION_ERROR), required vs non-required dependents
     def test_commit_on_blur_validation_error_and_required_dependent_halt(self) -> None:
         f0 = make_rgb_frame(800, 600, bg=(240, 240, 240), frame_seq=1)
@@ -1095,7 +1121,7 @@ class ReconcileUiStateTests(unittest.TestCase):
                 rc = agent_mod.run_agent(args)
             self.assertEqual(rc, 0)
             req2 = gemini_backend.interaction_requests[1]
-            self.assertEqual(req2.get("generation_config", {}).get("thinking_level"), "high")
+            self.assertEqual(req2.get("generation_config", {}).get("thinking_level"), "low")
             fres = req2["input"][0]
             self.assertEqual(fres["name"], "reconcile_ui_state")
             img_blocks = [b for b in fres["result"] if b.get("type") == "image"]
@@ -1103,13 +1129,16 @@ class ReconcileUiStateTests(unittest.TestCase):
             payload = json.loads(fres["result"][0]["text"])
             self.assertEqual(payload["breaker_code"], CB_VALIDATION_ERROR)
             self.assertNotIn("_visual_evidence_images", payload)
-            self.assertEqual(payload["outcome"]["reconcile_summary"]["counts"]["failed_validation"], 1)
+            self.assertEqual(payload["outcome"]["reconcile_summary"]["fields"][0]["status"], "failed_validation")
+            self.assertNotIn("fsm_states", payload)
 
             trace_path = os.path.join(args.log_dir, "trace.jsonl")
             with open(trace_path, "r", encoding="utf-8") as tf:
                 entries = [json.loads(line) for line in tf if line.strip()]
             self.assertEqual(len(entries), 2)
             self.assertEqual(entries[0]["usage"]["total_tokens"], 1200)
+            self.assertEqual(entries[0]["system_one_breaker"], "system_one_cb_validation_error")
+            self.assertTrue(entries[0]["actions"][0]["result"]["fsm_states"])
             self.assertEqual(entries[1]["usage"]["total_tokens"], 800)
             self.assertIsInstance(entries[0]["wall_elapsed_s"], float)
             self.assertIsInstance(entries[1]["wall_elapsed_s"], float)

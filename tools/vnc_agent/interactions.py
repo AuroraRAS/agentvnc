@@ -42,7 +42,9 @@ class InteractionsApiError(RuntimeError):
     @property
     def is_safety_blocked(self) -> bool:
         hay = f"{self.error_message} {self.error_code}".lower()
-        if any(tok in hay for tok in ("safety", "harmful", "policy violation", "prohibited_content", "content_filter")):
+        if any(tok in hay for tok in (
+            "safety", "harmful", "policy violation", "prohibited_content", "content_filter", "prompt injection detected",
+        )):
             return True
         if "blocked" in hay and any(tok in hay for tok in ("safety", "harmful", "policy", "content")):
             return True

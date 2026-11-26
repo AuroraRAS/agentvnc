@@ -596,8 +596,8 @@ def compute_ssim_excluding_roi(
             a_rgb = a_rgb[::stride, ::stride]
             b_rgb = b_rgb[::stride, ::stride]
         dh, dw = a_rgb.shape[:2]
-        drx0 = max(0, min(dw, rx0 // stride))
-        dry0 = max(0, min(dh, ry0 // stride))
+        drx0 = max(0, min(dw, (rx0 + stride - 1) // stride))
+        dry0 = max(0, min(dh, (ry0 + stride - 1) // stride))
         drx1 = max(drx0, min(dw, int(math.ceil(rx1 / stride))))
         dry1 = max(dry0, min(dh, int(math.ceil(ry1 / stride))))
 

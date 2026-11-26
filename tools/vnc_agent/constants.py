@@ -844,74 +844,65 @@ SYSTEM_ONE_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "wait_until",
-        "description": (
-            "Host-side deterministic wait loop backed by TypeSafe System One (stateless single-frame visual oracle). "
-            "Polls watch_roi with pixel-diff gating (skipping System One when delta < diff_gate_threshold with periodic "
-            "heartbeat calibration) until condition passes or a circuit breaker trips. Supports require_stable_frames "
-            "and ring-buffered capture_transient for fleeting toasts/spinners."
-        ),
+        "description": "Poll pixels until a visual condition matches. Supports stability and transient evidence.",
         "parameters": {
             "type": "object",
             "properties": {
                 "condition": {
                     "type": "object",
-                    "description": (
-                        "Atomic single-frame predicate: {type: 'noul'|'choice', instructions: string, "
-                        "criteria?: object (for choice; 'unreadable' is auto-appended), expected_value?: boolean, "
-                        "target_choices?: string[], min_confidence?: number}."
-                    ),
+                    "description": "Visual predicate.",
                 },
                 "watch_roi": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "Normalized BBox [ymin, xmin, ymax, xmax] in 0..1000 (default [0, 0, 1000, 1000]).",
+                    "description": "Region to monitor; defaults to the full screen.",
                 },
                 "poll_interval_ms": {
                     "type": "integer",
-                    "description": "Polling interval in ms (default 500; use 150-250 for transient toasts).",
+                    "description": "Default 500 ms.",
                 },
                 "timeout_ms": {
                     "type": "integer",
-                    "description": "Maximum wait duration in ms (default 30000, hard cap 180000).",
+                    "description": "Default 30000 ms; cap 180000.",
                 },
                 "diff_gate_threshold": {
                     "type": "number",
-                    "description": "Minimum pixel-diff ratio in watch_roi to trigger System One (default 0.005).",
+                    "description": "Pixel-diff ratio required to recheck; default 0.005.",
                 },
                 "heartbeat_every_n": {
                     "type": "integer",
-                    "description": "Force a calibration System One check after this many gated skips (default 6).",
+                    "description": "Force a recheck after this many gated skips; default 6.",
                 },
                 "require_stable_frames": {
                     "type": "integer",
-                    "description": "Consecutive passing evaluations required before returning matched (default 1).",
+                    "description": "Consecutive passing evaluations; default 1.",
                 },
                 "capture_transient": {
                     "type": "boolean",
-                    "description": "If true, buffer recent frames and attach the transient match crop in visual_evidence.",
+                    "description": "Buffer frames and attach the transient match crop.",
                 },
                 "locate_box": {
                     "type": "string",
-                    "description": "Optional UI element description to locate with a System One box question on match.",
+                    "description": "Element to locate on match.",
                 },
                 "risk_tier": {
                     "type": "string",
-                    "description": "Risk tier: 'read_only' (default), 'reversible', or 'irreversible'.",
+                    "description": "read_only, reversible, or irreversible.",
                 },
                 "settle_delay_ms": {
                     "type": "integer",
-                    "description": "Settle delay before gray-zone 1x retry in ms (default 250).",
+                    "description": "Default 250 ms.",
                 },
                 "interrupt_predicates": {
                     "type": "array",
                     "items": {"type": "object"},
-                    "description": "Optional list of atomic interrupt/abort predicates checked on every inference.",
+                    "description": "Visual predicates that abort the tool.",
                 },
                 "ignore_scene_change": {
                     "type": "boolean",
-                    "description": "If true, do not trip CB_INTERRUPT when full-screen SSIM drops below 0.50.",
+                    "description": "Skip the full-screen scene-change check.",
                 },
-                "intent": {"type": "string", "description": "Short reason for waiting on this UI state."},
+                "intent": {"type": "string"},
             },
             "required": ["condition"],
         },
@@ -919,84 +910,70 @@ SYSTEM_ONE_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "loop_until",
-        "description": (
-            "Host-side bounded search/convergence loop (e.g. long dropdowns, calendars, sliders) backed by "
-            "TypeSafe System One. Runs closed-set HostAction step_action (or directional_actions) until "
-            "stop_predicate matches, switching to fallback_action on the first progress_roi SSIM stall. "
-            "Supports on_match closed-loop click_target_box/action unless risk_tier is irreversible."
-        ),
+        "description": "Repeat a UI step until a visual match or stall, with an optional verified action on match.",
         "parameters": {
             "type": "object",
             "properties": {
                 "stop_predicate": {
                     "type": "object",
-                    "description": (
-                        "Atomic single-frame stop predicate: {type: 'noul'|'choice', instructions: string, "
-                        "criteria?: object, expected_value?: boolean, target_choices?: string[], min_confidence?: number}."
-                    ),
+                    "description": "Visual predicate.",
                 },
                 "step_action": {
                     "type": "object",
-                    "description": (
-                        "Closed-set HostAction primitive: {type: 'hover'|'click'|'wheel_scroll'|'key_press'|'drag_step', ...} "
-                        "with normalized 0..1000 coordinates."
-                    ),
+                    "description": "HostAction repeated during the search.",
                 },
                 "fallback_action": {
                     "type": "object",
-                    "description": "Optional closed-set HostAction (e.g. key_press PageDown) switched to on first stall.",
+                    "description": "HostAction used on first stall.",
                 },
                 "directional_actions": {
                     "type": "object",
-                    "description": "Optional map of stop_predicate choice label -> closed-set HostAction.",
+                    "description": "Predicate label to HostAction map.",
                 },
                 "roi": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "Target search BBox [ymin, xmin, ymax, xmax] in 0..1000 (default [0, 0, 1000, 1000]).",
+                    "description": "Search region; defaults to the full screen.",
                 },
                 "progress_roi": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "BBox monitored via SSIM for scroll/step progress (defaults to roi).",
+                    "description": "Region checked for progress.",
                 },
                 "ssim_stall_threshold": {
                     "type": "number",
-                    "description": "SSIM threshold at or above which consecutive frames count as stalled (default 0.992).",
+                    "description": "Similarity threshold for a stall; default 0.992.",
                 },
                 "max_stalls": {
                     "type": "integer",
-                    "description": "Max consecutive post-fallback stalls before tripping CB_STALL (default 2).",
+                    "description": "Consecutive stalls after fallback; default 2.",
                 },
                 "max_steps": {
                     "type": "integer",
-                    "description": "Maximum step iterations before CB_BUDGET_EXCEEDED (default 15, hard cap 50).",
+                    "description": "Default 15; cap 50.",
                 },
                 "settle_delay_ms": {
                     "type": "integer",
-                    "description": "Delay in ms after each action before re-capturing (default 250).",
+                    "description": "Default 250 ms.",
                 },
                 "on_match": {
                     "type": "object",
-                    "description": (
-                        "Optional post-match closed-loop execution: {mode: 'none'|'click_target_box'|'action', "
-                        "target_description?: string, action?: HostAction, button?: 'left'|'middle'|'right', count?: integer}."
-                    ),
+                    "description": "{mode: none|click_target_box|action, target_description?, action?: HostAction, button?, count?}",
                 },
                 "risk_tier": {
                     "type": "string",
-                    "description": "Risk tier: 'read_only', 'reversible' (default when on_match acts), or 'irreversible'.",
+                    "description": "read_only, reversible, or irreversible.",
                 },
                 "interrupt_predicates": {
                     "type": "array",
                     "items": {"type": "object"},
-                    "description": "Optional list of atomic interrupt/abort predicates checked on every step.",
+                    "description": "Visual predicates that abort the tool.",
                 },
                 "ignore_scene_change": {
                     "type": "boolean",
-                    "description": "If true, do not trip CB_INTERRUPT when full-screen SSIM drops below 0.50.",
+                    "description": "Skip the full-screen scene-change check.",
                 },
-                "intent": {"type": "string", "description": "Short reason for running this search loop."},
+                "intent": {"type": "string"},
             },
             "required": ["stop_predicate"],
         },
@@ -1004,102 +981,97 @@ SYSTEM_ONE_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "batch_apply",
-        "description": (
-            "Single- or multi-page bulk visual evaluation and action tool backed by TypeSafe System One Parallel Questions. "
-            "Locates items via fixed_slots or dynamic_box, evaluates all visible slots in one batched System One call, "
-            "and runs noop_collect, click_target_box, or click_relative with max_pages (20), max_mutations, "
-            "max_error_ratio (0.25), and post-click pixel-change drift guards."
-        ),
+        "description": "Evaluate visible slots together. Act only on matching items; use collection mode if actions reorder rows.",
         "parameters": {
             "type": "object",
             "properties": {
                 "item_predicate": {
                     "type": "object",
-                    "description": "Atomic single-frame predicate evaluated per visible slot.",
+                    "description": "Visual predicate for each slot.",
                 },
                 "item_action": {
                     "type": "string",
-                    "description": "Action on matched slots: 'noop_collect', 'click_target_box', or 'click_relative'.",
+                    "description": "noop_collect, click_target_box, or click_relative.",
                 },
                 "locate_mode": {
                     "type": "string",
-                    "description": "Slot location mode: 'fixed_slots' or 'dynamic_box'.",
+                    "description": "fixed_slots or dynamic_box.",
                 },
                 "slots": {
                     "type": "array",
                     "items": {"type": "object"},
-                    "description": "For fixed_slots: list of {id?: string, roi: [ymin, xmin, ymax, xmax]} slot objects.",
+                    "description": "Fixed slots: [{id?, roi}].",
                 },
                 "slot_grid": {
                     "type": "object",
-                    "description": "For fixed_slots: {rows: integer, cols: integer} grid subdividing page_roi.",
+                    "description": "Fixed slots: {rows, cols} dividing page_roi.",
                 },
                 "dynamic_box_prompts": {
                     "type": "array",
                     "items": {"type": "string"},
-                    "description": "For dynamic_box: descriptions of target item slots to locate via System One box.",
+                    "description": "Descriptions used to find dynamic slots.",
                 },
                 "page_roi": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "Normalized BBox [ymin, xmin, ymax, xmax] containing the batch items.",
+                    "description": "Region containing the batch items.",
                 },
                 "progress_roi": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "BBox monitored via SSIM when paginating between pages.",
+                    "description": "Region checked for progress.",
                 },
                 "relative_offset": {
                     "type": "array",
                     "items": {"type": "number"},
-                    "description": "For click_relative: [rel_y, rel_x] in 0..1 within each matched slot ROI (default [0.5, 0.5]).",
+                    "description": "Click at [rel_y, rel_x] in 0..1 inside each match; default [0.5,0.5].",
                 },
                 "target_description": {
                     "type": "string",
-                    "description": "Description of the element to locate/confirm inside each matched slot.",
+                    "description": "Control to locate within each match.",
                 },
                 "next_page_action": {
                     "type": "object",
-                    "description": "Optional closed-set HostAction to advance to the next page.",
+                    "description": "HostAction to advance one page.",
                 },
                 "fallback_next_page_action": {
                     "type": "object",
-                    "description": "Optional fallback closed-set HostAction on pagination stall.",
+                    "description": "HostAction for a pagination stall.",
                 },
                 "max_pages": {
                     "type": "integer",
-                    "description": "Maximum pages to process (default 1, hard cap 20).",
+                    "description": "Default 1; cap 20.",
                 },
                 "max_mutations": {
                     "type": "integer",
-                    "description": "Maximum mutating clicks across the batch before CB_BUDGET_EXCEEDED.",
+                    "description": "Maximum clicks in the batch.",
                 },
                 "max_error_ratio": {
                     "type": "number",
-                    "description": "Maximum per-page failure/gray ratio before CB_BATCH_DRIFT (default/cap 0.25).",
+                    "description": "Allowed failure ratio; default/cap 0.25.",
                 },
                 "verify_after_action": {
                     "type": "boolean",
-                    "description": "If true (default), verify pixel change after each click and trip CB_BATCH_DRIFT on 2 consecutive zero-delta clicks.",
+                    "description": "Check pixel changes after clicks; default true.",
                 },
                 "risk_tier": {
                     "type": "string",
-                    "description": "Risk tier: 'read_only', 'reversible', or 'irreversible'.",
+                    "description": "read_only, reversible, or irreversible.",
                 },
                 "settle_delay_ms": {
                     "type": "integer",
-                    "description": "Delay in ms after clicks/pagination (default 250).",
+                    "description": "Default 250 ms.",
                 },
                 "interrupt_predicates": {
                     "type": "array",
                     "items": {"type": "object"},
-                    "description": "Optional list of atomic interrupt/abort predicates checked per page.",
+                    "description": "Visual predicates that abort the tool.",
                 },
                 "ignore_scene_change": {
                     "type": "boolean",
-                    "description": "If true, do not trip CB_INTERRUPT when full-screen SSIM drops below 0.50.",
+                    "description": "Skip the full-screen scene-change check.",
                 },
-                "intent": {"type": "string", "description": "Short reason for running this batch evaluation/action."},
+                "intent": {"type": "string"},
             },
             "required": ["item_predicate", "item_action", "locate_mode"],
         },
@@ -1107,14 +1079,7 @@ SYSTEM_ONE_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
     {
         "type": "function",
         "name": "reconcile_ui_state",
-        "description": (
-            "L2 composite Observe->Compare->Act->Verify controller that converges multiple GUI fields in topological "
-            "DAG waves using wait_until, loop_until, and batch_apply. Supports checkbox/radio/toggle, dropdown, "
-            "text/number (VNC clipboard first, OCR+Jev fallback), secret_text (overwrite_always, masked verify only), "
-            "and slider. Hard-blocks final submissions, payments, destructive actions, and irreversible auto-save "
-            "controls (CB_SAFETY_GUARD). Enforces relayout/shift invalidation, commit_on_blur validation "
-            "(CB_VALIDATION_ERROR), dependency blocking (CB_DEPENDENCY_BLOCKED), and oscillation bounds (CB_OSCILLATION)."
-        ),
+        "description": "Set and verify several form controls in dependency order, including fields revealed by relayout and values validated on blur. Only reversible edits.",
         "parameters": {
             "type": "object",
             "properties": {
@@ -1122,77 +1087,78 @@ SYSTEM_ONE_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
                     "type": "array",
                     "items": {"type": "object"},
                     "description": (
-                        "Target fields: [{id, control_type ('text'|'number'|'secret_text'|'checkbox'|'radio'|'toggle'|"
-                        "'dropdown'|'slider'), locator_prompt, desired_value, roi?, match_mode? ('exact'|'semantic'|"
-                        "'overwrite_always'), depends_on?, triggers_relayout?, commit_on_blur?, risk_level?, required?, "
-                        "error_roi?, validation_error_prompt?, regex_pattern?, options?, loop_config?, relayout_wait?, "
-                        "min_confidence?}]."
+                        "Targets: [{id, control_type, locator_prompt, desired_value, roi?, match_mode?, depends_on?, "
+                        "triggers_relayout?, commit_on_blur?, risk_level?, required?, auto_save?, error_roi?, "
+                        "validation_error_prompt?, regex_pattern?, options?, loop_config?, relayout_wait?, "
+                        "min_confidence?}]. Types: text, number, secret_text, checkbox, radio, toggle, dropdown, "
+                        "slider. Use displayed labels for dropdowns, booleans for binary controls and field IDs in "
+                        "depends_on. Match modes: exact, semantic, overwrite_always (required for secret_text)."
                     ),
                 },
                 "container_roi": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "Normalized BBox [ymin, xmin, ymax, xmax] in 0..1000 of the form/container (default [0,0,1000,1000]).",
+                    "description": "Form region; defaults to the full screen.",
                 },
                 "risk_level": {
                     "type": "string",
-                    "description": "Overall risk level: 'read_only', 'reversible' (default), or 'irreversible'.",
+                    "description": "read_only, reversible (default), or irreversible.",
                 },
                 "allow_scroll": {
                     "type": "boolean",
-                    "description": "If true, scroll to find out-of-view top-level controls; never reuses cached BBoxes across scroll offsets.",
+                    "description": "Scroll to locate off-screen controls.",
                 },
                 "scroll_action": {
                     "type": "object",
-                    "description": "Closed-set HostAction used when allow_scroll=true.",
+                    "description": "HostAction used to scroll.",
                 },
                 "max_scroll_steps": {
                     "type": "integer",
-                    "description": "Maximum scroll steps when allow_scroll=true (default 5, cap 20).",
+                    "description": "Default 5; cap 20.",
                 },
                 "blur_action": {
                     "type": "object",
-                    "description": "Closed-set HostAction used to blur commit_on_blur fields before validation (default Tab).",
+                    "description": "HostAction to leave a field; default Tab.",
                 },
                 "neutral_blur_point": {
                     "type": "array",
                     "items": {"type": "integer"},
-                    "description": "Optional normalized [y, x] neutral area click target for blurring commit_on_blur fields.",
+                    "description": "Neutral [y,x] click to leave a field.",
                 },
                 "max_reconcile_passes": {
                     "type": "integer",
-                    "description": "Maximum convergence passes over DAG waves (default 2, hard cap 3).",
+                    "description": "Default 2; cap 3.",
                 },
                 "max_retries_per_field": {
                     "type": "integer",
-                    "description": "Maximum retries per field on mismatch/validation revert (default 2).",
+                    "description": "Default 2.",
                 },
                 "settle_delay_ms": {
                     "type": "integer",
-                    "description": "Settle delay in ms after actions (default 250).",
+                    "description": "Default 250 ms.",
                 },
                 "relayout_timeout_ms": {
                     "type": "integer",
-                    "description": "Timeout in ms waiting for triggers_relayout stability via wait_until (default 5000).",
+                    "description": "Default 5000 ms.",
                 },
                 "relayout_poll_interval_ms": {
                     "type": "integer",
-                    "description": "Poll interval in ms for triggers_relayout wait_until (default 250).",
+                    "description": "Default 250 ms.",
                 },
                 "max_total_actions": {
                     "type": "integer",
-                    "description": "Hard cap on total host actions before CB_BUDGET_EXCEEDED (default 80, cap 200).",
+                    "description": "Default 80; cap 200.",
                 },
                 "interrupt_predicates": {
                     "type": "array",
                     "items": {"type": "object"},
-                    "description": "Optional atomic interrupt/abort predicates checked during reconciliation.",
+                    "description": "Visual predicates that abort the tool.",
                 },
                 "ignore_scene_change": {
                     "type": "boolean",
-                    "description": "If true, skip baseline full-screen SSIM < 0.50 check (step-level < 0.50 still interrupts).",
+                    "description": "Skip baseline scene-change checks; per-step checks still apply.",
                 },
-                "intent": {"type": "string", "description": "Short reason for reconciling these UI fields."},
+                "intent": {"type": "string"},
             },
             "required": ["fields"],
         },
@@ -1317,15 +1283,11 @@ COORDINATION_SYSTEM_INSTRUCTION = """## Asynchronous Research Assistant & Marker
 * **Checking & Waiting:** Use `peer_get_status` to inspect the assistant's status marker (`sleeping`, `working`, `done`, `error`), `peer_read_messages` when notified of unread messages, or `peer_wait_for_message` when you need to sleep until the assistant wakes you up with a reply.
 """
 
-SYSTEM_ONE_SYSTEM_INSTRUCTION = """## Host-Side System One Tools (`wait_until`, `loop_until`, `batch_apply`, `reconcile_ui_state`):
-* **Strict Decoupling:** Emit declarative tool parameters only; the host executes a deterministic FSM (`S0_INIT_VALIDATE`..`S5_HANDOFF_TO_S2`) and calls TypeSafe System One (`noul`, `choice`, `box`) as a stateless single-frame visual oracle.
-* **When to Use:**
-  - `wait_until`: Wait for spinners, progress bars, page loads, or fleeting toasts (`poll_interval_ms=150..250`, `capture_transient=true`) without burning System 2 turns.
-  - `loop_until`: Bounded scrolling/stepping through long dropdowns, calendars, lists, or sliders (`step_action`, `fallback_action` on first stall, `on_match` closed-loop click unless `irreversible`).
-  - `batch_apply`: Evaluate or act on multiple visible items/checkboxes/rows on one or more pages in one batched Parallel Questions call per page.
-  - `reconcile_ui_state`: L2 composite `Observe -> Compare -> Act -> Verify` controller for multi-field forms/settings with DAG `depends_on` waves, `triggers_relayout` / unannounced shift invalidation, `commit_on_blur` inline validation, `secret_text` masked verification, and bounded convergence. Hard-blocks final submissions, payments, destructive actions, and `irreversible` auto-save controls (`CB_SAFETY_GUARD`).
-* **Normalized Coordinates & Closed-Set `HostAction`:** All `BBox` values are `[ymin, xmin, ymax, xmax]` in `0..1000`. Actions in `step_action`, `fallback_action`, `directional_actions`, `next_page_action`, `on_match.action`, `scroll_action`, and `blur_action` MUST use closed-set primitives: `hover`, `click`, `wheel_scroll`, `key_press`, or `drag_step`.
-* **Risk Tiers & Circuit Breakers:** Choose `read_only`, `reversible`, or `irreversible` accurately. Never expect host auto-clicks on `irreversible` targets (`CB_SAFETY_GUARD` blocks input and returns the annotated candidate box for your review). On `CB_AMBIGUITY`, `CB_STALL`, `CB_INTERRUPT`, `CB_SAFETY_GUARD`, `CB_BUDGET_EXCEEDED`, `CB_BATCH_DRIFT`, `CB_VALIDATION_ERROR`, `CB_OSCILLATION`, or `CB_DEPENDENCY_BLOCKED`, inspect the returned `HostToolResult` (including `reconcile_summary` per-field states) and `visual_evidence` (max 2 images) before deciding the next step.
+SYSTEM_ONE_SYSTEM_INSTRUCTION = """## System One desktop tools
+Use wait_until for a pending visual state, loop_until for repeated navigation, batch_apply for stable groups, and reconcile_ui_state when a form has several fields, dependent controls or inline validation. For fields revealed by another control, use depends_on and mark the revealing control triggers_relayout. Use commit_on_blur for validation on leaving a field.
+Coordinates are 0..1000. A BBox is [ymin,xmin,ymax,xmax]. A visual predicate is {type: noul|choice, instructions, expected_value?: boolean, criteria?: {label: description}, target_choices?: [label], min_confidence?, roi?}. Use tight regions containing all relevant evidence.
+HostAction is {type: hover|click|wheel_scroll, x, y, button?, count?, direction?, magnitude?}, {type: key_press, key}, or {type: drag_step, start_x, start_y, end_x, end_y}.
+Specify risk accurately. Keep final submissions, payments and destructive actions outside System One. After any handoff, inspect current visual evidence before continuing. A breaker may leave partial progress; check which changes landed before retrying.
 """
 
 ASSISTANT_SYSTEM_INSTRUCTION = """You are the asynchronous **Research Assistant** collaborating with the **Computer Use Agent** (`computer_use`) via a shared local workspace and `.coord/` coordination markers.

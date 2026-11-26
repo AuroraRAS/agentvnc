@@ -746,7 +746,7 @@ def run_reconcile_ui_state(
             metrics["steps_executed"] += int(sub_m.get("steps_executed", 0))
 
         def _effective_tier(spec: ReconcileFieldSpec) -> str:
-            return "read_only" if spec.risk_level == "read_only" else "reversible"
+            return "read_only" if "read_only" in (top_risk, spec.risk_level) else "reversible"
 
         def _run_ocr(frame: FrameSnapshot, roi: Sequence[int]) -> Optional[str]:
             ocr_fn = getattr(engine, "ocr_fn", None)
@@ -909,15 +909,15 @@ def run_reconcile_ui_state(
                     "ignore_scene_change": ignore_scene_change,
                 }
                 fsm_trace.append("S4_ACT_OR_RECOVER")
-                wait_res = engine.run_wait_until(wait_args, collaborate_mode=collaborate_mode)
+                wait_res = engine.run_wait_until(wait_args, collaborate_mode=collaborate_mode, _skip_handoff_png=True)
                 _merge_sub_metrics(wait_res)
                 latest = engine._capture_frame()
                 cur_frame = latest
                 final_frame = latest
-                if wait_res.get("breaker_code") == CB_INTERRUPT:
-                    immediate_halt_breaker = CB_INTERRUPT
-                    immediate_halt_detail = str(wait_res.get("detail") or "Interrupted during relayout wait")
-                    _record_breaker(CB_INTERRUPT)
+                if wait_res.get("status") != "matched":
+                    immediate_halt_breaker = wait_res.get("breaker_code") or CB_AMBIGUITY
+                    immediate_halt_detail = f"Relayout after {spec.field_id!r} did not settle: {wait_res.get('detail')}"
+                    _record_breaker(immediate_halt_breaker)
                     return False, False, latest
                 if not _check_unexpected_navigation(pre_f, latest, f"relayout after {spec.field_id}"):
                     return False, False, latest
@@ -1015,6 +1015,7 @@ def run_reconcile_ui_state(
             step_idx: int,
         ) -> Tuple[Optional[List[int]], float, bool, bool]:
             """Run single-frame ``box`` localization inside ``spec.roi`` with 1x gray/context retry."""
+            nonlocal cur_frame, final_frame
             tier = _effective_tier(spec)
             tier_cfg = RISK_TIER_THRESHOLDS[tier]
             global_floor = max(
@@ -1046,6 +1047,7 @@ def run_reconcile_ui_state(
             if tau_low <= cand_conf < global_floor or (cand_box is not None and not _box_center_in_roi(cand_box, spec.roi)):
                 _sleep_settle()
                 fresh = engine._capture_frame()
+                cur_frame = final_frame = fresh
                 use_cont = spec.roi != container_roi and _box_center_in_roi(spec.roi, container_roi)
                 retry_roi = container_roi if use_cont else _expand_context_roi(fresh, spec.roi, min_px=280)
                 retry_ans, retry_prep, retry_intr = _run_s1_with_interrupts(
@@ -1057,7 +1059,11 @@ def run_reconcile_ui_state(
                 if retry_intr or retry_ans is None:
                     return None, 0.0, True, False
                 retry_box, retry_conf = _extract_box_norm_and_conf(retry_ans.get("loc"), retry_prep)
-                cand_ok = cand_box is not None and _box_center_in_roi(cand_box, spec.roi)
+                cand_ok = (
+                    cand_box is not None
+                    and _box_center_in_roi(cand_box, spec.roi)
+                    and compute_pixel_diff_ratio(frame, fresh, roi=spec.roi) == 0.0
+                )
                 retry_ok = retry_box is not None and _box_center_in_roi(retry_box, spec.roi)
                 if retry_ok and (not cand_ok or retry_conf >= cand_conf):
                     cand_box, cand_conf = retry_box, retry_conf
@@ -1114,6 +1120,8 @@ def run_reconcile_ui_state(
                             cur_frame,
                         )
                     if allow_scroll and scroll_steps_used < max_scroll_steps:
+                        if not _check_budget():
+                            return "halt", None, immediate_halt_detail, cur_frame
                         rem_scroll = max_scroll_steps - scroll_steps_used
                         loop_res = engine.run_loop_until(
                             {
@@ -1130,6 +1138,8 @@ def run_reconcile_ui_state(
                                 "ignore_scene_change": ignore_scene_change,
                             },
                             collaborate_mode=collaborate_mode,
+                            _max_actions=max_total_actions - metrics["steps_executed"],
+                            _skip_handoff_png=True,
                         )
                         _merge_sub_metrics(loop_res)
                         steps_taken = int((loop_res.get("metrics") or {}).get("steps_executed", 0))
@@ -1139,6 +1149,8 @@ def run_reconcile_ui_state(
                             _invalidate_for_scroll()
                         cur_frame = engine._capture_frame()
                         final_frame = cur_frame
+                        if loop_res.get("breaker_code") == CB_BUDGET_EXCEEDED and not _check_budget():
+                            return "halt", None, immediate_halt_detail, cur_frame
                         if loop_res.get("breaker_code") == CB_INTERRUPT:
                             immediate_halt_breaker = CB_INTERRUPT
                             immediate_halt_detail = str(loop_res.get("detail") or "Interrupted while scrolling")
@@ -1342,6 +1354,7 @@ def run_reconcile_ui_state(
             step_idx: int,
             *,
             focus_for_clipboard: bool = True,
+            read_clipboard: bool = True,
         ) -> Tuple[str, Optional[str], FrameSnapshot, bool]:
             """Observe a ``text``/``number`` control: prefer VNC clipboard, fallback to OCR + Jev crop score.
 
@@ -1350,7 +1363,7 @@ def run_reconcile_ui_state(
             nonlocal cur_frame, final_frame, error_crop_frame, error_crop_roi, error_crop_box, error_crop_label
             focused = False
             clipboard_fn = getattr(engine.executor, "copy_focused_text", None)
-            if callable(clipboard_fn):
+            if read_clipboard and callable(clipboard_fn):
                 if focus_for_clipboard:
                     cy = int(round((box_norm[0] + box_norm[2]) / 2.0))
                     cx = int(round((box_norm[1] + box_norm[3]) / 2.0))
@@ -1753,13 +1766,16 @@ def run_reconcile_ui_state(
                 clear_secret_fn = getattr(engine.executor, "clear_clipboard_secret", None)
 
                 pasted_ok = False
-                if callable(overwrite_clip_fn):
-                    if not _check_budget():
-                        return True, needs_reobserve
-                    pasted_ok = bool(overwrite_clip_fn(spec.desired_value))
-                    metrics["steps_executed"] += 1
-
-                _sleep_settle()
+                try:
+                    if callable(overwrite_clip_fn):
+                        if not _check_budget():
+                            return True, needs_reobserve
+                        pasted_ok = bool(overwrite_clip_fn(spec.desired_value))
+                        metrics["steps_executed"] += 1
+                    _sleep_settle()
+                finally:
+                    if is_secret and callable(clear_secret_fn):
+                        clear_secret_fn()
                 post_paste = engine._capture_frame()
                 cur_frame = post_paste
                 final_frame = post_paste
@@ -1773,7 +1789,7 @@ def run_reconcile_ui_state(
                     else:
                         if callable(clip_copy_fn):
                             ok_rb, rb_val = clip_copy_fn()
-                            if ok_rb and rb_val == "" and spec.desired_value != "":
+                            if ok_rb and not _compare_text_values(spec, rb_val):
                                 need_keystroke_fallback = True
                             elif not ok_rb:
                                 delta = compute_pixel_diff_ratio(pre_act, post_paste, roi=box_norm, channel_threshold=2)
@@ -1790,9 +1806,6 @@ def run_reconcile_ui_state(
                         post_paste = engine._capture_frame()
                         cur_frame = post_paste
                         final_frame = post_paste
-
-                if is_secret and callable(clear_secret_fn):
-                    clear_secret_fn()
 
                 ok_nav, shifted, cur_frame = _post_mutation_guards(spec, pre_act, cur_frame, box_norm, step_idx)
                 needs_reobserve = needs_reobserve or shifted
@@ -1930,19 +1943,26 @@ def run_reconcile_ui_state(
                     continue
 
                 # Non-secret text/number verification
-                # If commit_on_blur blurred away focus, click to read clipboard then re-blur if needed.
-                v_state, v_val, cur_frame, v_focused = _observe_text_or_number(
-                    spec, box_norm, step_idx, focus_for_clipboard=spec.commit_on_blur
+                # Validate the committed state without refocusing a field that may have moved.
+                if needs_reobserve:
+                    loc_state, new_box, reason, cur_frame = _locate_and_verify_box(spec, step_idx, verify_geometry=False)
+                    if loc_state == "halt":
+                        return True, needs_reobserve
+                    if loc_state != "ok" or new_box is None:
+                        st.status = "uncertain"
+                        st.breaker_code = CB_AMBIGUITY
+                        st.reason = reason
+                        st.terminal_failure = True
+                        _record_breaker(CB_AMBIGUITY)
+                        return False, needs_reobserve
+                    box_norm = new_box
+                v_state, v_val, cur_frame, _ = _observe_text_or_number(
+                    spec, box_norm, step_idx, focus_for_clipboard=False,
+                    read_clipboard=not (spec.commit_on_blur or needs_reobserve),
                 )
                 st.observed_value = v_val
                 if v_state == "halt":
                     return True, needs_reobserve
-                if spec.commit_on_blur and v_focused:
-                    if not _exec_action(blur_action):
-                        return True, needs_reobserve
-                    _sleep_settle()
-                    cur_frame = engine._capture_frame()
-                    final_frame = cur_frame
                 if v_state == "matched":
                     st.status = "reconciled"
                     st.breaker_code = None
@@ -2090,12 +2110,16 @@ def run_reconcile_ui_state(
                     collaborate_mode=collaborate_mode,
                     _include_crop_box_check=False,
                     _confirm_crop_roi=menu_roi,
+                    _max_actions=max_total_actions - metrics["steps_executed"],
+                    _skip_handoff_png=True,
                 )
                 _merge_sub_metrics(loop_res)
                 cur_frame = engine._capture_frame()
                 final_frame = cur_frame
 
                 l_breaker = loop_res.get("breaker_code")
+                if l_breaker == CB_BUDGET_EXCEEDED and not _check_budget():
+                    return True, needs_reobserve
                 if l_breaker == CB_INTERRUPT:
                     immediate_halt_breaker = CB_INTERRUPT
                     immediate_halt_detail = str(loop_res.get("detail") or f"Interrupted in dropdown {spec.field_id!r}")
@@ -2301,12 +2325,18 @@ def run_reconcile_ui_state(
                 if lcfg.get("fallback_action") is not None:
                     loop_args["fallback_action"] = lcfg["fallback_action"]
 
-                loop_res = engine.run_loop_until(loop_args, collaborate_mode=collaborate_mode)
+                loop_res = engine.run_loop_until(
+                    loop_args, collaborate_mode=collaborate_mode,
+                    _max_actions=max_total_actions - metrics["steps_executed"],
+                    _skip_handoff_png=True,
+                )
                 _merge_sub_metrics(loop_res)
                 cur_frame = engine._capture_frame()
                 final_frame = cur_frame
 
                 l_breaker = loop_res.get("breaker_code")
+                if l_breaker == CB_BUDGET_EXCEEDED and not _check_budget():
+                    return True, needs_reobserve
                 if l_breaker == CB_INTERRUPT:
                     immediate_halt_breaker = CB_INTERRUPT
                     immediate_halt_detail = str(loop_res.get("detail") or f"Interrupted on slider {spec.field_id!r}")
@@ -2365,7 +2395,6 @@ def run_reconcile_ui_state(
         # Multi-pass Topological DAG Wave Loop
         # -------------------------------------------------------------------
         prev_pass_mismatches: Optional[int] = None
-        last_pass_needed_verify = False
 
         for pass_idx in range(1, max_passes + 1):
             passes_executed = pass_idx
@@ -2406,19 +2435,47 @@ def run_reconcile_ui_state(
                     continue
 
                 # 2. Batched observation for binary / dropdown-with-options / slider controls in wave
-                batch_obs_map, halted = _batch_observe_fields(active_wave_specs, cur_frame, request_boxes=True)
+                writable_specs = [sp for sp in active_wave_specs if _effective_tier(sp) != "read_only"]
+                batch_obs_map, halted = _batch_observe_fields(writable_specs, cur_frame, request_boxes=True)
                 if halted:
                     break
 
                 # Pre-classify already-matched vs mismatched vs blocked on initial wave read
                 # Also record initial state hash before any Pass 1 mutations if all are observable here.
-                batch_verify_candidates: List[ReconcileFieldSpec] = []
                 wave_needs_reobserve = False
 
                 for sp in active_wave_specs:
                     fid = sp.field_id
                     st = field_states[fid]
                     obs_item = batch_obs_map.get(fid)
+
+                    if _effective_tier(sp) == "read_only":
+                        if sp.control_type == "secret_text":
+                            st.reason = "A masked value cannot be compared in read-only mode"
+                        else:
+                            predicate = normalize_predicate({
+                                "type": "noul",
+                                "instructions": f"Is the visible {sp.locator_prompt} ({sp.control_type}) set to {sp.desired_value!r}?",
+                                "min_confidence": sp.min_confidence,
+                            }, risk_tier="read_only", default_roi=sp.roi)
+                            adj, cur_frame, halted = _query_predicate_with_retry(
+                                cur_frame, predicate, "read_only", sp.roi, pass_idx * 100 + wave_idx,
+                            )
+                            final_frame = cur_frame
+                            if halted:
+                                break
+                            if adj.zone == "pass":
+                                st.status = "already_matched"
+                                st.observed_value = sp.desired_value
+                                st.breaker_code = None
+                                st.reason = "Observed state already matches desired_value"
+                                st.ever_matched = True
+                                continue
+                            st.reason = "The target value could not be confirmed in read-only mode"
+                        st.status = "uncertain"
+                        st.breaker_code = CB_AMBIGUITY
+                        _record_breaker(CB_AMBIGUITY)
+                        continue
 
                     # On Pass 2+, only re-act on fields that are currently mismatched (or failed/uncertain? no, those were skipped).
                     if sp.control_type in BINARY_CONTROL_TYPES:
@@ -2473,15 +2530,14 @@ def run_reconcile_ui_state(
                             break
                         if shifted:
                             wave_needs_reobserve = True
-                        if st.status == "reconciled":
-                            batch_verify_candidates.append(sp)
                     elif sp.control_type in TEXT_CONTROL_TYPES or sp.control_type == "secret_text":
                         if pass_idx > 1 and st.status in ("already_matched", "reconciled") and sp.control_type != "secret_text":
                             # On pass 2+, check only if regressed; if still matched, skip
                             loc_b = _get_cached_box(fid)
                             if loc_b is not None:
                                 o_st, o_val, cur_frame, foc = _observe_text_or_number(
-                                    sp, loc_b[0], pass_idx * 100 + wave_idx, focus_for_clipboard=False
+                                    sp, loc_b[0], pass_idx * 100 + wave_idx,
+                                    focus_for_clipboard=False, read_clipboard=False,
                                 )
                                 if o_st == "halt":
                                     break
