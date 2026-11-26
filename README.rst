@@ -223,8 +223,9 @@ The Gemini desktop agent can delegate visual checks and bounded sequences
 of GUI actions to the host.  The host sends desktop frames or crops with
 visual questions to the TypeSafe System One API.  It evaluates the answers
 and runs the configured actions through ``-AgentSocket``.  Gemini receives
-the result, any circuit breaker reason, and up to two images so it can
-inspect the current state before continuing.
+a compact result with any circuit breaker reason and up to two images so
+it can inspect the current state before continuing.  The local trace keeps
+the diagnostic details.
 
 * ``wait_until`` polls for a visual condition such as a progress bar
   completing.  It can require several passing evaluations and capture a
@@ -234,6 +235,16 @@ inspect the current state before continuing.
 * ``batch_apply`` evaluates several visible items together, optionally
   applies a reversible action to matching items, and can paginate.  It
   stops applying actions when it detects a change to a pending target.
+* ``reconcile_ui_state`` sets and verifies multiple form fields in
+  dependency order.  It can locate controls revealed by earlier edits,
+  refresh their locations after layout changes, and check validation when a
+  field loses focus.  A read-only request checks field values without
+  sending desktop input.  Final submissions, payments, and destructive
+  controls are blocked.  Local Tesseract is optional for reading text fields.
+
+After a circuit breaker, the agent can inspect the handoff at its baseline
+thinking level.  The same breaker on consecutive turns can trigger the
+configured recovery thinking level.
 
 With custom tools enabled, the agent enables System One when it finds a
 TypeSafe API key.  Store the key in ``typesafe.key`` in the repository root
@@ -252,16 +263,28 @@ This example uses the Gemini and TypeSafe key files in the repository root.
   python3 tools/vnc_computer_use_agent.py --vnc-host localhost:5901 --system-one \
       --prompt "Wait for the status panel to show Ready, then report it."
 
-Run ``python3 tools/test_agent_system_one.py`` for the offline System One
-tests with mocked API calls.  The test suite requires Pillow.
+Run ``python3 -m unittest discover -s tools -p 'test_agent_*.py'`` for the
+offline agent suite, including the System One and reconciliation tests with
+mocked API calls.  The suite requires Pillow.
 
 For live testing, open the `IE6 compatibility exam <tools/system_one_exam_ie6.html>`_
 or the `Dispatch Recovery Exam <tools/system_one_recovery_exam_ie6.html>`_
 in the VNC desktop's browser.  The recovery exam has two self-scoring
-scenarios that exercise stale status messages, stalled pagination, and
-rows that reorder after an update.  The `recovery exam guide
+scenarios that exercise dependent dispatch fields, validation on blur,
+stale status messages, stalled pagination, and rows that reorder after an
+update.  The timer starts at the first exam interaction and freezes when a
+passing receipt is issued.  The `recovery exam guide
 <tools/system_one_recovery_exam.txt>`_ provides setup, a sample prompt,
 and scoring criteria.
+
+For an enabled versus disabled comparison, reset to the same scenario and
+use the same model and prompt.  Switch between ``--system-one`` and
+``--no-system-one`` and use a separate ``--log-dir`` for each run.
+``trace.jsonl`` records per-turn Gemini token usage when returned by the
+API, elapsed wall time, and System One outcomes.  The runner prints a
+``[TOKENS]`` task summary.  Record the exam time from a passing receipt in
+``final.png``.  If a run stops early, record the stop and its elapsed wall
+time separately.
 
 
 HiDPI and Remote Desktop Scaling
