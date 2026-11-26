@@ -283,6 +283,70 @@ class VncDesktopExecutor:
             time.sleep(0.05)
         return {"error": "The server sent no fresh clipboard update after Ctrl+C. The selection was not verified."}
 
+    def copy_focused_text(self, timeout: float = 1.0) -> Tuple[bool, str]:
+        """Copy the full focused text control through the VNC clipboard."""
+        try:
+            init_resp = self._get_clipboard_reply()
+            init_text = self._decode_clipboard_text(init_resp) if init_resp.get("available") else None
+        except (RuntimeError, UnicodeError):
+            return False, ""
+        start_seq = init_resp.get("sequence")
+        marker = f"__agentvnc_copy_{uuid.uuid4().hex}__"
+        try:
+            self.clipboard_set(marker)
+        except AgentPausedError:
+            raise
+        except (ValueError, RuntimeError):
+            return False, ""
+
+        time.sleep(0.04)
+        self._select_text_field()
+        self._hotkey_syms([KEY_MAP["ctrl"], ord("c")])
+
+        deadline = time.monotonic() + float(timeout)
+        while time.monotonic() < deadline:
+            try:
+                resp = self._get_clipboard_reply()
+                decoded = self._decode_clipboard_text(resp) if resp.get("available") else None
+            except (RuntimeError, UnicodeError):
+                return False, ""
+            if decoded is not None and decoded != marker:
+                seq = resp.get("sequence")
+                if isinstance(start_seq, int):
+                    if isinstance(seq, int) and seq > start_seq:
+                        return True, decoded
+                elif decoded != init_text:
+                    return True, decoded
+            time.sleep(0.04)
+        return False, ""
+
+    def overwrite_focused_text_clipboard(self, text: str) -> bool:
+        """Replace the focused field through the VNC clipboard."""
+        if text:
+            try:
+                self.clipboard_set(text)
+            except AgentPausedError:
+                raise
+            except (ValueError, RuntimeError):
+                return False
+        self._clear_text_field()
+        if text:
+            self._hotkey_syms([KEY_MAP["ctrl"], ord("v")])
+        return True
+
+    def type_focused_text(self, text: str) -> None:
+        """Replace the focused field using VNC key events."""
+        self._clear_text_field()
+        if text:
+            self._type_text_impl(text, press_enter=False)
+
+    def clear_clipboard_secret(self) -> None:
+        """Best-effort clearing of remote clipboard after pasting a secret field."""
+        try:
+            self.clipboard_set("")
+        except (ValueError, RuntimeError, OSError):
+            pass
+
     def wait_until_resumed(self, intent: Optional[str] = None) -> Tuple[int, List[str]]:
         st = self.get_status()
         start_human = int(st.get("human_action_count", 0))
@@ -633,11 +697,14 @@ class VncDesktopExecutor:
             self._key(ks, False)
             time.sleep(0.04)
 
-    def _clear_text_field(self) -> None:
+    def _select_text_field(self) -> None:
         # Legacy Windows edit controls, including the Save As filename box,
         # do not always implement Ctrl+A.
         self._hotkey_syms([KEY_MAP["ctrl"], KEY_MAP["home"]])
         self._hotkey_syms([KEY_MAP["ctrl"], KEY_MAP["shift"], KEY_MAP["end"]])
+
+    def _clear_text_field(self) -> None:
+        self._select_text_field()
         self._hotkey_syms([KEY_MAP["backspace"]])
 
     def _type_text_impl(self, text: str, press_enter: bool) -> None:

@@ -807,6 +807,21 @@ class SystemOneUnitTests(unittest.TestCase):
         self.assertIn("during retry", result["detail"])
         self.assertEqual(executor.actions, [])
 
+    def test_delegated_loop_budget_covers_on_match_action(self) -> None:
+        executor = FakeFsmExecutor([make_rgb_frame()])
+        client = ScriptedSystemOneClient(lambda idx, *_: {"stop": {"noul": 0.01 if idx == 0 else 0.99}})
+        engine = SystemOneHostEngine(executor, client)
+        step = {"type": "key_press", "key": "Down"}
+        result = engine.run_loop_until({
+            "stop_predicate": {"type": "noul", "instructions": "Ready?"},
+            "step_action": step,
+            "on_match": {"mode": "action", "action": {"type": "click", "x": 500, "y": 500}},
+            "settle_delay_ms": 0,
+        }, _max_actions=1)
+        self.assertEqual(result["breaker_code"], CB_BUDGET_EXCEEDED)
+        self.assertEqual(result["metrics"]["steps_executed"], 1)
+        self.assertEqual(executor.actions, [step])
+
     def test_batch_apply_parallel_eval_and_drift_breakers(self) -> None:
         # 2x2 grid on 800x600 screen, 2 items match -> 1 S1 call evaluates all 4 slots in parallel
         f0 = make_rgb_frame(800, 600, bg=(245, 245, 245), frame_seq=1)
@@ -1003,14 +1018,14 @@ class SystemOneUnitTests(unittest.TestCase):
 
         def scripted_gemini(req_body: Dict[str, Any]) -> Tuple[int, Dict[str, Any]]:
             turn_num = len(gemini_backend.interaction_requests)
-            if turn_num == 1:
+            if turn_num <= 2:
                 return 200, {
-                    "id": "int_1",
+                    "id": f"int_{turn_num}",
                     "status": "requires_action",
                     "outputs": [
                         {
                             "type": "function_call",
-                            "id": "call_1",
+                            "id": f"call_wait_{turn_num}",
                             "name": "wait_until",
                             "arguments": {
                                 "condition": {"type": "noul", "instructions": "Is the badge ready?"},
@@ -1020,14 +1035,14 @@ class SystemOneUnitTests(unittest.TestCase):
                         },
                         {
                             "type": "function_call",
-                            "id": "call_2",
+                            "id": f"call_click_{turn_num}",
                             "name": "click",
                             "arguments": {"x": 500, "y": 500},
                         },
                     ],
                 }
             return 200, {
-                "id": "int_2",
+                "id": "int_3",
                 "status": "completed",
                 "outputs": [{"type": "text", "text": "Escalated ambiguity cleanly."}],
             }
@@ -1090,11 +1105,13 @@ class SystemOneUnitTests(unittest.TestCase):
                  mock.patch("vnc_agent.runner.InteractionsClient", side_effect=lambda **kw: agent_mod.InteractionsClient(base_url=f"http://127.0.0.1:{gemini_srv.server_port}/v1beta/interactions", **kw)):
                 rc = agent_mod.run_agent(args)
             self.assertEqual(rc, 0)
-            self.assertEqual(len(gemini_backend.interaction_requests), 2)
+            self.assertEqual(len(gemini_backend.interaction_requests), 3)
 
-            # Turn 2 sends function_result with 2 visual_evidence images and escalated thinking_level="high"
+            # The first visual handoff stays at baseline; the same breaker twice escalates.
             req2 = gemini_backend.interaction_requests[1]
-            self.assertEqual(req2.get("generation_config", {}).get("thinking_level"), "high")
+            self.assertEqual(req2.get("generation_config", {}).get("thinking_level"), "low")
+            req3 = gemini_backend.interaction_requests[2]
+            self.assertEqual(req3.get("generation_config", {}).get("thinking_level"), "high")
             fres = req2["input"][0]
             self.assertEqual(fres["name"], "wait_until")
             img_blocks = [b for b in fres["result"] if b.get("type") == "image"]

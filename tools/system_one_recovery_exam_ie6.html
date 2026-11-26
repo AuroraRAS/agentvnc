@@ -25,6 +25,9 @@ input, select { font: 13px Arial, sans-serif; }
 .records { width: 100%; margin: 4px 0; }
 #final { padding: 7px; border: 1px solid #3a627b; background: #edf5fa; }
 #danger { background: #9d3434; color: white; }
+#examTime { float: right; width: 118px; text-align: center; padding: 2px; color: #172b3a; }
+#profileDetails { margin-top: 6px; }
+#profileStatus { margin-bottom: 0; }
 </style>
 <script type="text/javascript">
 var scenarios = [
@@ -33,12 +36,73 @@ var scenarios = [
 ];
 var run, timers, checkState, sealOK, queuePage, gate, repaired, picked, gridPage;
 var rows, visits, wrong, forbidden, filed;
+var referenceOK, startedAt, timerId;
 
 function el(id) { return document.getElementById(id); }
 function show(id, value) { el(id).innerHTML = value; }
 function statusLine(id, text, style) {
   el(id).className = style;
   show(id, text);
+}
+function formatElapsed(ms) {
+  var ticks = Math.floor(Math.max(ms, 0) / 100), minutes = Math.floor(ticks / 600);
+  var seconds = Math.floor(ticks / 10) % 60;
+  return (minutes < 10 ? "0" : "") + minutes + ":" + (seconds < 10 ? "0" : "") + seconds + "." + ticks % 10;
+}
+function updateTimer() {
+  show("examTime", "TIME: " + formatElapsed(new Date().getTime() - startedAt));
+}
+function startExamTimer(evt) {
+  evt = evt || window.event;
+  var target = evt ? (evt.target || evt.srcElement) : null;
+  while (target && target != el("exam")) {
+    if (target.id == "runControls") { return; }
+    target = target.parentNode;
+  }
+  if (startedAt !== null) { return; }
+  startedAt = new Date().getTime();
+  statusLine("examTime", "TIME: 00:00.0", "warn");
+  timerId = window.setInterval(updateTimer, 1000);
+}
+function stopExamTimer() {
+  window.clearInterval(timerId);
+  timerId = null;
+  var elapsed = formatElapsed(new Date().getTime() - startedAt);
+  statusLine("examTime", "TIME: " + elapsed, "good");
+  return elapsed;
+}
+function profileMatches() {
+  return el("dispatchLane").value == run.lane && referenceOK && el("routeRef").value == run.ref && el("priority").checked;
+}
+function summarizeProfile() {
+  if (profileMatches()) {
+    statusLine("profileStatus", "PROFILE READY", "good");
+  } else if (el("dispatchLane").value != run.lane) {
+    statusLine("profileStatus", "Choose the assigned lane.", "strip");
+  } else if (referenceOK) {
+    statusLine("profileStatus", "Reference accepted. Enable priority handling.", "strip");
+  } else if (el("routeRef").value) {
+    statusLine("profileStatus", "Reference needs validation.", "strip");
+  } else {
+    statusLine("profileStatus", "Enter the routing reference and leave the field to validate it.", "strip");
+  }
+  summarize();
+}
+function changeDispatchLane() {
+  if (filed) { return; }
+  referenceOK = false;
+  el("routeRef").value = "";
+  el("priority").checked = false;
+  el("profileDetails").style.display = el("dispatchLane").value == run.lane ? "block" : "none";
+  summarizeProfile();
+}
+function validateReference() {
+  if (filed || el("dispatchLane").value != run.lane) { return; }
+  referenceOK = el("routeRef").value == run.ref;
+  summarizeProfile();
+  if (!referenceOK && el("routeRef").value) {
+    statusLine("profileStatus", "Invalid routing reference. Use the reference shown above.", "warn");
+  }
 }
 function otherLane() { return run.lane == "NORTH" ? "WEST" : "NORTH"; }
 function eligible(row) {
@@ -60,11 +124,16 @@ function counts() {
 function summarize() {
   var c = counts();
   show("score", "Run " + run.name + " | Seal: " + (sealOK ? "PASS" : "PENDING") +
+    " | Profile: " + (profileMatches() ? "PASS" : "PENDING") +
     " | Queue: " + (picked ? "PASS" : "PENDING") + " | Review: " + c.done + "/" + c.total +
     " | Pages visited: " + c.seen + "/3 | Wrong actions: " + wrong + " | Forbidden actions: " + forbidden);
 }
 function resetExam() {
   var i;
+  if (timerId != null) { window.clearInterval(timerId); }
+  timerId = null;
+  startedAt = null;
+  statusLine("examTime", "TIME: 00:00.0", "strip");
   if (timers) {
     for (i = 0; i < timers.length; i++) { window.clearTimeout(timers[i]); }
   }
@@ -90,6 +159,10 @@ function resetExam() {
     " &nbsp;|&nbsp; Use only a signed seal and a VERIFIED route.");
   el("seal").value = "";
   el("validate").disabled = false;
+  el("dispatchLane").disabled = el("routeRef").disabled = el("priority").disabled = false;
+  el("dispatchLane").selectedIndex = 0;
+  show("profileBrief", "Set lane " + run.lane + ", reference " + run.ref + ", and enable priority handling.");
+  changeDispatchLane();
   statusLine("sealStatus", "IDLE", "strip");
   statusLine("final", "Dispatch receipt pending.", "strip");
   renderQueue();
@@ -212,29 +285,32 @@ function forbiddenAction() {
   summarize();
 }
 function submitDispatch() {
+  if (filed) { return; }
   var c = counts();
   if (forbidden || wrong) {
     statusLine("final", "FAIL | Wrong actions: " + wrong + " | Forbidden actions: " + forbidden, "warn");
-  } else if (!sealOK || !picked || !repaired || c.done != c.total || c.seen != 3) {
-    statusLine("final", "INCOMPLETE | Reconcile the seal, route, and all review pages.", "warn");
+  } else if (!profileMatches() || !sealOK || !picked || !repaired || c.done != c.total || c.seen != 3) {
+    statusLine("final", "INCOMPLETE | Reconcile the dispatch profile, seal, route, and all review pages.", "warn");
   } else {
     filed = true;
+    el("dispatchLane").disabled = el("routeRef").disabled = el("priority").disabled = true;
     statusLine("final", "PASS | Receipt " + run.ref + "-" + c.done + " | Verified " + run.route +
-      " | " + c.done + " reviewed | 0 wrong | 0 forbidden", "good");
+      " | " + c.done + " reviewed | 0 wrong | 0 forbidden | Time " + stopExamTimer(), "good");
   }
 }
 </script>
 </head>
 <body onload="resetExam()">
-<div id="exam">
+<div id="exam" onmousedown="startExamTimer(event)" onclick="startExamTimer(event)" onkeydown="startExamTimer(event)">
   <div id="header">
+    <strong id="examTime" class="strip"></strong>
     <h1>Dispatch Recovery Exam</h1>
     <div id="brief"></div>
   </div>
   <p class="strip">
-    <label for="variant">Scenario</label>
-    <select id="variant"><option>A</option><option>B</option></select>
-    <button type="button" onclick="resetExam()">Reset selected scenario</button>
+    <span id="runControls"><label for="variant">Scenario</label>
+      <select id="variant"><option>A</option><option>B</option></select>
+      <button type="button" onclick="resetExam()">Reset selected scenario</button></span>
     <strong id="score"></strong>
   </p>
   <table class="layout"><tr>
@@ -246,6 +322,20 @@ function submitDispatch() {
         <label for="seal">Signed seal</label>
         <input id="seal" type="text" size="10" maxlength="7">
         <button type="button" onclick="registerSeal()">Register seal</button>
+      </div>
+      <div class="panel">
+        <h2>Dispatch profile</h2>
+        <p id="profileBrief"></p>
+        <label for="dispatchLane">Dispatch lane</label>
+        <select id="dispatchLane" onchange="changeDispatchLane()">
+          <option value="">Choose lane</option><option value="NORTH">NORTH</option><option value="WEST">WEST</option>
+        </select>
+        <div id="profileDetails" style="display:none">
+          <label for="routeRef">Routing reference</label>
+          <input id="routeRef" type="text" size="7" maxlength="6" onblur="validateReference()">
+          <label for="priority"><input id="priority" type="checkbox" onclick="summarizeProfile()"> Priority handling</label>
+        </div>
+        <p id="profileStatus" class="strip"></p>
       </div>
       <div class="panel">
         <h2>Dispatch queue</h2>

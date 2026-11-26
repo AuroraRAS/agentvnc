@@ -6,7 +6,9 @@ import io
 import json
 import math
 import os
+import shutil
 import struct
+import subprocess
 import time
 import urllib.error
 import urllib.parse
@@ -548,6 +550,167 @@ def compute_ssim(
     num = (2.0 * mu_a * mu_b + c1) * (2.0 * cov + c2)
     den = (mu_a * mu_a + mu_b * mu_b + c1) * (var_a + var_b + c2)
     return max(0.0, min(1.0, num / max(den, 1e-12)))
+
+
+def compute_ssim_excluding_roi(
+    frame_a: FrameSnapshot,
+    frame_b: FrameSnapshot,
+    container_roi: Optional[Sequence[int]] = None,
+    exclude_roi: Optional[Sequence[int]] = None,
+) -> float:
+    """Compute SSIM over ``container_roi`` excluding pixels inside ``exclude_roi``."""
+    if frame_a.width != frame_b.width or frame_a.height != frame_b.height:
+        return 0.0
+    if frame_a.rgb_bytes == frame_b.rgb_bytes:
+        return 1.0
+    if exclude_roi is None:
+        return compute_ssim(frame_a, frame_b, roi=container_roi)
+
+    c_roi = validate_bbox(list(container_roi), name="container_roi") if container_roi is not None else [0, 0, 1000, 1000]
+    e_roi = validate_bbox(list(exclude_roi), name="exclude_roi")
+
+    cx0, cy0, cx1, cy1 = bbox_to_pixels(c_roi, frame_a.width, frame_a.height)
+    ex0, ey0, ex1, ey1 = bbox_to_pixels(e_roi, frame_a.width, frame_a.height)
+    cw = cx1 - cx0
+    ch = cy1 - cy0
+
+    rx0 = max(0, ex0 - cx0)
+    ry0 = max(0, ey0 - cy0)
+    rx1 = min(cw, ex1 - cx0)
+    ry1 = min(ch, ey1 - cy0)
+
+    if rx1 <= rx0 or ry1 <= ry0:
+        return compute_ssim(frame_a, frame_b, roi=c_roi)
+    if rx0 == 0 and ry0 == 0 and rx1 == cw and ry1 == ch:
+        return 1.0
+
+    c1 = (0.01 * 255.0) ** 2
+    c2 = (0.03 * 255.0) ** 2
+
+    if np is not None:
+        a_rgb = _extract_roi_rgb_array(frame_a, c_roi)
+        b_rgb = _extract_roi_rgb_array(frame_b, c_roi)
+        h, w = a_rgb.shape[:2]
+        stride = max(1, int(math.ceil(max(h, w) / 320.0)))
+        if stride > 1:
+            a_rgb = a_rgb[::stride, ::stride]
+            b_rgb = b_rgb[::stride, ::stride]
+        dh, dw = a_rgb.shape[:2]
+        drx0 = max(0, min(dw, (rx0 + stride - 1) // stride))
+        dry0 = max(0, min(dh, (ry0 + stride - 1) // stride))
+        drx1 = max(drx0, min(dw, int(math.ceil(rx1 / stride))))
+        dry1 = max(dry0, min(dh, int(math.ceil(ry1 / stride))))
+
+        excl = np.zeros((dh, dw), dtype=bool)
+        excl[dry0:dry1, drx0:drx1] = True
+        keep = ~excl
+        if not np.any(keep):
+            return 1.0
+
+        weights = np.array([0.299, 0.587, 0.114], dtype=np.float64)
+        x = np.tensordot(a_rgb.astype(np.float64), weights, axes=([2], [0]))
+        y = np.tensordot(b_rgb.astype(np.float64), weights, axes=([2], [0]))
+
+        y_masked = y.copy()
+        y_masked[excl] = x[excl]
+        if np.array_equal(x, y_masked):
+            return 1.0
+
+        win = min(7, dh, dw)
+        if uniform_filter is not None and win >= 3:
+            mu_x = uniform_filter(x, size=win, mode="reflect")
+            mu_y = uniform_filter(y_masked, size=win, mode="reflect")
+            sigma_x2 = np.maximum(0.0, uniform_filter(x * x, size=win, mode="reflect") - mu_x * mu_x)
+            sigma_y2 = np.maximum(0.0, uniform_filter(y_masked * y_masked, size=win, mode="reflect") - mu_y * mu_y)
+            sigma_xy = uniform_filter(x * y_masked, size=win, mode="reflect") - mu_x * mu_y
+            num = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+            den = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x2 + sigma_y2 + c2)
+            ssim_map = num / np.maximum(den, 1e-12)
+            ssim_val = float(np.mean(ssim_map[keep]))
+        else:
+            xk = x[keep]
+            yk = y[keep]
+            mu_x = float(np.mean(xk))
+            mu_y = float(np.mean(yk))
+            sigma_x2 = float(np.var(xk))
+            sigma_y2 = float(np.var(yk))
+            sigma_xy = float(np.mean((xk - mu_x) * (yk - mu_y)))
+            num = (2.0 * mu_x * mu_y + c1) * (2.0 * sigma_xy + c2)
+            den = (mu_x * mu_x + mu_y * mu_y + c1) * (sigma_x2 + sigma_y2 + c2)
+            ssim_val = num / max(den, 1e-12)
+        return max(0.0, min(1.0, float(ssim_val)))
+
+    # Pure-Python fallback
+    lum_a: List[float] = []
+    lum_b: List[float] = []
+    stride_bytes = frame_a.width * 3
+    for yy in range(cy0, cy1):
+        row_off = yy * stride_bytes
+        in_y = ey0 <= yy < ey1
+        for xx in range(cx0, cx1):
+            if in_y and ex0 <= xx < ex1:
+                continue
+            p = row_off + xx * 3
+            la = 0.299 * frame_a.rgb_bytes[p] + 0.587 * frame_a.rgb_bytes[p + 1] + 0.114 * frame_a.rgb_bytes[p + 2]
+            lb = 0.299 * frame_b.rgb_bytes[p] + 0.587 * frame_b.rgb_bytes[p + 1] + 0.114 * frame_b.rgb_bytes[p + 2]
+            lum_a.append(la)
+            lum_b.append(lb)
+    if not lum_a:
+        return 1.0
+    n = len(lum_a)
+    mu_a = sum(lum_a) / n
+    mu_b = sum(lum_b) / n
+    var_a = sum((v - mu_a) ** 2 for v in lum_a) / n
+    var_b = sum((v - mu_b) ** 2 for v in lum_b) / n
+    cov = sum((va - mu_a) * (vb - mu_b) for va, vb in zip(lum_a, lum_b)) / n
+    num = (2.0 * mu_a * mu_b + c1) * (2.0 * cov + c2)
+    den = (mu_a * mu_a + mu_b * mu_b + c1) * (var_a + var_b + c2)
+    return max(0.0, min(1.0, num / max(den, 1e-12)))
+
+
+def extract_roi_text_ocr(
+    frame: FrameSnapshot,
+    roi: Sequence[int],
+    psm: int = 7,
+    timeout: float = 2.0,
+) -> Optional[str]:
+    """Run local Tesseract OCR on ``roi`` of ``frame``, returning ``None`` if unavailable/failed."""
+    tesseract_bin = shutil.which("tesseract")
+    if not tesseract_bin:
+        return None
+    norm = validate_bbox(list(roi), name="roi")
+    x0, y0, x1, y1 = bbox_to_pixels(norm, frame.width, frame.height)
+    cw, ch = x1 - x0, y1 - y0
+    if Image is not None:
+        cropped = Image.frombytes("RGB", (frame.width, frame.height), frame.rgb_bytes).crop((x0, y0, x1, y1))
+        min_side = min(cw, ch)
+        if min_side < 60:
+            scale = min(3.0, max(2.0, 60.0 / max(1, min_side)))
+            new_w = max(1, int(round(cw * scale)))
+            new_h = max(1, int(round(ch * scale)))
+            resample = Image.Resampling.BICUBIC if hasattr(Image, "Resampling") else Image.BICUBIC
+            cropped = cropped.resize((new_w, new_h), resample=resample)
+        buf = io.BytesIO()
+        cropped.save(buf, format="PNG")
+        png_bytes = buf.getvalue()
+    else:  # pragma: no cover
+        cw_f, ch_f, cropped_rgb = _crop_rgb_fallback(frame, x0, y0, x1, y1)
+        png_bytes = _encode_rgb_png(cw_f, ch_f, cropped_rgb)
+
+    try:
+        proc = subprocess.run(
+            [tesseract_bin, "stdin", "stdout", "--psm", str(int(psm))],
+            input=png_bytes,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=float(timeout),
+            check=False,
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    return proc.stdout.decode("utf-8", errors="replace").strip()
 
 
 class SystemOneClient:

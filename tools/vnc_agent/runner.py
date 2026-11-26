@@ -67,6 +67,7 @@ from .interactions import (
     InteractionsClient,
     extract_function_calls,
     extract_model_text,
+    extract_usage,
     load_api_key,
 )
 from .system_one_client import (
@@ -130,6 +131,47 @@ def build_tools_config(
     if enable_system_one_tools:
         tools.extend(copy.deepcopy(SYSTEM_ONE_FUNCTION_DECLARATIONS))
     return tools
+
+
+def trace_action_args(name: str, args: Dict[str, Any]) -> Dict[str, Any]:
+    fields = args.get("fields")
+    if name != "reconcile_ui_state" or not isinstance(fields, list):
+        return args
+    return {
+        **args,
+        "fields": [
+            {**field, "desired_value": "<redacted>"}
+            if isinstance(field, dict)
+            and str(field.get("control_type", "")).strip().lower() == "secret_text"
+            and "desired_value" in field
+            else field
+            for field in fields
+        ],
+    }
+
+
+def system_one_model_result(result: Dict[str, Any]) -> Dict[str, Any]:
+    """Keep the visual handoff and field outcomes in context, with diagnostics in the trace."""
+    compact = {key: value for key, value in result.items() if key not in ("fsm_states", "metrics", "outcome")}
+    outcome = result.get("outcome")
+    if outcome:
+        model_outcome = {
+            key: value for key, value in outcome.items()
+            if value is not None and key not in ("recent_confidences", "reconcile_summary")
+        }
+        summary = outcome.get("reconcile_summary")
+        if summary is not None:
+            model_outcome["reconcile_summary"] = {
+                "fields": [
+                    {key: value for key, value in field.items()
+                     if value is not None and key not in ("attempts", "control_type", "desired_value")
+                     and (key != "reason" or field.get("breaker_code"))}
+                    for field in summary["fields"]
+                ],
+                "conflicting_fields": summary["conflicting_fields"],
+            }
+        compact["outcome"] = model_outcome
+    return compact
 
 
 def is_sandboxed_local_target(vnc_host: str, socket_path: Optional[str] = None) -> bool:
@@ -549,7 +591,7 @@ def run_agent(args: argparse.Namespace) -> int:
                     )
                 return next_text
 
-            def handle_api_error(err: InteractionsApiError, interaction_id: Optional[str]) -> str:
+            def handle_api_error(err: InteractionsApiError, interaction_id: Optional[str], wall_elapsed_s: float) -> str:
                 if err.is_safety_blocked:
                     print(f"\n[SAFETY BLOCKED] Gemini API rejected this request: {err.error_message}")
                     print("  Please modify/rephrase your instruction or perform the action manually in vncviewer.")
@@ -575,6 +617,7 @@ def run_agent(args: argparse.Namespace) -> int:
                         "http_status": err.status_code,
                         "error_code": err.error_code,
                         "error": err.error_message,
+                        "wall_elapsed_s": wall_elapsed_s,
                     }
                     if interaction_id:
                         entry["interaction_id"] = interaction_id
@@ -647,7 +690,46 @@ def run_agent(args: argparse.Namespace) -> int:
                         raise ValueError("--prompt must not be empty in non-collaborative mode")
 
                 task_index += 1
+                task_start_mono = time.monotonic()
+                task_usage_totals: Dict[str, int] = {
+                    "api_calls": 0,
+                    "usage_reports": 0,
+                    "total_tokens": 0,
+                    "total_input_tokens": 0,
+                    "total_cached_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_thought_tokens": 0,
+                    "total_tool_use_tokens": 0,
+                }
+
+                def _record_turn_usage(u: Optional[Dict[str, Any]]) -> None:
+                    task_usage_totals["api_calls"] += 1
+                    if not isinstance(u, dict):
+                        return
+                    task_usage_totals["usage_reports"] += 1
+                    for k in (
+                        "total_tokens",
+                        "total_input_tokens",
+                        "total_cached_tokens",
+                        "total_output_tokens",
+                        "total_thought_tokens",
+                        "total_tool_use_tokens",
+                    ):
+                        val = u.get(k)
+                        if isinstance(val, (int, float)) and not isinstance(val, bool):
+                            task_usage_totals[k] += int(val)
+
+                def _format_usage_summary(wall_s: float) -> str:
+                    t = task_usage_totals
+                    return (
+                        f"[TOKENS] api_calls={t['api_calls']} usage_reports={t['usage_reports']} total={t['total_tokens']} "
+                        f"(in={t['total_input_tokens']}, cached={t['total_cached_tokens']}, "
+                        f"out={t['total_output_tokens']}, thought={t['total_thought_tokens']}, "
+                        f"tool={t['total_tool_use_tokens']}) | wall={wall_s:.2f}s"
+                    )
+
                 consecutive_no_change_turns = 0
+                previous_s1_breaker: Optional[str] = None
                 init_thinking_lv = select_thinking_level(None)
                 init_png, _ = executor.capture_png(settle_delay=0.2, max_wait=1.0)
                 if log_dir:
@@ -671,7 +753,9 @@ def run_agent(args: argparse.Namespace) -> int:
                     )
                 except InteractionsApiError as e:
                     current_prompt = None
-                    wait_intent = handle_api_error(e, None)
+                    elapsed = round(time.monotonic() - task_start_mono, 3)
+                    wait_intent = handle_api_error(e, None, elapsed)
+                    print(_format_usage_summary(elapsed))
                     if not stay_interactive or e.is_auth_error:
                         executor.set_overlay("done", "error", wait_intent)
                         return 2
@@ -693,8 +777,23 @@ def run_agent(args: argparse.Namespace) -> int:
                 turn_thinking_lv = init_thinking_lv
 
                 for task_turn in range(1, args.max_turns + 2):
+                    turn_usage = extract_usage(interaction)
+                    _record_turn_usage(turn_usage)
+                    wall_elapsed_s = round(time.monotonic() - task_start_mono, 3)
                     function_calls = extract_function_calls(interaction)
                     if task_turn > args.max_turns and function_calls:
+                        if trace_file:
+                            max_entry: Dict[str, Any] = {
+                                "turn": global_turn + 1,
+                                "task": task_index,
+                                "interaction_id": interaction.get("id"),
+                                "status": "max_turns_reached",
+                                "wall_elapsed_s": wall_elapsed_s,
+                            }
+                            if turn_usage is not None:
+                                max_entry["usage"] = turn_usage
+                            trace_file.write(json.dumps(max_entry, ensure_ascii=False) + "\n")
+                            trace_file.flush()
                         break
                     global_turn += 1
                     print(
@@ -707,6 +806,7 @@ def run_agent(args: argparse.Namespace) -> int:
                         last_completed_interaction_id = interaction.get("id")
                         consecutive_no_change_turns = 0
                         print(f"Agent finished:\n{final_text}")
+                        print(_format_usage_summary(wall_elapsed_s))
                         final_png, _ = executor.capture_png(settle_delay=0.2, max_wait=0.8)
                         if log_dir:
                             with open(os.path.join(log_dir, "final.png"), "wb") as f:
@@ -715,19 +815,17 @@ def run_agent(args: argparse.Namespace) -> int:
                                 with open(os.path.join(log_dir, f"task_{task_index:02d}_final.png"), "wb") as f:
                                     f.write(final_png)
                         if trace_file:
-                            trace_file.write(
-                                json.dumps(
-                                    {
-                                        "turn": global_turn,
-                                        "task": task_index,
-                                        "status": interaction.get("status"),
-                                        "thinking_level": turn_thinking_lv,
-                                        "final_text": final_text,
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
-                            )
+                            done_entry: Dict[str, Any] = {
+                                "turn": global_turn,
+                                "task": task_index,
+                                "status": interaction.get("status"),
+                                "thinking_level": turn_thinking_lv,
+                                "final_text": final_text,
+                                "wall_elapsed_s": wall_elapsed_s,
+                            }
+                            if turn_usage is not None:
+                                done_entry["usage"] = turn_usage
+                            trace_file.write(json.dumps(done_entry, ensure_ascii=False) + "\n")
                             trace_file.flush()
                         if not stay_interactive:
                             coordinator.set_status(AGENT_COMPUTER_USE, "done", task="Task completed")
@@ -1050,25 +1148,37 @@ def run_agent(args: argparse.Namespace) -> int:
                         escalation_reason = "desktop_resized"
                     elif collaborator_intervened:
                         escalation_reason = "human_takeover"
-                    elif s1_breaker_reason:
+                    elif s1_breaker_reason and (
+                        s1_breaker_reason == previous_s1_breaker
+                        or s1_breaker_reason == "system_one_error"
+                    ):
                         escalation_reason = s1_breaker_reason
                     elif consecutive_no_change_turns >= 2:
                         escalation_reason = "stalled_ui"
 
                     next_thinking_lv = select_thinking_level(escalation_reason) if not halted_reason else turn_thinking_lv
+                    previous_s1_breaker = s1_breaker_reason
 
                     if trace_file:
                         trace_entry: Dict[str, Any] = {
                             "turn": global_turn,
                             "task": task_index,
                             "interaction_id": interaction.get("id"),
-                            "actions": turn_log_actions,
+                            "actions": [
+                                {**action, "args": trace_action_args(action["name"], action["args"])}
+                                for action in turn_log_actions
+                            ],
                             "frame_seq": post_hdr.get("frame_seq"),
                             "captured_screenshot": need_capture,
                             "thinking_level": turn_thinking_lv,
                             "halted_reason": halted_reason,
                             "user_notes": collab_notes,
+                            "wall_elapsed_s": wall_elapsed_s,
                         }
+                        if turn_usage is not None:
+                            trace_entry["usage"] = turn_usage
+                        if s1_breaker_reason:
+                            trace_entry["system_one_breaker"] = s1_breaker_reason
                         if escalation_reason:
                             trace_entry["escalated_reason"] = escalation_reason
                             trace_entry["next_thinking_level"] = next_thinking_lv
@@ -1077,6 +1187,7 @@ def run_agent(args: argparse.Namespace) -> int:
 
                     if halted_reason:
                         print(f"Agent halted: {halted_reason}")
+                        print(_format_usage_summary(wall_elapsed_s))
                         coordinator.set_status(AGENT_COMPUTER_USE, "error", task="Halted", detail=halted_reason)
                         if not stay_interactive:
                             return 2
@@ -1095,7 +1206,11 @@ def run_agent(args: argparse.Namespace) -> int:
 
                     function_responses = []
                     for i, (fname, call_id, res, _) in enumerate(results):
-                        res_blocks: List[Dict[str, Any]] = [{"type": "text", "text": json.dumps(res)}]
+                        if fname in SYSTEM_ONE_FUNCTION_NAMES:
+                            result_text = json.dumps(system_one_model_result(res), separators=(",", ":"))
+                        else:
+                            result_text = json.dumps(res)
+                        res_blocks: List[Dict[str, Any]] = [{"type": "text", "text": result_text}]
                         if i in s1_evidence_map:
                             for ev_idx, (ev_label, ev_png) in enumerate(s1_evidence_map[i][:2]):
                                 if log_dir:
@@ -1132,7 +1247,9 @@ def run_agent(args: argparse.Namespace) -> int:
                         )
                         turn_thinking_lv = next_thinking_lv
                     except InteractionsApiError as e:
-                        wait_intent = handle_api_error(e, interaction.get("id"))
+                        elapsed = round(time.monotonic() - task_start_mono, 3)
+                        wait_intent = handle_api_error(e, interaction.get("id"), elapsed)
+                        print(_format_usage_summary(elapsed))
                         if not stay_interactive or e.is_auth_error:
                             executor.set_overlay("done", "error", wait_intent)
                             return 2
@@ -1141,6 +1258,7 @@ def run_agent(args: argparse.Namespace) -> int:
                         break
 
                 if not task_completed and not task_halted:
+                    print(_format_usage_summary(round(time.monotonic() - task_start_mono, 3)))
                     if not stay_interactive:
                         print(f"Reached turn limit ({args.max_turns}) before task completion.")
                         return 1
@@ -1384,7 +1502,7 @@ def main() -> int:
     parser.add_argument(
         "--system-one",
         action="store_true",
-        help="Require TypeSafe System One host tools (wait_until, loop_until, batch_apply)",
+        help="Require TypeSafe System One host tools (wait_until, loop_until, batch_apply, reconcile_ui_state)",
     )
     parser.add_argument(
         "--no-system-one",
