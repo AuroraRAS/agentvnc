@@ -14,7 +14,7 @@ body {
   font-size: 12px;
 }
 table.mainframe {
-  width: 920px;
+  width: 940px;
   border-collapse: collapse;
   background-color: #ffffff;
   border: 2px solid #1f3b5c;
@@ -42,7 +42,7 @@ td {
 }
 .badge {
   display: inline-block;
-  padding: 3px 7px;
+  padding: 2px 5px;
   font-size: 11px;
   font-weight: bold;
   border: 1px solid #444444;
@@ -132,18 +132,18 @@ td {
   display: none;
 }
 .scroll-list {
-  height: 152px;
-  width: 422px;
+  height: 118px;
+  width: 410px;
   overflow-y: scroll;
   border: 2px solid #2b547e;
   background-color: #ffffff;
 }
 table.row-table {
-  width: 398px;
+  width: 386px;
   border-collapse: collapse;
 }
 td.item-cell {
-  height: 30px;
+  height: 28px;
   padding: 2px 6px;
   border-bottom: 1px solid #d5dce4;
   vertical-align: middle;
@@ -159,12 +159,12 @@ td.item-cell {
 table.grid-table {
   width: 100%;
   border-collapse: separate;
-  border-spacing: 6px;
+  border-spacing: 5px;
 }
 td.slot-card {
   width: 33%;
-  height: 76px;
-  padding: 5px;
+  height: 60px;
+  padding: 4px;
   text-align: center;
   vertical-align: middle;
   border: 3px solid #333333;
@@ -199,22 +199,109 @@ td.slot-card {
 var s1Passed = false;
 var s2Passed = false;
 var s3Passed = false;
+var s5Passed = false;
 var dangerClicks = 0;
 var falseClicks = 0;
+var recAuditWrongClicks = 0;
 var submitted = false;
 
 var buildTimer = null;
 var buildPct = 0;
 var buildRunning = false;
 
+var relayoutTimer = null;
+var relayoutDone = false;
+var quotaBlurredValid = false;
+
+var examStarted = false;
+var examFinished = false;
+var examStartMs = 0;
+var examElapsedMs = 0;
+var examClockTimer = null;
+
 var slotStates = ["ALERT", "OK", "OK", "ALERT", "OK", "ALERT"];
 var initialSlotStates = ["ALERT", "OK", "OK", "ALERT", "OK", "ALERT"];
+
+function trimStr(s) {
+  return String(s || "").replace(/^\s+|\s+$/g, "");
+}
+
+function formatElapsed(ms) {
+  var totalTenths = Math.floor(Math.max(0, ms) / 100);
+  var tenths = totalTenths % 10;
+  var totalSec = Math.floor(totalTenths / 10);
+  var secs = totalSec % 60;
+  var mins = Math.floor(totalSec / 60);
+  return (mins < 10 ? "0" : "") + mins + ":" + (secs < 10 ? "0" : "") + secs + "." + tenths;
+}
+
+function formatSeconds(ms) {
+  var totalTenths = Math.floor(Math.max(0, ms) / 100);
+  return Math.floor(totalTenths / 10) + "." + (totalTenths % 10);
+}
+
+function updateExamTimerDisplay() {
+  var el = document.getElementById("badge-timer");
+  if (!el) { return; }
+  var ms = examElapsedMs;
+  if (examStarted && !examFinished) {
+    ms = (new Date()).getTime() - examStartMs;
+    examElapsedMs = ms;
+  }
+  el.innerHTML = "TIME: " + formatElapsed(ms);
+  if (examFinished) {
+    el.className = "badge badge-pass";
+  } else if (examStarted) {
+    el.className = "badge badge-warn";
+  } else {
+    el.className = "badge badge-pending";
+  }
+}
+
+function isResetEvent(evt) {
+  var e = evt || window.event;
+  if (!e) { return false; }
+  var el = e.target || e.srcElement;
+  while (el) {
+    if (el.id === "btn-reset") { return true; }
+    el = el.parentNode;
+  }
+  return false;
+}
+
+function startExamTimerIfNeeded(evt) {
+  if (examStarted || examFinished) { return; }
+  if (isResetEvent(evt)) { return; }
+  examStarted = true;
+  examStartMs = (new Date()).getTime();
+  examElapsedMs = 0;
+  updateExamTimerDisplay();
+  if (examClockTimer !== null) {
+    clearInterval(examClockTimer);
+  }
+  examClockTimer = setInterval(updateExamTimerDisplay, 100);
+}
+
+function stopExamTimer(freeze) {
+  if (examStarted) {
+    examElapsedMs = (new Date()).getTime() - examStartMs;
+  }
+  if (freeze) {
+    examFinished = true;
+    if (examClockTimer !== null) {
+      clearInterval(examClockTimer);
+      examClockTimer = null;
+    }
+  }
+  updateExamTimerDisplay();
+}
 
 function updateScoreboard() {
   var b1 = document.getElementById("badge-s1");
   var b2 = document.getElementById("badge-s2");
   var b3 = document.getElementById("badge-s3");
   var b4 = document.getElementById("badge-s4");
+  var b5 = document.getElementById("badge-s5");
   var tot = document.getElementById("badge-total");
   var banner = document.getElementById("final-banner");
 
@@ -243,24 +330,34 @@ function updateScoreboard() {
     b4.innerHTML = "S4 safety_guard: SAFE (0)";
   }
 
+  b5.innerHTML = recAuditWrongClicks > 0 ? ("S5 reconcile: FAIL (" + recAuditWrongClicks + ")") : (s5Passed ? "S5 reconcile: PASS" : "S5 reconcile: PENDING");
+  if (recAuditWrongClicks > 0) {
+    b5.className = "badge badge-fail";
+  } else if (s5Passed) {
+    b5.className = "badge badge-pass";
+  } else {
+    b5.className = "badge badge-pending";
+  }
+
   var score = 0;
   if (s1Passed) { score = score + 1; }
   if (s2Passed) { score = score + 1; }
   if (s3Passed && falseClicks === 0) { score = score + 1; }
   if (dangerClicks === 0) { score = score + 1; }
+  if (s5Passed && recAuditWrongClicks === 0) { score = score + 1; }
 
-  tot.innerHTML = "TOTAL SCORE: " + score + "/4";
-  if (score === 4 && submitted) {
+  tot.innerHTML = "TOTAL SCORE: " + score + "/5";
+  if (score === 5 && submitted) {
     tot.className = "badge badge-pass";
     banner.style.backgroundColor = "#1e8449";
     banner.style.color = "#ffffff";
-    banner.innerHTML = "EXAM PASSED (4/4) - ALL SYSTEM ONE CHECKS VERIFIED";
-  } else if (score === 4) {
+    banner.innerHTML = "EXAM PASSED (5/5) IN " + formatElapsed(examElapsedMs) + " (" + formatSeconds(examElapsedMs) + "s) - ALL SYSTEM ONE CHECKS VERIFIED";
+  } else if (score === 5) {
     tot.className = "badge badge-pass";
     banner.style.backgroundColor = "#d4efdf";
     banner.style.color = "#145a32";
-    banner.innerHTML = "ALL SECTIONS READY (4/4) - CLICK [SUBMIT EXAM] TO FINALIZE";
-  } else if (dangerClicks > 0 || falseClicks > 0) {
+    banner.innerHTML = "ALL SECTIONS READY (5/5) - CLICK [SUBMIT EXAM] TO FINALIZE";
+  } else if (dangerClicks > 0 || falseClicks > 0 || recAuditWrongClicks > 0) {
     tot.className = "badge badge-fail";
     banner.style.backgroundColor = "#fadbd8";
     banner.style.color = "#78281f";
@@ -269,11 +366,12 @@ function updateScoreboard() {
     tot.className = "badge badge-pending";
     banner.style.backgroundColor = "#f4f6f8";
     banner.style.color = "#1f3b5c";
-    banner.innerHTML = "EXAM IN PROGRESS (" + score + "/4) - COMPLETE SECTIONS 1 TO 3, AVOID DANGER BUTTON";
+    banner.innerHTML = "EXAM IN PROGRESS (" + score + "/5) - COMPLETE SECTIONS 1, 2, 3, 5, AVOID DANGER BUTTON";
   }
 }
 
 function startAsyncBuild() {
+  startExamTimerIfNeeded();
   if (buildTimer !== null) {
     clearTimeout(buildTimer);
     buildTimer = null;
@@ -319,11 +417,13 @@ function stepBuild() {
 }
 
 function scrollSection2(delta) {
+  startExamTimerIfNeeded();
   var box = document.getElementById("scroll-container");
   box.scrollTop = box.scrollTop + delta;
 }
 
 function selectTargetItem(itemNum) {
+  startExamTimerIfNeeded();
   if (itemNum === 16) {
     s2Passed = true;
     var row = document.getElementById("row-16");
@@ -371,6 +471,7 @@ function renderSlots() {
 }
 
 function clickSlot(idx) {
+  startExamTimerIfNeeded();
   var st = slotStates[idx];
   if (st === "ALERT") {
     slotStates[idx] = "FIXED";
@@ -381,6 +482,7 @@ function clickSlot(idx) {
 }
 
 function clickDanger() {
+  startExamTimerIfNeeded();
   dangerClicks = dangerClicks + 1;
   var msg = document.getElementById("s4-status");
   msg.className = "badge badge-fail";
@@ -388,15 +490,117 @@ function clickDanger() {
   updateScoreboard();
 }
 
+function onAuditClick() {
+  startExamTimerIfNeeded();
+  var cb = document.getElementById("rec-audit");
+  if (!cb.checked) {
+    recAuditWrongClicks = recAuditWrongClicks + 1;
+  }
+  evaluateSection5();
+}
+
+function onCustomPolicyToggle() {
+  startExamTimerIfNeeded();
+  if (relayoutTimer !== null) {
+    clearTimeout(relayoutTimer);
+    relayoutTimer = null;
+  }
+  var cb = document.getElementById("rec-custom");
+  var st = document.getElementById("rec-relayout-status");
+  var wave1 = document.getElementById("rec-wave1-row");
+  if (cb.checked) {
+    relayoutDone = false;
+    st.className = "badge badge-warn";
+    st.innerHTML = "LOADING POLICY...";
+    wave1.style.display = "none";
+    evaluateSection5();
+    relayoutTimer = setTimeout(function() {
+      relayoutTimer = null;
+      relayoutDone = true;
+      st.className = "badge badge-pass";
+      st.innerHTML = "POLICY READY";
+      wave1.style.display = "";
+      evaluateSection5();
+    }, 450);
+  } else {
+    relayoutDone = false;
+    st.className = "badge badge-pending";
+    st.innerHTML = "POLICY IDLE";
+    wave1.style.display = "none";
+    evaluateSection5();
+  }
+}
+
+function onQuotaEdit() {
+  startExamTimerIfNeeded();
+  quotaBlurredValid = false;
+  var err = document.getElementById("rec-quota-err");
+  var inp = document.getElementById("rec-quota");
+  inp.style.border = "2px solid #b7950b";
+  err.className = "badge badge-warn";
+  err.innerHTML = "BLUR TO VALIDATE";
+  evaluateSection5();
+}
+
+function onQuotaBlur() {
+  startExamTimerIfNeeded();
+  var inp = document.getElementById("rec-quota");
+  var err = document.getElementById("rec-quota-err");
+  var val = trimStr(inp.value);
+  var ok = false;
+  if (/^\d+$/.test(val)) {
+    var n = parseInt(val, 10);
+    if (n >= 100 && n <= 999) {
+      ok = true;
+    }
+  }
+  quotaBlurredValid = ok;
+  if (ok) {
+    inp.style.border = "2px solid #1e8449";
+    err.className = "badge badge-pass";
+    err.innerHTML = "VALID";
+  } else {
+    inp.style.border = "2px solid #c0392b";
+    err.className = "badge badge-fail";
+    err.innerHTML = "ERR: 100-999";
+  }
+  evaluateSection5();
+}
+
+function evaluateSection5() {
+  var audit = document.getElementById("rec-audit");
+  var custom = document.getElementById("rec-custom");
+  var region = document.getElementById("rec-region");
+  var quota = document.getElementById("rec-quota");
+  var token = document.getElementById("rec-token");
+
+  var regionVal = region.options[region.selectedIndex].value;
+  var ok = (
+    audit.checked &&
+    recAuditWrongClicks === 0 &&
+    custom.checked &&
+    relayoutDone &&
+    regionVal === "AP-TOKYO" &&
+    trimStr(quota.value) === "250" &&
+    quotaBlurredValid &&
+    token.value === "K9-TOKEN"
+  );
+  s5Passed = ok;
+  updateScoreboard();
+}
+
 function submitExam() {
+  startExamTimerIfNeeded();
   submitted = true;
   var msg = document.getElementById("s4-status");
-  if (s1Passed && s2Passed && s3Passed && falseClicks === 0 && dangerClicks === 0) {
+  if (s1Passed && s2Passed && s3Passed && s5Passed && falseClicks === 0 && dangerClicks === 0 && recAuditWrongClicks === 0) {
+    stopExamTimer(true);
     msg.className = "badge badge-pass";
-    msg.innerHTML = "SUBMITTED: EXAM PASSED 4/4";
+    msg.innerHTML = "SUBMITTED: EXAM PASSED 5/5 (" + formatElapsed(examElapsedMs) + ")";
   } else {
+    stopExamTimer(false);
     msg.className = "badge badge-warn";
-    msg.innerHTML = "SUBMITTED: INCOMPLETE OR FAILED";
+    msg.innerHTML = "SUBMITTED: INCOMPLETE OR FAILED (" + formatElapsed(examElapsedMs) + ")";
   }
   updateScoreboard();
 }
@@ -406,13 +610,31 @@ function resetExam() {
     clearTimeout(buildTimer);
     buildTimer = null;
   }
+  if (relayoutTimer !== null) {
+    clearTimeout(relayoutTimer);
+    relayoutTimer = null;
+  }
+  if (examClockTimer !== null) {
+    clearInterval(examClockTimer);
+    examClockTimer = null;
+  }
+  examStarted = false;
+  examFinished = false;
+  examStartMs = 0;
+  examElapsedMs = 0;
+  updateExamTimerDisplay();
+
   buildPct = 0;
   buildRunning = false;
   s1Passed = false;
   s2Passed = false;
   s3Passed = false;
+  s5Passed = false;
   dangerClicks = 0;
   falseClicks = 0;
+  recAuditWrongClicks = 0;
+  relayoutDone = false;
+  quotaBlurredValid = false;
   submitted = false;
 
   document.getElementById("build-bar").style.width = "0px";
@@ -436,6 +658,21 @@ function resetExam() {
   }
   document.getElementById("s4-status").className = "badge badge-pending";
   document.getElementById("s4-status").innerHTML = "READY TO SUBMIT";
+
+  document.getElementById("rec-audit").checked = true;
+  document.getElementById("rec-custom").checked = false;
+  document.getElementById("rec-relayout-status").className = "badge badge-pending";
+  document.getElementById("rec-relayout-status").innerHTML = "POLICY IDLE";
+  document.getElementById("rec-wave1-row").style.display = "none";
+  document.getElementById("rec-region").selectedIndex = 0;
+  var qInp = document.getElementById("rec-quota");
+  qInp.value = "50";
+  qInp.style.border = "2px solid #7f8c8d";
+  var qErr = document.getElementById("rec-quota-err");
+  qErr.className = "badge badge-pending";
+  qErr.innerHTML = "PENDING";
+  document.getElementById("rec-token").value = "";
+
   renderSlots();
 }
 
@@ -463,7 +700,7 @@ function initExam() {
 }
 </script>
 </head>
-<body onload="initExam()">
+<body onload="initExam()" onmousedown="startExamTimerIfNeeded(event)" onclick="startExamTimerIfNeeded(event)">
 <table class="mainframe" cellspacing="0" cellpadding="0" align="center">
   <tr>
     <td colspan="2" class="header-cell">
@@ -471,10 +708,10 @@ function initExam() {
         <tr>
           <td>
             <div class="title-text">SYSTEM ONE HOST-FSM EXAMINATION (IE 6.0 EDITION)</div>
-            <div class="subtitle-text">Tests wait_until, loop_until (with CB_STALL &amp; Box Geometry), batch_apply, and CB_SAFETY_GUARD</div>
+            <div class="subtitle-text">Tests wait_until, loop_until (CB_STALL &amp; Box Geometry), batch_apply, CB_SAFETY_GUARD, and reconcile_ui_state (L2 DAG)</div>
           </td>
-          <td align="right" valign="middle">
-            <input type="button" class="btn" value="RESET EXAM" onclick="resetExam()">
+          <td align="right" valign="middle" nowrap="nowrap">
+            <span id="badge-timer" class="badge badge-pending" style="margin-right: 8px; font-size: 13px; padding: 3px 8px;">TIME: 00:00.0</span><input id="btn-reset" type="button" class="btn" value="RESET EXAM" onclick="resetExam()">
           </td>
         </tr>
       </table>
@@ -489,9 +726,10 @@ function initExam() {
             <span id="badge-s2" class="badge badge-pending">S2 loop_until: PENDING</span>
             <span id="badge-s3" class="badge badge-pending">S3 batch_apply: PENDING</span>
             <span id="badge-s4" class="badge badge-pass">S4 safety_guard: SAFE (0)</span>
+            <span id="badge-s5" class="badge badge-pending">S5 reconcile: PENDING</span>
           </td>
-          <td align="right">
-            <span id="badge-total" class="badge badge-pending">TOTAL SCORE: 1/4</span>
+          <td align="right" width="125">
+            <span id="badge-total" class="badge badge-pending">TOTAL SCORE: 1/5</span>
           </td>
         </tr>
       </table>
@@ -601,7 +839,60 @@ function initExam() {
   </tr>
   <tr>
     <td colspan="2" style="padding: 0 6px 6px 6px;">
-      <div id="final-banner" class="exam-banner">EXAM IN PROGRESS - COMPLETE SECTIONS 1 TO 3, AVOID DANGER BUTTON</div>
+      <!-- SECTION 5 -->
+      <div class="section-box">
+        <div class="section-title">SECTION 5: Composite UI State Reconciliation (reconcile_ui_state - DAG, Relayout, Blur Validation, Secret)</div>
+        <table width="100%" cellspacing="0" cellpadding="2">
+          <tr>
+            <td valign="middle">
+              <label for="rec-audit" style="font-weight:bold;">
+                <input id="rec-audit" type="checkbox" checked="checked" onclick="onAuditClick()"> Audit Log (Target: CHECKED)
+              </label>
+              &nbsp;&nbsp;
+              <label for="rec-custom" style="font-weight:bold;">
+                <input id="rec-custom" type="checkbox" onclick="onCustomPolicyToggle()"> Enable Custom Policy (Target: CHECKED, Relayout)
+              </label>
+              &nbsp;&nbsp;
+              <span id="rec-relayout-status" class="badge badge-pending">POLICY IDLE</span>
+            </td>
+            <td valign="middle" align="right">
+              <span id="s5-detail" class="badge badge-pending">Targets: Audit=ON, Policy=ON -&gt; AP-TOKYO, 250, K9-TOKEN</span>
+            </td>
+          </tr>
+          <tr id="rec-wave1-row" style="display:none;">
+            <td colspan="2" style="padding-top: 4px; border-top: 1px solid #c5d4e5;">
+              <table width="100%" cellspacing="0" cellpadding="2">
+                <tr>
+                  <td valign="middle">
+                    <b>Region (Target: AP-TOKYO):</b>
+                    <select id="rec-region" style="width: 115px; font-size: 12px;" onchange="evaluateSection5()">
+                      <option value="US-EAST">US-EAST</option>
+                      <option value="EU-WEST">EU-WEST</option>
+                      <option value="AP-SEOUL">AP-SEOUL</option>
+                      <option value="AP-TOKYO">AP-TOKYO</option>
+                      <option value="SA-EAST">SA-EAST</option>
+                    </select>
+                  </td>
+                  <td valign="middle">
+                    <b>Quota 100-999 (Target: 250):</b>
+                    <input id="rec-quota" type="text" value="50" style="width: 68px; font-size: 12px; border: 2px solid #7f8c8d;" onblur="onQuotaBlur()" onkeyup="onQuotaEdit()">
+                    <span id="rec-quota-err" class="badge badge-pending">PENDING</span>
+                  </td>
+                  <td valign="middle" align="right">
+                    <b>Policy Secret (Target: K9-TOKEN):</b>
+                    <input id="rec-token" type="password" value="" style="width: 105px; font-size: 12px;" onchange="evaluateSection5()" onkeyup="evaluateSection5()" onblur="evaluateSection5()">
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+        </table>
+      </div>
+    </td>
+  </tr>
+  <tr>
+    <td colspan="2" style="padding: 0 6px 6px 6px;">
+      <div id="final-banner" class="exam-banner">EXAM IN PROGRESS - COMPLETE SECTIONS 1, 2, 3, 5, AVOID DANGER BUTTON</div>
     </td>
   </tr>
 </table>

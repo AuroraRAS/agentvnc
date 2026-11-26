@@ -67,6 +67,7 @@ from .interactions import (
     InteractionsClient,
     extract_function_calls,
     extract_model_text,
+    extract_usage,
     load_api_key,
 )
 from .system_one_client import (
@@ -647,6 +648,42 @@ def run_agent(args: argparse.Namespace) -> int:
                         raise ValueError("--prompt must not be empty in non-collaborative mode")
 
                 task_index += 1
+                task_start_mono = time.monotonic()
+                task_usage_totals: Dict[str, int] = {
+                    "api_calls": 0,
+                    "total_tokens": 0,
+                    "total_input_tokens": 0,
+                    "total_cached_tokens": 0,
+                    "total_output_tokens": 0,
+                    "total_thought_tokens": 0,
+                    "total_tool_use_tokens": 0,
+                }
+
+                def _record_turn_usage(u: Optional[Dict[str, Any]]) -> None:
+                    task_usage_totals["api_calls"] += 1
+                    if not isinstance(u, dict):
+                        return
+                    for k in (
+                        "total_tokens",
+                        "total_input_tokens",
+                        "total_cached_tokens",
+                        "total_output_tokens",
+                        "total_thought_tokens",
+                        "total_tool_use_tokens",
+                    ):
+                        val = u.get(k)
+                        if isinstance(val, (int, float)) and not isinstance(val, bool):
+                            task_usage_totals[k] += int(val)
+
+                def _format_usage_summary(wall_s: float) -> str:
+                    t = task_usage_totals
+                    return (
+                        f"[TOKENS] api_calls={t['api_calls']} total={t['total_tokens']} "
+                        f"(in={t['total_input_tokens']}, cached={t['total_cached_tokens']}, "
+                        f"out={t['total_output_tokens']}, thought={t['total_thought_tokens']}, "
+                        f"tool={t['total_tool_use_tokens']}) | wall={wall_s:.2f}s"
+                    )
+
                 consecutive_no_change_turns = 0
                 init_thinking_lv = select_thinking_level(None)
                 init_png, _ = executor.capture_png(settle_delay=0.2, max_wait=1.0)
@@ -693,8 +730,23 @@ def run_agent(args: argparse.Namespace) -> int:
                 turn_thinking_lv = init_thinking_lv
 
                 for task_turn in range(1, args.max_turns + 2):
+                    turn_usage = extract_usage(interaction)
+                    _record_turn_usage(turn_usage)
+                    wall_elapsed_s = round(time.monotonic() - task_start_mono, 3)
                     function_calls = extract_function_calls(interaction)
                     if task_turn > args.max_turns and function_calls:
+                        if trace_file:
+                            max_entry: Dict[str, Any] = {
+                                "turn": global_turn + 1,
+                                "task": task_index,
+                                "interaction_id": interaction.get("id"),
+                                "status": "max_turns_reached",
+                                "wall_elapsed_s": wall_elapsed_s,
+                            }
+                            if turn_usage is not None:
+                                max_entry["usage"] = turn_usage
+                            trace_file.write(json.dumps(max_entry, ensure_ascii=False) + "\n")
+                            trace_file.flush()
                         break
                     global_turn += 1
                     print(
@@ -707,6 +759,7 @@ def run_agent(args: argparse.Namespace) -> int:
                         last_completed_interaction_id = interaction.get("id")
                         consecutive_no_change_turns = 0
                         print(f"Agent finished:\n{final_text}")
+                        print(_format_usage_summary(wall_elapsed_s))
                         final_png, _ = executor.capture_png(settle_delay=0.2, max_wait=0.8)
                         if log_dir:
                             with open(os.path.join(log_dir, "final.png"), "wb") as f:
@@ -715,19 +768,17 @@ def run_agent(args: argparse.Namespace) -> int:
                                 with open(os.path.join(log_dir, f"task_{task_index:02d}_final.png"), "wb") as f:
                                     f.write(final_png)
                         if trace_file:
-                            trace_file.write(
-                                json.dumps(
-                                    {
-                                        "turn": global_turn,
-                                        "task": task_index,
-                                        "status": interaction.get("status"),
-                                        "thinking_level": turn_thinking_lv,
-                                        "final_text": final_text,
-                                    },
-                                    ensure_ascii=False,
-                                )
-                                + "\n"
-                            )
+                            done_entry: Dict[str, Any] = {
+                                "turn": global_turn,
+                                "task": task_index,
+                                "status": interaction.get("status"),
+                                "thinking_level": turn_thinking_lv,
+                                "final_text": final_text,
+                                "wall_elapsed_s": wall_elapsed_s,
+                            }
+                            if turn_usage is not None:
+                                done_entry["usage"] = turn_usage
+                            trace_file.write(json.dumps(done_entry, ensure_ascii=False) + "\n")
                             trace_file.flush()
                         if not stay_interactive:
                             coordinator.set_status(AGENT_COMPUTER_USE, "done", task="Task completed")
@@ -1068,7 +1119,10 @@ def run_agent(args: argparse.Namespace) -> int:
                             "thinking_level": turn_thinking_lv,
                             "halted_reason": halted_reason,
                             "user_notes": collab_notes,
+                            "wall_elapsed_s": wall_elapsed_s,
                         }
+                        if turn_usage is not None:
+                            trace_entry["usage"] = turn_usage
                         if escalation_reason:
                             trace_entry["escalated_reason"] = escalation_reason
                             trace_entry["next_thinking_level"] = next_thinking_lv
@@ -1077,6 +1131,7 @@ def run_agent(args: argparse.Namespace) -> int:
 
                     if halted_reason:
                         print(f"Agent halted: {halted_reason}")
+                        print(_format_usage_summary(wall_elapsed_s))
                         coordinator.set_status(AGENT_COMPUTER_USE, "error", task="Halted", detail=halted_reason)
                         if not stay_interactive:
                             return 2
@@ -1141,6 +1196,7 @@ def run_agent(args: argparse.Namespace) -> int:
                         break
 
                 if not task_completed and not task_halted:
+                    print(_format_usage_summary(round(time.monotonic() - task_start_mono, 3)))
                     if not stay_interactive:
                         print(f"Reached turn limit ({args.max_turns}) before task completion.")
                         return 1
@@ -1384,7 +1440,7 @@ def main() -> int:
     parser.add_argument(
         "--system-one",
         action="store_true",
-        help="Require TypeSafe System One host tools (wait_until, loop_until, batch_apply)",
+        help="Require TypeSafe System One host tools (wait_until, loop_until, batch_apply, reconcile_ui_state)",
     )
     parser.add_argument(
         "--no-system-one",

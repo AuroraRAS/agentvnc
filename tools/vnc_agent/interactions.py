@@ -227,6 +227,14 @@ def extract_model_text(interaction: Dict[str, Any]) -> str:
     return "\n".join(texts).strip()
 
 
+def extract_usage(interaction: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    """Return a copy of the Gemini interaction's token usage dict, if present."""
+    raw = interaction.get("usage") or interaction.get("usage_metadata") or interaction.get("usageMetadata")
+    if isinstance(raw, dict) and raw:
+        return dict(raw)
+    return None
+
+
 def _is_server_tool_type(raw_type: Any) -> bool:
     t = str(raw_type or "").lower()
     if not t or t in ("function_call", "function_result", "text", "model_output", "thought", "user_input"):

@@ -42,6 +42,9 @@ CB_INTERRUPT = "CB_INTERRUPT"
 CB_SAFETY_GUARD = "CB_SAFETY_GUARD"
 CB_BUDGET_EXCEEDED = "CB_BUDGET_EXCEEDED"
 CB_BATCH_DRIFT = "CB_BATCH_DRIFT"
+CB_VALIDATION_ERROR = "CB_VALIDATION_ERROR"
+CB_OSCILLATION = "CB_OSCILLATION"
+CB_DEPENDENCY_BLOCKED = "CB_DEPENDENCY_BLOCKED"
 
 VALID_BREAKER_CODES = frozenset(
     {
@@ -51,6 +54,9 @@ VALID_BREAKER_CODES = frozenset(
         CB_SAFETY_GUARD,
         CB_BUDGET_EXCEEDED,
         CB_BATCH_DRIFT,
+        CB_VALIDATION_ERROR,
+        CB_OSCILLATION,
+        CB_DEPENDENCY_BLOCKED,
     }
 )
 
@@ -556,7 +562,7 @@ def _subdivide_slot_grid(page_roi: Sequence[int], rows: int, cols: int) -> List[
 
 
 class SystemOneHostEngine:
-    """Executes ``wait_until``, ``loop_until``, and ``batch_apply`` on a shared 6-state FSM."""
+    """Executes ``wait_until``, ``loop_until``, ``batch_apply``, and ``reconcile_ui_state`` on a shared FSM."""
 
     def __init__(
         self,
@@ -564,11 +570,13 @@ class SystemOneHostEngine:
         s1_client: SystemOneClient,
         sleep_fn: Callable[[float], None] = time.sleep,
         monotonic_fn: Callable[[], float] = time.monotonic,
+        ocr_fn: Optional[Callable[[FrameSnapshot, Sequence[int]], Optional[str]]] = None,
     ) -> None:
         self.executor = executor
         self.s1_client = s1_client
         self.sleep = sleep_fn
         self.monotonic = monotonic_fn
+        self.ocr_fn = ocr_fn
 
     def _capture_frame(self) -> FrameSnapshot:
         frame = self.executor.capture_rgb_frame()
@@ -696,6 +704,7 @@ class SystemOneHostEngine:
         step: int,
         caller_box_min_conf: Optional[float] = None,
         include_crop_box_check: bool = True,
+        confirm_crop_roi: Optional[Sequence[int]] = None,
     ) -> Tuple[bool, str]:
         """Run Box Geometry Pre-Click Checks: ROI containment, pixel bounds, and 20%-padded crop confirmation."""
         if box_norm is None:
@@ -719,14 +728,19 @@ class SystemOneHostEngine:
         if not bounds_ok:
             return False, bounds_msg
 
-        # Check (3): 20%-padded local crop re-passes a noul confirmation check (+ local box check)
-        padded = pad_bbox_norm(box_norm, BOX_CROP_PAD_RATIO, mode="pad")
+        # Check (3): local crop re-passes a noul confirmation check (+ local box check)
+        padded = list(confirm_crop_roi) if confirm_crop_roi is not None else pad_bbox_norm(box_norm, BOX_CROP_PAD_RATIO, mode="pad")
         prep = prepare_image_for_system_one(frame, padded)
         ref = "box_crop_img"
+        noul_instr = (
+            f"In `crop`: is the target UI control ({target_desc}) clearly visible?"
+            if confirm_crop_roi is not None
+            else f"In `crop`: does the centered UI element clearly show {target_desc}?"
+        )
         questions: Dict[str, Dict[str, Any]] = {
             "confirm_noul": {
                 "type": "noul",
-                "instructions": f"In `crop`: does the centered UI element clearly show {target_desc}?",
+                "instructions": noul_instr,
             },
         }
         if include_crop_box_check:
@@ -766,7 +780,7 @@ class SystemOneHostEngine:
                 "pass" if crop_box_conf >= crop_floor else ("gray" if crop_box_conf >= tau_low else "fail"),
             )
             if tau_low <= crop_box_conf < crop_floor:
-                padded_retry = pad_bbox_norm(box_norm, GRAY_RETRY_ROI_SCALE, mode="scale")
+                padded_retry = pad_bbox_norm(padded, GRAY_RETRY_ROI_SCALE, mode="scale")
                 prep_retry = prepare_image_for_system_one(frame, padded_retry)
                 retry_ans = self._query_s1(
                     state={"crop": "box_crop_retry_img"},
@@ -809,8 +823,12 @@ class SystemOneHostEngine:
         matched_label: Optional[str] = None,
         recent_confs: Optional[Deque[Dict[str, Any]]] = None,
         batch_summary: Optional[Dict[str, Any]] = None,
+        reconcile_summary: Optional[Dict[str, Any]] = None,
         annotated_crop_frame: Optional[FrameSnapshot] = None,
         annotated_crop_roi: Optional[Sequence[int]] = None,
+        attach_annotated_crop: Optional[bool] = None,
+        annotated_crop_label: Optional[str] = None,
+        skip_visual_encoding: bool = False,
         transient_frame: Optional[FrameSnapshot] = None,
         transient_roi: Optional[Sequence[int]] = None,
         fsm_trace: Optional[List[str]] = None,
@@ -825,38 +843,52 @@ class SystemOneHostEngine:
 
         evidence_images: List[Tuple[str, bytes]] = []
         evidence_labels: List[str] = []
-        if final_frame is not None:
-            evidence_images.append(("final_fullscreen", final_frame.to_png_bytes()))
-            evidence_labels.append("final_fullscreen")
+        if not skip_visual_encoding:
+            if final_frame is not None:
+                evidence_images.append(("final_fullscreen", final_frame.to_png_bytes()))
+                evidence_labels.append("final_fullscreen")
 
-        if breaker_code in (CB_AMBIGUITY, CB_SAFETY_GUARD):
-            crop_src = annotated_crop_frame or final_frame
-            if crop_src is not None:
-                roi_to_crop = list(annotated_crop_roi or matched_box or [0, 0, 1000, 1000])
-                crop_png = render_annotated_crop_png(
-                    crop_src,
+            should_attach_crop = (
+                attach_annotated_crop
+                if attach_annotated_crop is not None
+                else (breaker_code in (CB_AMBIGUITY, CB_SAFETY_GUARD))
+            )
+            if should_attach_crop:
+                crop_src = annotated_crop_frame or final_frame
+                if crop_src is not None:
+                    roi_to_crop = list(annotated_crop_roi or matched_box or [0, 0, 1000, 1000])
+                    crop_png = render_annotated_crop_png(
+                        crop_src,
+                        roi_to_crop,
+                        highlight_box_norm=matched_box,
+                        label=str(annotated_crop_label or breaker_code or "annotated"),
+                    )
+                    evidence_images.append(("annotated_roi_crop", crop_png))
+                    evidence_labels.append("annotated_roi_crop")
+            elif transient_frame is not None:
+                roi_to_crop = list(transient_roi or [0, 0, 1000, 1000])
+                t_png = render_annotated_crop_png(
+                    transient_frame,
                     roi_to_crop,
                     highlight_box_norm=matched_box,
-                    label=breaker_code,
+                    label="transient",
                 )
-                evidence_images.append(("annotated_roi_crop", crop_png))
-                evidence_labels.append("annotated_roi_crop")
-        elif transient_frame is not None:
-            roi_to_crop = list(transient_roi or [0, 0, 1000, 1000])
-            t_png = render_annotated_crop_png(
-                transient_frame,
-                roi_to_crop,
-                highlight_box_norm=matched_box,
-                label="transient",
-            )
-            evidence_images.append(("capture_transient", t_png))
-            evidence_labels.append("capture_transient")
+                evidence_images.append(("capture_transient", t_png))
+                evidence_labels.append("capture_transient")
 
-        # Enforce hard max 2 images invariant
-        evidence_images = evidence_images[:MAX_VISUAL_EVIDENCE_IMAGES]
-        evidence_labels = evidence_labels[:MAX_VISUAL_EVIDENCE_IMAGES]
+            # Enforce hard max 2 images invariant
+            evidence_images = evidence_images[:MAX_VISUAL_EVIDENCE_IMAGES]
+            evidence_labels = evidence_labels[:MAX_VISUAL_EVIDENCE_IMAGES]
 
         confs = list(recent_confs or ())[-MAX_RECENT_CONFIDENCES:]
+        outcome: Dict[str, Any] = {
+            "matched_box": matched_box,
+            "matched_label": matched_label,
+            "recent_confidences": confs,
+            "batch_summary": batch_summary,
+        }
+        if reconcile_summary is not None:
+            outcome["reconcile_summary"] = reconcile_summary
         result: Dict[str, Any] = {
             "tool": tool_name,
             "status": status,
@@ -867,12 +899,7 @@ class SystemOneHostEngine:
                 "s1_calls": int(metrics.get("s1_calls", 0)),
                 "elapsed_ms": elapsed_ms,
             },
-            "outcome": {
-                "matched_box": matched_box,
-                "matched_label": matched_label,
-                "recent_confidences": confs,
-                "batch_summary": batch_summary,
-            },
+            "outcome": outcome,
             "visual_evidence": evidence_labels,
             "fsm_states": list(fsm_trace or []),
             "_visual_evidence_images": evidence_images,
@@ -912,7 +939,15 @@ class SystemOneHostEngine:
             return self.run_loop_until(raw_args, collaborate_mode=collaborate_mode)
         if tool_name == "batch_apply":
             return self.run_batch_apply(raw_args, collaborate_mode=collaborate_mode)
+        if tool_name == "reconcile_ui_state":
+            return self.run_reconcile_ui_state(raw_args, collaborate_mode=collaborate_mode)
         raise ValueError(f"Unsupported System One host tool: {tool_name!r}")
+
+    def run_reconcile_ui_state(self, args: Dict[str, Any], collaborate_mode: bool = False) -> Dict[str, Any]:
+        """Run the L2 composite ``reconcile_ui_state`` controller."""
+        from .reconcile_ui_state import run_reconcile_ui_state as _run_reconcile
+
+        return _run_reconcile(self, args, collaborate_mode=collaborate_mode)
 
     # -----------------------------------------------------------------------
     # Tool 1: wait_until
@@ -1149,7 +1184,14 @@ class SystemOneHostEngine:
     # Tool 2: loop_until
     # -----------------------------------------------------------------------
 
-    def run_loop_until(self, args: Dict[str, Any], collaborate_mode: bool = False) -> Dict[str, Any]:
+    def run_loop_until(
+        self,
+        args: Dict[str, Any],
+        collaborate_mode: bool = False,
+        *,
+        _include_crop_box_check: bool = True,
+        _confirm_crop_roi: Optional[Sequence[int]] = None,
+    ) -> Dict[str, Any]:
         start_time = self.monotonic()
         metrics = {"steps_executed": 0, "s1_calls": 0}
         recent_confs: Deque[Dict[str, Any]] = deque(maxlen=MAX_RECENT_CONFIDENCES)
@@ -1414,18 +1456,23 @@ class SystemOneHostEngine:
                                 "pass" if cand_box_conf >= global_floor else "fail",
                             )
 
-                        geom_ok, geom_msg = self._verify_box_geometry_and_crop(
-                            frame=cur_frame,
-                            box_norm=cand_box,
-                            box_conf=cand_box_conf,
-                            roi_norm=roi,
-                            target_desc=on_match_desc,
-                            risk_tier=risk_tier,
-                            metrics=metrics,
-                            recent_confs=recent_confs,
-                            step=step_idx,
-                            caller_box_min_conf=on_match_box_min_conf,
-                        )
+                        if not _include_crop_box_check and cand_box_conf < global_floor:
+                            geom_ok, geom_msg = False, f"global box confidence {cand_box_conf:.3f} < {global_floor:.2f}"
+                        else:
+                            geom_ok, geom_msg = self._verify_box_geometry_and_crop(
+                                frame=cur_frame,
+                                box_norm=cand_box,
+                                box_conf=cand_box_conf,
+                                roi_norm=roi,
+                                target_desc=on_match_desc,
+                                risk_tier=risk_tier,
+                                metrics=metrics,
+                                recent_confs=recent_confs,
+                                step=step_idx,
+                                caller_box_min_conf=on_match_box_min_conf,
+                                include_crop_box_check=_include_crop_box_check,
+                                confirm_crop_roi=_confirm_crop_roi,
+                            )
                         if not geom_ok:
                             status = "escalated"
                             breaker_code = CB_AMBIGUITY
@@ -1540,7 +1587,18 @@ class SystemOneHostEngine:
     # Tool 3: batch_apply
     # -----------------------------------------------------------------------
 
-    def run_batch_apply(self, args: Dict[str, Any], collaborate_mode: bool = False) -> Dict[str, Any]:
+    def run_batch_apply(
+        self,
+        args: Dict[str, Any],
+        collaborate_mode: bool = False,
+        *,
+        _slot_predicates: Optional[Dict[str, NormalizedPredicate]] = None,
+        _locate_box_prompts: Optional[Dict[str, str]] = None,
+        _allow_partial_errors: bool = False,
+        _precaptured_frame: Optional[FrameSnapshot] = None,
+        _skip_handoff_png: bool = False,
+        _release_inputs: bool = True,
+    ) -> Dict[str, Any]:
         start_time = self.monotonic()
         metrics = {"steps_executed": 0, "s1_calls": 0}
         recent_confs: Deque[Dict[str, Any]] = deque(maxlen=MAX_RECENT_CONFIDENCES)
@@ -1606,7 +1664,12 @@ class SystemOneHostEngine:
                     fsm_trace=[*fsm_trace, "S5_HANDOFF_TO_S2"],
                 )
 
-            item_pred = normalize_predicate(args.get("item_predicate"), risk_tier=risk_tier, default_roi=page_roi, name="item_predicate")
+            raw_item_pred = args.get("item_predicate")
+            item_pred: Optional[NormalizedPredicate] = (
+                normalize_predicate(raw_item_pred, risk_tier=risk_tier, default_roi=page_roi, name="item_predicate")
+                if raw_item_pred is not None
+                else None
+            )
             locate_mode = str(args.get("locate_mode", "fixed_slots")).strip().lower()
             if locate_mode not in ("fixed_slots", "dynamic_box"):
                 raise ValueError(f"locate_mode={locate_mode!r} must be 'fixed_slots' or 'dynamic_box'")
@@ -1637,6 +1700,12 @@ class SystemOneHostEngine:
                         fixed_slots.append({"id": f"slot_{idx}", "roi": s_roi})
                 else:
                     raise ValueError("locate_mode='fixed_slots' requires 'slots' or 'slot_grid'")
+
+            if item_pred is None:
+                if _slot_predicates and fixed_slots and all(s["id"] in _slot_predicates for s in fixed_slots):
+                    item_pred = _slot_predicates[fixed_slots[0]["id"]]
+                else:
+                    item_pred = normalize_predicate(raw_item_pred, risk_tier=risk_tier, default_roi=page_roi, name="item_predicate")
 
             dynamic_box_prompts: List[str] = []
             if locate_mode == "dynamic_box":
@@ -1678,7 +1747,7 @@ class SystemOneHostEngine:
                 for i, ip in enumerate(args.get("interrupt_predicates") or [])
             ]
 
-            baseline = self._capture_frame()
+            baseline = _precaptured_frame if _precaptured_frame is not None else self._capture_frame()
             final_frame = baseline
             consecutive_zero_delta_clicks = 0
             using_fallback = False
@@ -1771,12 +1840,18 @@ class SystemOneHostEngine:
                     batch_state["slots"][sid] = ref
                     slot_ref = f"slots.{sid}"
 
-                    q_eval = item_pred.to_system_one_question(image_ref_name=slot_ref)
+                    slot_pred = _slot_predicates.get(sid, item_pred) if _slot_predicates else item_pred
+                    q_eval = slot_pred.to_system_one_question(image_ref_name=slot_ref)
                     batch_questions[f"eval_{sid}"] = q_eval
                     if item_action == "click_target_box":
                         batch_questions[f"box_{sid}"] = {
                             "type": "box",
                             "instructions": f"the {target_desc} in `{slot_ref}`",
+                        }
+                    elif _locate_box_prompts and sid in _locate_box_prompts:
+                        batch_questions[f"box_{sid}"] = {
+                            "type": "box",
+                            "instructions": f"the {_locate_box_prompts[sid]} in `{slot_ref}`",
                         }
 
                 self._add_interrupt_questions(cur_frame, interrupt_preds, batch_state, batch_questions, batch_assets)
@@ -1797,19 +1872,28 @@ class SystemOneHostEngine:
                 working_frame = cur_frame
 
                 for slot in page_slots:
-                    if page_errors / len(page_slots) > max_error_ratio:
+                    if not _allow_partial_errors and page_errors / len(page_slots) > max_error_ratio:
                         break
                     sid = slot["id"]
                     s_roi = slot["roi"]
                     batch_summary["items_evaluated"] += 1
+                    slot_pred = _slot_predicates.get(sid, item_pred) if _slot_predicates else item_pred
 
-                    adj = adjudicate_predicate(item_pred, answers.get(f"eval_{sid}"), risk_tier)
-                    self._record_confidence(recent_confs, page_idx, item_pred.pred_type, adj.label, adj.score, adj.zone)
+                    located_box_info: Dict[str, Any] = {}
+                    if f"box_{sid}" in answers:
+                        loc_b, loc_c = _extract_box_norm_and_conf(answers.get(f"box_{sid}"), slot_preps[sid])
+                        located_box_info = {
+                            "located_box": loc_b,
+                            "box_conf": round(loc_c, 4),
+                        }
+
+                    adj = adjudicate_predicate(slot_pred, answers.get(f"eval_{sid}"), risk_tier)
+                    self._record_confidence(recent_confs, page_idx, slot_pred.pred_type, adj.label, adj.score, adj.zone)
 
                     if adj.zone == "gray":
                         fsm_trace.append("S4_ACT_OR_RECOVER")
                         retry_adj, retry_frame, intr = self._run_gray_zone_retry(
-                            item_pred, risk_tier, s_roi, settle_ms, metrics, recent_confs, page_idx,
+                            slot_pred, risk_tier, s_roi, settle_ms, metrics, recent_confs, page_idx,
                             interrupt_preds=interrupt_preds,
                         )
                         working_frame = retry_frame
@@ -1821,30 +1905,32 @@ class SystemOneHostEngine:
                         if retry_adj.zone != "pass":
                             page_errors += 1
                             batch_summary["errors"] += 1
-                            batch_summary["items"].append(
-                                {
-                                    "page": page_idx,
-                                    "slot_id": sid,
-                                    "roi": s_roi,
-                                    "status": "gray_fail",
-                                    "label": retry_adj.label,
-                                    "score": round(retry_adj.score, 4),
-                                }
-                            )
+                            item_entry: Dict[str, Any] = {
+                                "page": page_idx,
+                                "slot_id": sid,
+                                "roi": s_roi,
+                                "status": "gray_fail",
+                                "label": retry_adj.label,
+                                "score": round(retry_adj.score, 4),
+                            }
+                            if located_box_info:
+                                item_entry.update(located_box_info)
+                            batch_summary["items"].append(item_entry)
                             continue
                         adj = retry_adj
 
                     if adj.zone == "reject":
-                        batch_summary["items"].append(
-                            {
-                                "page": page_idx,
-                                "slot_id": sid,
-                                "roi": s_roi,
-                                "status": "skipped",
-                                "label": adj.label,
-                                "score": round(adj.score, 4),
-                            }
-                        )
+                        item_entry = {
+                            "page": page_idx,
+                            "slot_id": sid,
+                            "roi": s_roi,
+                            "status": "skipped",
+                            "label": adj.label,
+                            "score": round(adj.score, 4),
+                        }
+                        if located_box_info:
+                            item_entry.update(located_box_info)
+                        batch_summary["items"].append(item_entry)
                         continue
 
                     # adj.zone == "pass"
@@ -1859,16 +1945,17 @@ class SystemOneHostEngine:
                             annotated_roi = s_roi
                             detail = "Irreversible target matched; returning annotated candidate only."
                             break
-                        batch_summary["items"].append(
-                            {
-                                "page": page_idx,
-                                "slot_id": sid,
-                                "roi": s_roi,
-                                "status": "collected",
-                                "label": adj.label,
-                                "score": round(adj.score, 4),
-                            }
-                        )
+                        item_entry = {
+                            "page": page_idx,
+                            "slot_id": sid,
+                            "roi": s_roi,
+                            "status": "collected",
+                            "label": adj.label,
+                            "score": round(adj.score, 4),
+                        }
+                        if located_box_info:
+                            item_entry.update(located_box_info)
+                        batch_summary["items"].append(item_entry)
                         continue
 
                     # Mutating action on matched slot
@@ -2015,7 +2102,7 @@ class SystemOneHostEngine:
                     break
 
                 err_ratio = page_errors / max(1, len(page_slots))
-                if err_ratio > max_error_ratio:
+                if not _allow_partial_errors and err_ratio > max_error_ratio:
                     status = "batch_drift"
                     breaker_code = CB_BATCH_DRIFT
                     detail = f"Page failure/gray ratio {err_ratio:.2%} exceeded max_error_ratio={max_error_ratio:.2%}"
@@ -2046,7 +2133,8 @@ class SystemOneHostEngine:
             detail = str(exc)
         finally:
             fsm_trace.append("S5_HANDOFF_TO_S2")
-            self._safe_release_inputs()
+            if _release_inputs:
+                self._safe_release_inputs()
 
         return self._build_handoff_result(
             tool_name="batch_apply",
@@ -2062,5 +2150,6 @@ class SystemOneHostEngine:
             batch_summary=batch_summary,
             annotated_crop_frame=annotated_frame,
             annotated_crop_roi=annotated_roi,
+            skip_visual_encoding=_skip_handoff_png,
             fsm_trace=fsm_trace,
         )

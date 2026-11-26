@@ -283,6 +283,75 @@ class VncDesktopExecutor:
             time.sleep(0.05)
         return {"error": "The server sent no fresh clipboard update after Ctrl+C. The selection was not verified."}
 
+    def copy_focused_text(self, timeout: float = 1.0) -> Tuple[bool, str]:
+        """Select all (Ctrl+A) and copy (Ctrl+C) from the focused control via VNC clipboard."""
+        try:
+            init_resp = self._get_clipboard_reply()
+        except RuntimeError:
+            return False, ""
+        start_seq = init_resp.get("sequence")
+        init_text = self._decode_clipboard_text(init_resp) if init_resp.get("available") else None
+        marker = f"__agentvnc_copy_{uuid.uuid4().hex}__"
+        try:
+            self.clipboard_set(marker)
+        except (ValueError, RuntimeError):
+            return False, ""
+
+        time.sleep(0.04)
+        self._hotkey_syms([KEY_MAP["ctrl"], ord("a")])
+        time.sleep(0.04)
+        self._hotkey_syms([KEY_MAP["ctrl"], ord("c")])
+
+        deadline = time.monotonic() + float(timeout)
+        while time.monotonic() < deadline:
+            try:
+                resp = self._get_clipboard_reply()
+            except RuntimeError:
+                return False, ""
+            if isinstance(start_seq, int):
+                seq = resp.get("sequence")
+                if resp.get("available") and isinstance(seq, int) and seq > start_seq:
+                    decoded = self._decode_clipboard_text(resp)
+                    if decoded != marker:
+                        return True, decoded
+            else:
+                if resp.get("available"):
+                    decoded = self._decode_clipboard_text(resp)
+                    if decoded != marker and (init_text is None or decoded != init_text):
+                        return True, decoded
+            time.sleep(0.04)
+        return False, ""
+
+    def overwrite_focused_text_clipboard(self, text: str) -> bool:
+        """Clear focused field (Ctrl+A, BackSpace) and paste ``text`` via VNC clipboard (Ctrl+V)."""
+        self._hotkey_syms([KEY_MAP["ctrl"], ord("a")])
+        time.sleep(0.03)
+        self._hotkey_syms([KEY_MAP["backspace"]])
+        if text == "":
+            return True
+        try:
+            self.clipboard_set(text)
+        except (ValueError, RuntimeError):
+            return False
+        time.sleep(0.04)
+        self._hotkey_syms([KEY_MAP["ctrl"], ord("v")])
+        return True
+
+    def type_focused_text(self, text: str) -> None:
+        """Clear focused field (Ctrl+A, BackSpace) and type ``text`` via VNC KeyEvents."""
+        self._hotkey_syms([KEY_MAP["ctrl"], ord("a")])
+        time.sleep(0.03)
+        self._hotkey_syms([KEY_MAP["backspace"]])
+        if text:
+            self._type_text_impl(text, press_enter=False)
+
+    def clear_clipboard_secret(self) -> None:
+        """Best-effort clearing of remote clipboard after pasting a secret field."""
+        try:
+            self.clipboard_set("")
+        except (ValueError, RuntimeError, OSError):
+            pass
+
     def wait_until_resumed(self, intent: Optional[str] = None) -> Tuple[int, List[str]]:
         st = self.get_status()
         start_human = int(st.get("human_action_count", 0))

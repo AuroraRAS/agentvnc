@@ -1104,6 +1104,99 @@ SYSTEM_ONE_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
             "required": ["item_predicate", "item_action", "locate_mode"],
         },
     },
+    {
+        "type": "function",
+        "name": "reconcile_ui_state",
+        "description": (
+            "L2 composite Observe->Compare->Act->Verify controller that converges multiple GUI fields in topological "
+            "DAG waves using wait_until, loop_until, and batch_apply. Supports checkbox/radio/toggle, dropdown, "
+            "text/number (VNC clipboard first, OCR+Jev fallback), secret_text (overwrite_always, masked verify only), "
+            "and slider. Hard-blocks final submissions, payments, destructive actions, and irreversible auto-save "
+            "controls (CB_SAFETY_GUARD). Enforces relayout/shift invalidation, commit_on_blur validation "
+            "(CB_VALIDATION_ERROR), dependency blocking (CB_DEPENDENCY_BLOCKED), and oscillation bounds (CB_OSCILLATION)."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "fields": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": (
+                        "Target fields: [{id, control_type ('text'|'number'|'secret_text'|'checkbox'|'radio'|'toggle'|"
+                        "'dropdown'|'slider'), locator_prompt, desired_value, roi?, match_mode? ('exact'|'semantic'|"
+                        "'overwrite_always'), depends_on?, triggers_relayout?, commit_on_blur?, risk_level?, required?, "
+                        "error_roi?, validation_error_prompt?, regex_pattern?, options?, loop_config?, relayout_wait?, "
+                        "min_confidence?}]."
+                    ),
+                },
+                "container_roi": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Normalized BBox [ymin, xmin, ymax, xmax] in 0..1000 of the form/container (default [0,0,1000,1000]).",
+                },
+                "risk_level": {
+                    "type": "string",
+                    "description": "Overall risk level: 'read_only', 'reversible' (default), or 'irreversible'.",
+                },
+                "allow_scroll": {
+                    "type": "boolean",
+                    "description": "If true, scroll to find out-of-view top-level controls; never reuses cached BBoxes across scroll offsets.",
+                },
+                "scroll_action": {
+                    "type": "object",
+                    "description": "Closed-set HostAction used when allow_scroll=true.",
+                },
+                "max_scroll_steps": {
+                    "type": "integer",
+                    "description": "Maximum scroll steps when allow_scroll=true (default 5, cap 20).",
+                },
+                "blur_action": {
+                    "type": "object",
+                    "description": "Closed-set HostAction used to blur commit_on_blur fields before validation (default Tab).",
+                },
+                "neutral_blur_point": {
+                    "type": "array",
+                    "items": {"type": "integer"},
+                    "description": "Optional normalized [y, x] neutral area click target for blurring commit_on_blur fields.",
+                },
+                "max_reconcile_passes": {
+                    "type": "integer",
+                    "description": "Maximum convergence passes over DAG waves (default 2, hard cap 3).",
+                },
+                "max_retries_per_field": {
+                    "type": "integer",
+                    "description": "Maximum retries per field on mismatch/validation revert (default 2).",
+                },
+                "settle_delay_ms": {
+                    "type": "integer",
+                    "description": "Settle delay in ms after actions (default 250).",
+                },
+                "relayout_timeout_ms": {
+                    "type": "integer",
+                    "description": "Timeout in ms waiting for triggers_relayout stability via wait_until (default 5000).",
+                },
+                "relayout_poll_interval_ms": {
+                    "type": "integer",
+                    "description": "Poll interval in ms for triggers_relayout wait_until (default 250).",
+                },
+                "max_total_actions": {
+                    "type": "integer",
+                    "description": "Hard cap on total host actions before CB_BUDGET_EXCEEDED (default 80, cap 200).",
+                },
+                "interrupt_predicates": {
+                    "type": "array",
+                    "items": {"type": "object"},
+                    "description": "Optional atomic interrupt/abort predicates checked during reconciliation.",
+                },
+                "ignore_scene_change": {
+                    "type": "boolean",
+                    "description": "If true, skip baseline full-screen SSIM < 0.50 check (step-level < 0.50 still interrupts).",
+                },
+                "intent": {"type": "string", "description": "Short reason for reconciling these UI fields."},
+            },
+            "required": ["fields"],
+        },
+    },
 ]
 
 CUSTOM_FUNCTION_NAMES = frozenset(d["name"] for d in CUSTOM_FUNCTION_DECLARATIONS)
@@ -1224,14 +1317,15 @@ COORDINATION_SYSTEM_INSTRUCTION = """## Asynchronous Research Assistant & Marker
 * **Checking & Waiting:** Use `peer_get_status` to inspect the assistant's status marker (`sleeping`, `working`, `done`, `error`), `peer_read_messages` when notified of unread messages, or `peer_wait_for_message` when you need to sleep until the assistant wakes you up with a reply.
 """
 
-SYSTEM_ONE_SYSTEM_INSTRUCTION = """## Host-Side System One Tools (`wait_until`, `loop_until`, `batch_apply`):
-* **Strict Decoupling:** Emit declarative tool parameters only; the host executes a deterministic 6-state FSM (`S0_INIT_VALIDATE`..`S5_HANDOFF_TO_S2`) and calls TypeSafe System One (`noul`, `choice`, `box`) as a stateless single-frame visual oracle.
+SYSTEM_ONE_SYSTEM_INSTRUCTION = """## Host-Side System One Tools (`wait_until`, `loop_until`, `batch_apply`, `reconcile_ui_state`):
+* **Strict Decoupling:** Emit declarative tool parameters only; the host executes a deterministic FSM (`S0_INIT_VALIDATE`..`S5_HANDOFF_TO_S2`) and calls TypeSafe System One (`noul`, `choice`, `box`) as a stateless single-frame visual oracle.
 * **When to Use:**
   - `wait_until`: Wait for spinners, progress bars, page loads, or fleeting toasts (`poll_interval_ms=150..250`, `capture_transient=true`) without burning System 2 turns.
   - `loop_until`: Bounded scrolling/stepping through long dropdowns, calendars, lists, or sliders (`step_action`, `fallback_action` on first stall, `on_match` closed-loop click unless `irreversible`).
   - `batch_apply`: Evaluate or act on multiple visible items/checkboxes/rows on one or more pages in one batched Parallel Questions call per page.
-* **Normalized Coordinates & Closed-Set `HostAction`:** All `BBox` values are `[ymin, xmin, ymax, xmax]` in `0..1000`. Actions in `step_action`, `fallback_action`, `directional_actions`, `next_page_action`, and `on_match.action` MUST use closed-set primitives: `hover`, `click`, `wheel_scroll`, `key_press`, or `drag_step`.
-* **Risk Tiers & Circuit Breakers:** Choose `read_only`, `reversible`, or `irreversible` accurately. Never expect host auto-clicks on `irreversible` targets (`CB_SAFETY_GUARD` blocks input and returns the annotated candidate box for your review). On `CB_AMBIGUITY`, `CB_STALL`, `CB_INTERRUPT`, `CB_SAFETY_GUARD`, `CB_BUDGET_EXCEEDED`, or `CB_BATCH_DRIFT`, inspect the returned `HostToolResult` and `visual_evidence` (max 2 images) before deciding the next step.
+  - `reconcile_ui_state`: L2 composite `Observe -> Compare -> Act -> Verify` controller for multi-field forms/settings with DAG `depends_on` waves, `triggers_relayout` / unannounced shift invalidation, `commit_on_blur` inline validation, `secret_text` masked verification, and bounded convergence. Hard-blocks final submissions, payments, destructive actions, and `irreversible` auto-save controls (`CB_SAFETY_GUARD`).
+* **Normalized Coordinates & Closed-Set `HostAction`:** All `BBox` values are `[ymin, xmin, ymax, xmax]` in `0..1000`. Actions in `step_action`, `fallback_action`, `directional_actions`, `next_page_action`, `on_match.action`, `scroll_action`, and `blur_action` MUST use closed-set primitives: `hover`, `click`, `wheel_scroll`, `key_press`, or `drag_step`.
+* **Risk Tiers & Circuit Breakers:** Choose `read_only`, `reversible`, or `irreversible` accurately. Never expect host auto-clicks on `irreversible` targets (`CB_SAFETY_GUARD` blocks input and returns the annotated candidate box for your review). On `CB_AMBIGUITY`, `CB_STALL`, `CB_INTERRUPT`, `CB_SAFETY_GUARD`, `CB_BUDGET_EXCEEDED`, `CB_BATCH_DRIFT`, `CB_VALIDATION_ERROR`, `CB_OSCILLATION`, or `CB_DEPENDENCY_BLOCKED`, inspect the returned `HostToolResult` (including `reconcile_summary` per-field states) and `visual_evidence` (max 2 images) before deciding the next step.
 """
 
 ASSISTANT_SYSTEM_INSTRUCTION = """You are the asynchronous **Research Assistant** collaborating with the **Computer Use Agent** (`computer_use`) via a shared local workspace and `.coord/` coordination markers.
