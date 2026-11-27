@@ -4,6 +4,7 @@ endif()
 
 add_library(scrcpyvncserver_core STATIC
   AdbClient.cxx
+  AdbFileTransfer.cxx
   H264SpsParser.cxx
   ScrcpyStream.cxx
   ScrcpyControl.cxx
@@ -14,7 +15,7 @@ add_library(scrcpyvncserver_core STATIC
 )
 
 target_include_directories(scrcpyvncserver_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR})
-target_link_libraries(scrcpyvncserver_core PUBLIC rfbserver rfb network rdr core)
+target_link_libraries(scrcpyvncserver_core PUBLIC rfbserver rfb network rdr core pthread)
 
 add_executable(scrcpyvncserver
   scrcpyvncserver.cxx

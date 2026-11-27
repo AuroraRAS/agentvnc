@@ -22,6 +22,7 @@
 
 #include "ScrcpyClient.h"
 #include "ScrcpyServer.h"
+#include "parameters.h"
 
 #include <algorithm>
 #include <cstring>
@@ -43,6 +44,7 @@
 #include <rfb/ServerCore.h>
 #include <rfb/encodings.h>
 #include <rfb/fenceTypes.h>
+#include <rfb/fileTransferTypes.h>
 #include <rfb/msgTypes.h>
 #include <rfb/screenTypes.h>
 
@@ -64,6 +66,15 @@ void writeU32Be(uint8_t* p, uint32_t v)
   p[3] = static_cast<uint8_t>(v & 0xff);
 }
 
+rfb::TightCapability makeTightCap(int32_t code, const char* signature)
+{
+  rfb::TightCapability cap;
+  cap.code = code;
+  std::memcpy(cap.vendor, rfb::tightVendorTight, 4);
+  std::memcpy(cap.signature, signature, 8);
+  return cap;
+}
+
 } // namespace
 
 ScrcpyClient::ScrcpyClient(ScrcpyServer* server, network::Socket* s,
@@ -71,6 +82,7 @@ ScrcpyClient::ScrcpyClient(ScrcpyServer* server, network::Socket* s,
   : rfb::SConnection(s, ar),
     server_(server),
     zeroCopyOs_(s->getFd()),
+    tight13DownloadPendingWrite_(false),
     inProcessMessages_(false),
     receivedEncodings_(false),
     continuousUpdates_(false),
@@ -92,10 +104,23 @@ ScrcpyClient::ScrcpyClient(ScrcpyServer* server, network::Socket* s,
   ::setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
 
   setStreams(&s->inStream(), &zeroCopyOs_);
+
+  if (fileTransferEnabled()) {
+    rfb::SecurityServer* sec = getSecurity();
+    bool hasTightAuth =
+      !sec->GetEnabledExtSecTypes().empty() ||
+      sec->IsSupported(rfb::secTypeNone) ||
+      sec->IsSupported(rfb::secTypeVncAuth) ||
+      sec->IsSupported(rfb::secTypePlain);
+    if (hasTightAuth)
+      sec->EnableSecType(rfb::secTypeTight);
+  }
 }
 
 ScrcpyClient::~ScrcpyClient()
 {
+  if (ftSession_)
+    ftSession_->stop();
   if (!closeReason_.empty()) {
     vlog.info(_("Closing %s: %s"), getPeerEndpoint(),
               closeReason_.c_str());
@@ -123,6 +148,11 @@ void ScrcpyClient::close(const char* reason)
 
   closeReason_ = reason ? reason : "";
   idleTimer_.stop();
+  tight13DownloadPendingWrite_ = false;
+  if (ftSession_) {
+    ftSession_->stop();
+    ftSession_.reset();
+  }
   for (const auto& key : pressedKeys_)
     server_->clientKeyEvent(key.second, 0, false);
   pressedKeys_.clear();
@@ -199,6 +229,11 @@ void ScrcpyClient::processSocketWriteEvent()
     if (getOutStream() != &zeroCopyOs_)
       zeroCopyOs_.flush();
     flushNoDataUpdateIfReady();
+    if (tight13DownloadPendingWrite_ && !zeroCopyOs_.hasBufferedData()) {
+      tight13DownloadPendingWrite_ = false;
+      if (ftSession_)
+        ftSession_->enqueueTight13DownloadNextChunk();
+    }
     if (retryVideoOnWritable_ && !zeroCopyOs_.hasBufferedData()) {
       retryVideoOnWritable_ = false;
       if (readyForVideo() && needsKeyFrame_)
@@ -309,6 +344,11 @@ void ScrcpyClient::fence(uint32_t flags, unsigned len, const uint8_t data[])
     return;
 
   flags &= (rfb::fenceFlagBlockBefore | rfb::fenceFlagBlockAfter);
+  if (ftSession_ && (flags & rfb::fenceFlagBlockBefore)) {
+    ftSession_->enqueueFenceBarrier(flags, data, len);
+    return;
+  }
+
   writer()->writeFence(flags, len, data);
 }
 
@@ -382,6 +422,436 @@ void ScrcpyClient::handleClipboardAnnounce(bool available)
 void ScrcpyClient::handleClipboardData(const char* data)
 {
   server_->clientClipboardData(this, data);
+}
+
+int ScrcpyClient::fileTransferWakeupFd() const
+{
+  return ftSession_ ? ftSession_->wakeupFd() : -1;
+}
+
+bool ScrcpyClient::fileTransferEnabled() const
+{
+  return static_cast<bool>(fileTransfer) && !server_->deviceSerial().empty();
+}
+
+void ScrcpyClient::noteActivity()
+{
+  if (rfb::Server::idleTimeout)
+    idleTimer_.start(core::secsToMillis(rfb::Server::idleTimeout));
+  server_->noteClientActivity();
+}
+
+void ScrcpyClient::getTightCapabilities(
+  std::vector<rfb::TightCapability>* serverMsgs,
+  std::vector<rfb::TightCapability>* clientMsgs,
+  std::vector<rfb::TightCapability>* /*encodings*/)
+{
+  if (!fileTransferEnabled() || !accessCheck(rfb::AccessFileTransfer))
+    return;
+
+  if (serverMsgs) {
+    // TightVNC 2.x server-to-client messages
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2CompressionSupportReply),
+      rfb::sigTight2CompressionSupportReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2FileListReply),
+      rfb::sigTight2FileListReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2Md5Reply),
+      rfb::sigTight2Md5Reply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2UploadStartReply),
+      rfb::sigTight2UploadStartReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2UploadDataReply),
+      rfb::sigTight2UploadDataReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2UploadEndReply),
+      rfb::sigTight2UploadEndReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2DownloadStartReply),
+      rfb::sigTight2DownloadStartReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2DownloadDataReply),
+      rfb::sigTight2DownloadDataReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2DownloadEndReply),
+      rfb::sigTight2DownloadEndReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2MkdirReply),
+      rfb::sigTight2MkdirReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2RemoveReply),
+      rfb::sigTight2RemoveReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2RenameReply),
+      rfb::sigTight2RenameReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2DirSizeReply),
+      rfb::sigTight2DirSizeReply));
+    serverMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2LastRequestFailedReply),
+      rfb::sigTight2LastRequestFailedReply));
+
+    // TightVNC 1.3.x server-to-client messages
+    serverMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileListData, rfb::sigTight13FileListData));
+    serverMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileDownloadData, rfb::sigTight13FileDownloadData));
+    serverMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileUploadCancel, rfb::sigTight13FileUploadCancel));
+    serverMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileDownloadFailed, rfb::sigTight13FileDownloadFailed));
+  }
+
+  if (clientMsgs) {
+    // TightVNC 2.x client-to-server messages
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2CompressionSupportReq),
+      rfb::sigTight2CompressionSupportReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2FileListReq),
+      rfb::sigTight2FileListReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2Md5Req),
+      rfb::sigTight2Md5Req));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2UploadStartReq),
+      rfb::sigTight2UploadStartReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2UploadDataReq),
+      rfb::sigTight2UploadDataReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2UploadEndReq),
+      rfb::sigTight2UploadEndReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2DownloadStartReq),
+      rfb::sigTight2DownloadStartReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2DownloadDataReq),
+      rfb::sigTight2DownloadDataReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2MkdirReq),
+      rfb::sigTight2MkdirReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2RemoveReq),
+      rfb::sigTight2RemoveReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2RenameReq),
+      rfb::sigTight2RenameReq));
+    clientMsgs->push_back(makeTightCap(
+      static_cast<int32_t>(rfb::tight2DirSizeReq),
+      rfb::sigTight2DirSizeReq));
+
+    // TightVNC 1.3.x client-to-server messages
+    clientMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileListReq, rfb::sigTight13FileListReq));
+    clientMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileDownloadReq, rfb::sigTight13FileDownloadReq));
+    clientMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileUploadReq, rfb::sigTight13FileUploadReq));
+    clientMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileUploadData, rfb::sigTight13FileUploadData));
+    clientMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileDownloadCancel, rfb::sigTight13FileDownloadCancel));
+    clientMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileUploadFailed, rfb::sigTight13FileUploadFailed));
+    clientMsgs->push_back(makeTightCap(
+      rfb::tight13CapFileCreateDirReq, rfb::sigTight13FileCreateDirReq));
+  }
+}
+
+bool ScrcpyClient::ensureFileTransferReady(bool isTight13,
+                                           uint8_t tight13Flags,
+                                           bool isDownload,
+                                           bool isUpload)
+{
+  noteActivity();
+
+  if (!fileTransferEnabled() || !accessCheck(rfb::AccessFileTransfer)) {
+    const char* msg = _("File transfer is not permitted");
+    if (!isTight13) {
+      writer()->writeTight2LastRequestFailedReply(msg);
+    } else if (isDownload) {
+      writer()->writeTight13FileDownloadFailed(msg);
+    } else if (isUpload) {
+      writer()->writeTight13FileUploadCancel(msg);
+    } else {
+      writer()->writeTight13FileListData(tight13Flags | rfb::tight13FlagError, {});
+    }
+    return false;
+  }
+
+  if (!ftSession_) {
+    ftSession_.reset(new AdbFileTransferSession(
+      server_->adbHost(), server_->adbPort(), server_->deviceSerial(),
+      static_cast<const char*>(fileTransferRoot)));
+  }
+  return true;
+}
+
+void ScrcpyClient::tight2CompressionSupportRequest()
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2CompressionSupport();
+}
+
+void ScrcpyClient::tight2FileListRequest(uint8_t compressLevel,
+                                         const std::string& path)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2FileList(compressLevel, path);
+}
+
+void ScrcpyClient::tight2Md5Request(const std::string& path,
+                                    uint64_t offset, uint64_t dataLen)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2Md5(path, offset, dataLen);
+}
+
+void ScrcpyClient::tight2UploadStartRequest(const std::string& path,
+                                            uint8_t flags, uint64_t offset)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2UploadStart(path, flags, offset);
+}
+
+void ScrcpyClient::tight2UploadDataRequest(const uint8_t* data, size_t len)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2UploadData(data, len);
+}
+
+void ScrcpyClient::tight2UploadEndRequest(uint16_t fileFlags,
+                                          uint64_t modTimeMs)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2UploadEnd(fileFlags, modTimeMs);
+}
+
+void ScrcpyClient::tight2DownloadStartRequest(const std::string& path,
+                                              uint64_t offset)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2DownloadStart(path, offset);
+}
+
+void ScrcpyClient::tight2DownloadDataRequest(uint8_t compressLevel,
+                                             uint32_t reqSize)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2DownloadData(compressLevel, reqSize);
+}
+
+void ScrcpyClient::tight2MkdirRequest(const std::string& path)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2Mkdir(path);
+}
+
+void ScrcpyClient::tight2RemoveRequest(const std::string& path)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2Remove(path);
+}
+
+void ScrcpyClient::tight2RenameRequest(const std::string& oldPath,
+                                       const std::string& newPath)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2Rename(oldPath, newPath);
+}
+
+void ScrcpyClient::tight2DirSizeRequest(const std::string& path)
+{
+  if (!ensureFileTransferReady(false))
+    return;
+  ftSession_->enqueueTight2DirSize(path);
+}
+
+void ScrcpyClient::tight13FileListRequest(uint8_t flags,
+                                          const std::string& dir)
+{
+  if (!ensureFileTransferReady(true, flags))
+    return;
+  ftSession_->enqueueTight13FileList(flags, dir);
+}
+
+void ScrcpyClient::tight13FileDownloadRequest(uint8_t compressLevel,
+                                              uint32_t position,
+                                              const std::string& path)
+{
+  if (!ensureFileTransferReady(true, 0, true, false))
+    return;
+  tight13DownloadPendingWrite_ = false;
+  ftSession_->enqueueTight13DownloadStart(compressLevel, position, path);
+}
+
+void ScrcpyClient::tight13FileUploadRequest(uint8_t /*compressLevel*/,
+                                            uint32_t position,
+                                            const std::string& path)
+{
+  if (!ensureFileTransferReady(true, 0, false, true))
+    return;
+  ftSession_->enqueueTight13UploadStart(position, path);
+}
+
+void ScrcpyClient::tight13FileUploadData(const uint8_t* data, size_t len)
+{
+  noteActivity();
+  if (!fileTransferEnabled() || !accessCheck(rfb::AccessFileTransfer) ||
+      !ftSession_)
+    return;
+  ftSession_->enqueueTight13UploadData(data, len);
+}
+
+void ScrcpyClient::tight13FileUploadEnd(uint32_t modTime)
+{
+  noteActivity();
+  if (!fileTransferEnabled() || !accessCheck(rfb::AccessFileTransfer) ||
+      !ftSession_)
+    return;
+  ftSession_->enqueueTight13UploadEnd(modTime);
+}
+
+void ScrcpyClient::tight13FileDownloadCancel(const std::string& /*reason*/)
+{
+  noteActivity();
+  tight13DownloadPendingWrite_ = false;
+  if (ftSession_)
+    ftSession_->enqueueTight13DownloadCancel();
+}
+
+void ScrcpyClient::tight13FileUploadFailed(const std::string& /*reason*/)
+{
+  noteActivity();
+  if (ftSession_)
+    ftSession_->enqueueTight13UploadFailed();
+}
+
+void ScrcpyClient::tight13FileCreateDirRequest(const std::string& dir)
+{
+  noteActivity();
+  if (!fileTransferEnabled() || !accessCheck(rfb::AccessFileTransfer))
+    return;
+  if (!ftSession_) {
+    ftSession_.reset(new AdbFileTransferSession(
+      server_->adbHost(), server_->adbPort(), server_->deviceSerial(),
+      static_cast<const char*>(fileTransferRoot)));
+  }
+  ftSession_->enqueueTight13CreateDir(dir);
+}
+
+void ScrcpyClient::processFileTransferEvents()
+{
+  if (!ftSession_ || state() != RFBSTATE_NORMAL)
+    return;
+
+  std::vector<AdbFileTransferSession::Reply> replies = ftSession_->drainReplies();
+  if (replies.empty())
+    return;
+
+  try {
+    using Kind = AdbFileTransferSession::Reply::Kind;
+    for (const auto& reply : replies) {
+      if (state() == RFBSTATE_CLOSING)
+        break;
+      switch (reply.kind) {
+      case Kind::Tight2CompressionSupport:
+        writer()->writeTight2CompressionSupportReply(reply.boolVal);
+        break;
+      case Kind::Tight2FileList:
+        writer()->writeTight2FileListReply(reply.compressLevel, reply.entries);
+        break;
+      case Kind::Tight2Md5:
+        writer()->writeTight2Md5Reply(reply.md5);
+        break;
+      case Kind::Tight2UploadStart:
+        writer()->writeTight2UploadStartReply();
+        break;
+      case Kind::Tight2UploadData:
+        writer()->writeTight2UploadDataReply();
+        break;
+      case Kind::Tight2UploadEnd:
+        writer()->writeTight2UploadEndReply();
+        break;
+      case Kind::Tight2DownloadStart:
+        writer()->writeTight2DownloadStartReply();
+        break;
+      case Kind::Tight2DownloadData:
+        writer()->writeTight2DownloadDataReply(
+          reply.compressLevel,
+          reply.data.empty() ? nullptr : reply.data.data(),
+          reply.data.size());
+        break;
+      case Kind::Tight2DownloadEnd:
+        writer()->writeTight2DownloadEndReply(reply.flags, reply.u64Val);
+        break;
+      case Kind::Tight2Mkdir:
+        writer()->writeTight2MkdirReply();
+        break;
+      case Kind::Tight2Remove:
+        writer()->writeTight2RemoveReply();
+        break;
+      case Kind::Tight2Rename:
+        writer()->writeTight2RenameReply();
+        break;
+      case Kind::Tight2DirSize:
+        writer()->writeTight2DirSizeReply(reply.u64Val);
+        break;
+      case Kind::Tight2Failed:
+        writer()->writeTight2LastRequestFailedReply(reply.text);
+        break;
+      case Kind::Tight13FileList:
+        writer()->writeTight13FileListData(reply.flags, reply.entries);
+        break;
+      case Kind::Tight13DownloadData:
+        writer()->writeTight13FileDownloadData(
+          reply.compressLevel,
+          reply.data.empty() ? nullptr : reply.data.data(),
+          static_cast<uint16_t>(reply.data.size()));
+        if (zeroCopyOs_.hasBufferedData()) {
+          tight13DownloadPendingWrite_ = true;
+        } else if (ftSession_) {
+          ftSession_->enqueueTight13DownloadNextChunk();
+        }
+        break;
+      case Kind::Tight13DownloadEnd:
+        tight13DownloadPendingWrite_ = false;
+        writer()->writeTight13FileDownloadEnd(reply.u32Val);
+        break;
+      case Kind::Tight13DownloadFailed:
+        tight13DownloadPendingWrite_ = false;
+        writer()->writeTight13FileDownloadFailed(reply.text);
+        break;
+      case Kind::Tight13UploadCancel:
+        writer()->writeTight13FileUploadCancel(reply.text);
+        break;
+      case Kind::FenceReply:
+        if (client.supportsFence()) {
+          writer()->writeFence(reply.u32Val,
+                               static_cast<unsigned>(reply.data.size()),
+                               reply.data.empty() ? nullptr : reply.data.data());
+        }
+        break;
+      }
+    }
+  } catch (std::exception& e) {
+    close(e.what());
+  }
 }
 
 bool ScrcpyClient::readyForVideo()

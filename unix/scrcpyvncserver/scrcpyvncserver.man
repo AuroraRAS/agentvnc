@@ -24,6 +24,13 @@ resizes, they must also support DesktopSize (\-223) or ExtendedDesktopSize
 (\-308). ContinuousUpdates (\-313) lets the server stream frames without
 waiting for individual update requests. With an H.264-enabled
 \fBvncviewer\fP(1), use \fB\-AutoSelect=0 \-PreferredEncoding=H.264\fP.
+.PP
+When \fB\-FileTransfer\fP is enabled (the default), \fBscrcpyvncserver\fP also
+advertises the Tight security type (16) and TightVNC 2.x and 1.3.x File
+Transfer extensions, performing directory listing, download, upload, resume,
+MD5 checksum, directory size, mkdir, rename, and remove operations on the
+connected Android device over ADB. Viewers such as \fBvncviewer \-FtpServer\fP
+automatically negotiate Tight capability exchange when connecting.
 .SH OPTIONS
 Parameters can be specified as \fB\-\fIParam\fR, \fB\-\fIParam\fP=0\fR,
 or \fB\-\fIParam\fP=\fIvalue\fR. Run \fBscrcpyvncserver \-h\fP for the full
@@ -47,6 +54,13 @@ its control, dummy byte, and device metadata settings. Use
 .BI \-HostsFile " path"
 Apply IP access rules to TCP listeners, including systemd-activated
 listeners. Connections that require interactive approval are rejected.
+.TP
+.BI \-FileTransfer " [0|1]"
+Enable or disable TightVNC File Transfer over ADB (enabled by default).
+.TP
+.BI \-FileTransferRoot " path"
+Confine TightVNC File Transfer operations to the specified directory on the
+Android device (empty exposes the full device filesystem).
 .SH SEE ALSO
 .BR vncviewer (1),
 .BR x0vncserver (1),

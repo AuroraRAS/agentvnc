@@ -58,6 +58,8 @@ public:
                             ScrcpyProtocol protocol,
                             int width, int height,
                             const std::string& deviceName);
+  void setAdbTargetForTest(const std::string& host, int port,
+                           const std::string& serial);
 
   // Main poll() event loop. Runs until caughtSignal becomes true or
   // terminate() is called.
@@ -78,10 +80,14 @@ public:
   int width() const { return stream_.width(); }
   int height() const { return stream_.height(); }
   const std::string& desktopName() const { return desktopName_; }
+  const std::string& adbHost() const { return adbHost_; }
+  int adbPort() const { return adbPort_; }
+  const std::string& deviceSerial() const { return deviceSerial_; }
 
   // Called by ScrcpyClient
   void clientReady(ScrcpyClient* client, bool shared);
   void clearBlacklist(const char* address);
+  void noteClientActivity();
   void clientRequestsKeyFrame(ScrcpyClient* client);
   void clientPointerEvent(ScrcpyClient* client,
                           int x, int y, uint16_t buttonMask);
@@ -123,6 +129,9 @@ private:
   std::string detectedShellVersion_;
 
   std::string desktopName_;
+  std::string adbHost_;
+  int adbPort_;
+  std::string deviceSerial_;
   std::string deviceClipboard_;
   uint64_t clipboardSeq_;
 
