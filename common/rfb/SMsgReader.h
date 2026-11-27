@@ -24,10 +24,16 @@
 #ifndef __RFB_SMSGREADER_H__
 #define __RFB_SMSGREADER_H__
 
+#include <stddef.h>
+#include <stdint.h>
+
+#include <vector>
+
 namespace rdr { class InStream; }
 
 namespace rfb {
   class SMsgHandler;
+  struct Tight2InflateState;
 
   class SMsgReader {
   public:
@@ -59,6 +65,19 @@ namespace rfb {
     bool readQEMUMessage();
     bool readQEMUKeyEvent();
 
+    bool readTight13FileListRequest();
+    bool readTight13FileDownloadRequest();
+    bool readTight13FileUploadRequest();
+    bool readTight13FileUploadData();
+    bool readTight13FileDownloadCancel();
+    bool readTight13FileUploadFailed();
+    bool readTight13FileCreateDirRequest();
+    bool readTight2Message();
+
+    std::vector<uint8_t> inflateTight2Block(const uint8_t* compressed,
+                                            size_t compressedSize,
+                                            size_t uncompressedSize);
+
   private:
     SMsgHandler* handler;
     rdr::InStream* is;
@@ -71,6 +90,7 @@ namespace rfb {
     stateEnum state;
 
     uint8_t currentMsgType;
+    Tight2InflateState* tight2Inflate;
   };
 }
 #endif

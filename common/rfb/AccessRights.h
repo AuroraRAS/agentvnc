@@ -32,6 +32,7 @@ namespace rfb
   extern const AccessRights AccessCutText;        // Send/receive clipboard events
   extern const AccessRights AccessSetDesktopSize; // Change desktop size
   extern const AccessRights AccessNonShared;      // Exclusive access to the server
+  extern const AccessRights AccessFileTransfer;   // Transfer and manage files
   extern const AccessRights AccessDefault;        // The default rights, INCLUDING FUTURE ONES
   extern const AccessRights AccessNoQuery;        // Connect without local user accepting
   extern const AccessRights AccessFull;           // All of the available AND FUTURE rights

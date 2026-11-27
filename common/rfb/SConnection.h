@@ -25,12 +25,14 @@
 #define __RFB_SCONNECTION_H__
 
 #include <string>
+#include <vector>
 
 #include <core/Timer.h>
 
 #include <rfb/AccessRights.h>
 #include <rfb/SMsgHandler.h>
 #include <rfb/SecurityServer.h>
+#include <rfb/TightCapability.h>
 
 namespace rdr {
   class InStream;
@@ -262,6 +264,11 @@ namespace rfb {
 
     SMsgReader* reader() { return reader_; }
     SMsgWriter* writer() { return writer_; }
+    SecurityServer* getSecurity() { return &security; }
+
+    virtual void getTightCapabilities(std::vector<TightCapability>* serverMsgs,
+                                      std::vector<TightCapability>* clientMsgs,
+                                      std::vector<TightCapability>* encodings);
 
     // FIXME: EncodeManager does low level access to SMsgWriter
     friend class EncodeManager;

@@ -25,7 +25,12 @@
 
 #include <stdint.h>
 
+#include <string>
+#include <vector>
+
 #include <rfb/ClientParams.h>
+#include <rfb/TightCapability.h>
+#include <rfb/fileTransferTypes.h>
 
 namespace rfb {
 
@@ -66,6 +71,46 @@ namespace rfb {
     virtual void clipboardProvide(uint32_t flags,
                                   const size_t* lengths,
                                   const uint8_t* const* data) = 0;
+
+    // TightVNC 2.x File Transfer
+    virtual void tight2CompressionSupportRequest() {}
+    virtual void tight2FileListRequest(uint8_t /*compressLevel*/,
+                                       const std::string& /*path*/) {}
+    virtual void tight2Md5Request(const std::string& /*path*/,
+                                  uint64_t /*offset*/,
+                                  uint64_t /*dataLen*/) {}
+    virtual void tight2UploadStartRequest(const std::string& /*path*/,
+                                          uint8_t /*flags*/,
+                                          uint64_t /*offset*/) {}
+    virtual void tight2UploadDataRequest(const uint8_t* /*data*/,
+                                         size_t /*len*/) {}
+    virtual void tight2UploadEndRequest(uint16_t /*fileFlags*/,
+                                        uint64_t /*modTimeMs*/) {}
+    virtual void tight2DownloadStartRequest(const std::string& /*path*/,
+                                            uint64_t /*offset*/) {}
+    virtual void tight2DownloadDataRequest(uint8_t /*compressLevel*/,
+                                           uint32_t /*reqSize*/) {}
+    virtual void tight2MkdirRequest(const std::string& /*path*/) {}
+    virtual void tight2RemoveRequest(const std::string& /*path*/) {}
+    virtual void tight2RenameRequest(const std::string& /*oldPath*/,
+                                     const std::string& /*newPath*/) {}
+    virtual void tight2DirSizeRequest(const std::string& /*path*/) {}
+
+    // TightVNC 1.3.x File Transfer
+    virtual void tight13FileListRequest(uint8_t /*flags*/,
+                                        const std::string& /*dir*/) {}
+    virtual void tight13FileDownloadRequest(uint8_t /*compressLevel*/,
+                                            uint32_t /*position*/,
+                                            const std::string& /*path*/) {}
+    virtual void tight13FileUploadRequest(uint8_t /*compressLevel*/,
+                                          uint32_t /*position*/,
+                                          const std::string& /*path*/) {}
+    virtual void tight13FileUploadData(const uint8_t* /*data*/,
+                                       size_t /*len*/) {}
+    virtual void tight13FileUploadEnd(uint32_t /*modTime*/) {}
+    virtual void tight13FileDownloadCancel(const std::string& /*reason*/) {}
+    virtual void tight13FileUploadFailed(const std::string& /*reason*/) {}
+    virtual void tight13FileCreateDirRequest(const std::string& /*dir*/) {}
 
     ClientParams client;
   };

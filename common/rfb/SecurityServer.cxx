@@ -31,6 +31,7 @@
 
 #include <rfb/SSecurityNone.h>
 #include <rfb/SSecurityStack.h>
+#include <rfb/SSecurityTight.h>
 #include <rfb/SSecurityPlain.h>
 #include <rfb/SSecurityVncAuth.h>
 #include <rfb/SSecurityVeNCrypt.h>
@@ -48,7 +49,7 @@ core::EnumListParameter SecurityServer::secTypes
  core::format(
   "%s (%s)",
   _("Specify which security scheme to use"),
-  "None, VncAuth, Plain"
+  "None, VncAuth, Plain, Tight"
 #ifdef HAVE_GNUTLS
    ", TLSNone, TLSVnc, TLSPlain, X509None, X509Vnc, X509Plain"
 #endif
@@ -56,7 +57,7 @@ core::EnumListParameter SecurityServer::secTypes
    ", RA2, RA2ne, RA2_256, RA2ne_256"
 #endif
    ).c_str(),
- { "None", "VncAuth", "Plain",
+ { "None", "VncAuth", "Plain", "Tight",
 #ifdef HAVE_GNUTLS
  "TLSNone", "TLSVnc", "TLSPlain", "X509None", "X509Vnc", "X509Plain",
 #endif
@@ -78,6 +79,7 @@ SSecurity* SecurityServer::GetSSecurity(SConnection* sc, uint32_t secType)
   switch (secType) {
   case secTypeNone: return new SSecurityNone(sc);
   case secTypeVncAuth: return new SSecurityVncAuth(sc);
+  case secTypeTight: return new SSecurityTight(sc, this);
   case secTypeVeNCrypt: return new SSecurityVeNCrypt(sc, this);
   case secTypePlain: return new SSecurityPlain(sc);
 #ifdef HAVE_GNUTLS

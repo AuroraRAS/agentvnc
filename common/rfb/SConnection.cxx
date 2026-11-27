@@ -271,6 +271,7 @@ bool SConnection::processSecurityMsg()
   }
 
   state_ = RFBSTATE_QUERYING;
+  client.tightEnabled = (ssecurity->getType() == secTypeTight);
   setAccessRights(accessRights & ssecurity->getAccessRights());
   userName = ssecurity->getUserName();
 
@@ -594,7 +595,8 @@ void SConnection::approveConnection(bool accept, const char* reason)
   if (state_ != RFBSTATE_QUERYING)
     throw std::logic_error("SConnection::approveConnection: Invalid state");
 
-  if (!client.beforeVersion(3,8) || ssecurity->getType() != secTypeNone) {
+  if (!client.beforeVersion(3,8) ||
+      ssecurity->getEffectiveType() != secTypeNone) {
     if (accept) {
       os->writeU32(secResultOK);
     } else {
@@ -622,12 +624,28 @@ void SConnection::approveConnection(bool accept, const char* reason)
   }
 }
 
+void SConnection::getTightCapabilities(std::vector<TightCapability>* /*serverMsgs*/,
+                                       std::vector<TightCapability>* /*clientMsgs*/,
+                                       std::vector<TightCapability>* /*encodings*/)
+{
+}
+
 void SConnection::desktopReady()
 {
   if (state() != RFBSTATE_CLIENT_READY)
     return;
-  writer_->writeServerInit(client.width(), client.height(),
-                           client.pf(), client.name());
+  if (client.tightEnabled) {
+    std::vector<TightCapability> serverMsgs;
+    std::vector<TightCapability> clientMsgs;
+    std::vector<TightCapability> encodings;
+    getTightCapabilities(&serverMsgs, &clientMsgs, &encodings);
+    writer_->writeServerInit(client.width(), client.height(),
+                             client.pf(), client.name(),
+                             serverMsgs, clientMsgs, encodings);
+  } else {
+    writer_->writeServerInit(client.width(), client.height(),
+                             client.pf(), client.name());
+  }
   state_ = RFBSTATE_NORMAL;
 }
 

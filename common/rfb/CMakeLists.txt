@@ -41,6 +41,7 @@ add_library(rfbserver STATIC
   SecurityServer.cxx
   SSecurityPlain.cxx
   SSecurityStack.cxx
+  SSecurityTight.cxx
   SSecurityVncAuth.cxx
   SSecurityVeNCrypt.cxx
   TightEncoder.cxx
@@ -50,7 +51,8 @@ add_library(rfbserver STATIC
   ZRLEEncoder.cxx)
 
 target_include_directories(rfbserver PUBLIC ${CMAKE_SOURCE_DIR}/common)
-target_link_libraries(rfbserver PRIVATE core rdr network rfb)
+target_include_directories(rfbserver SYSTEM PUBLIC ${ZLIB_INCLUDE_DIRS})
+target_link_libraries(rfbserver PRIVATE core rdr network rfb ${ZLIB_LIBRARIES})
 
 add_library(rfbclient STATIC
   CConnection.cxx

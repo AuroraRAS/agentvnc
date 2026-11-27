@@ -44,6 +44,7 @@ ClientParams::ClientParams()
   : majorVersion(0), minorVersion(0),
     compressLevel(2), qualityLevel(-1), fineQualityLevel(-1),
     subsampling(subsampleUndefined),
+    tightEnabled(false),
     width_(0), height_(0),
     cursorPos_(0, 0), ledState_(ledUnknown)
 {

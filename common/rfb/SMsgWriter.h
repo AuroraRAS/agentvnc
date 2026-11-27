@@ -23,7 +23,15 @@
 #ifndef __RFB_SMSGWRITER_H__
 #define __RFB_SMSGWRITER_H__
 
+#include <stddef.h>
 #include <stdint.h>
+
+#include <list>
+#include <string>
+#include <vector>
+
+#include <rfb/TightCapability.h>
+#include <rfb/fileTransferTypes.h>
 
 namespace core { struct Rect; }
 
@@ -34,6 +42,7 @@ namespace rfb {
   class ClientParams;
   class PixelFormat;
   struct ScreenSet;
+  struct Tight2DeflateState;
 
   class SMsgWriter {
   public:
@@ -44,6 +53,11 @@ namespace rfb {
     // protocol initialisation.
     void writeServerInit(uint16_t width, uint16_t height,
                          const PixelFormat& pf, const char* name);
+    void writeServerInit(uint16_t width, uint16_t height,
+                         const PixelFormat& pf, const char* name,
+                         const std::vector<TightCapability>& serverMsgs,
+                         const std::vector<TightCapability>& clientMsgs,
+                         const std::vector<TightCapability>& encodings);
 
     // Methods to write normal protocol messages
 
@@ -94,6 +108,33 @@ namespace rfb {
 
     // let the client know we support extended mouse button support
     void writeExtendedMouseButtonsSupport();
+
+    // TightVNC 2.x File Transfer
+    void writeTight2CompressionSupportReply(bool supported);
+    void writeTight2FileListReply(uint8_t compressLevel,
+                                  const std::vector<FileEntry>& entries);
+    void writeTight2Md5Reply(const uint8_t digest[16]);
+    void writeTight2UploadStartReply();
+    void writeTight2UploadDataReply();
+    void writeTight2UploadEndReply();
+    void writeTight2DownloadStartReply();
+    void writeTight2DownloadDataReply(uint8_t compressLevel,
+                                      const uint8_t* data, size_t len);
+    void writeTight2DownloadEndReply(uint8_t fileFlags, uint64_t modTimeMs);
+    void writeTight2MkdirReply();
+    void writeTight2RemoveReply();
+    void writeTight2RenameReply();
+    void writeTight2DirSizeReply(uint64_t size);
+    void writeTight2LastRequestFailedReply(const std::string& message);
+
+    // TightVNC 1.3.x File Transfer
+    void writeTight13FileListData(uint8_t flags,
+                                  const std::vector<FileEntry>& entries);
+    void writeTight13FileDownloadData(uint8_t compressLevel,
+                                      const uint8_t* data, uint16_t len);
+    void writeTight13FileDownloadEnd(uint32_t modTime);
+    void writeTight13FileUploadCancel(const std::string& reason);
+    void writeTight13FileDownloadFailed(const std::string& reason);
 
     // needFakeUpdate() returns true when an immediate update is needed in
     // order to flush out pseudo-rectangles to the client.
@@ -170,6 +211,10 @@ namespace rfb {
     } ExtendedDesktopSizeMsg;
 
     std::list<ExtendedDesktopSizeMsg> extendedDesktopSizeMsgs;
+
+    std::vector<uint8_t> deflateTight2Block(const uint8_t* data, size_t len);
+
+    Tight2DeflateState* tight2Deflate;
   };
 }
 #endif

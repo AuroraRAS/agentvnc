@@ -109,6 +109,7 @@ namespace rfb {
     int qualityLevel;
     int fineQualityLevel;
     int subsampling;
+    bool tightEnabled;
 
   private:
 
