@@ -41,24 +41,42 @@
 #include <core/Rect.h>
 #include <network/TcpSocket.h>
 #include <network/UnixSocket.h>
+#include <rdr/FdInStream.h>
+#include <rdr/FdOutStream.h>
+#include <rfb/Exception.h>
 #include <rfb/PixelBuffer.h>
 #include <rfb/PixelFormat.h>
+#include <rfb/CConnection.h>
+#include <rfb/CMsgReader.h>
+#include <rfb/CMsgWriter.h>
+#include <rfb/CSecurityTight.h>
+#include <rfb/FileTransferClient.h>
+#include <rfb/SConnection.h>
+#include <rfb/SSecurityTight.h>
+#include <rfb/SSecurityVncAuth.h>
+#include <rfb/SecurityClient.h>
 #include <rfb/SecurityServer.h>
 #include <rfb/ServerParams.h>
 #include <rfb/encodings.h>
+#include <rfb/fileTransferTypes.h>
 #include <rfb/msgTypes.h>
 #include <rfb/screenTypes.h>
+#include <rfb/obfuscate.h>
+
+#include <zlib.h>
 
 #ifdef HAVE_H264
 #include <rfb/H264Decoder.h>
 #endif
 
 #include "AdbClient.h"
+#include "AdbFileTransfer.h"
 #include "H264SpsParser.h"
 #include "ScrcpyControl.h"
 #include "ScrcpyServer.h"
 #include "ScrcpyStream.h"
 #include "ZeroCopyOutStream.h"
+#include "../../unix/scrcpyvncserver/parameters.h"
 
 namespace {
 
@@ -1246,3 +1264,1583 @@ TEST(ScrcpyVncEndToEndTest, HandshakeContinuousUpdatesResizeAndH264Decode)
   ::close(ctrlFds[1]);
 }
 #endif
+
+namespace {
+
+class TightTestSConnection : public rfb::SConnection {
+public:
+  TightTestSConnection(network::Socket* s, rfb::AccessRights ar)
+    : rfb::SConnection(s, ar) {}
+
+  rfb::SecurityServer* sec() { return getSecurity(); }
+  bool readyCalled = false;
+
+protected:
+  void clientReady(bool /*shared*/) override
+  {
+    readyCalled = true;
+    client.setDimensions(640, 480);
+    client.setName("TightTest");
+    desktopReady();
+  }
+  void setPixelFormat(const rfb::PixelFormat& pf) override
+  {
+    rfb::SConnection::setPixelFormat(pf);
+  }
+  void setEncodings(int n, const int32_t* enc) override
+  {
+    rfb::SConnection::setEncodings(n, enc);
+  }
+  void framebufferUpdateRequest(const core::Rect& r, bool inc) override
+  {
+    rfb::SConnection::framebufferUpdateRequest(r, inc);
+  }
+  void setDesktopSize(int, int, const rfb::ScreenSet&) override {}
+  void keyEvent(uint32_t, uint32_t, bool) override {}
+  void pointerEvent(const core::Point&, uint16_t) override {}
+};
+
+class TightTestCConnection : public rfb::CConnection {
+public:
+  explicit TightTestCConnection(bool preferTight = true)
+  {
+    supportsFileTransfer = true;
+    preferTightForFileTransfer = preferTight;
+  }
+
+  bool initialized = false;
+  std::vector<uint8_t> h264Frames;
+  bool md5Done = false;
+  uint8_t lastMd5[16] = {};
+  bool dirSizeDone = false;
+  uint64_t lastDirSize = 0;
+
+  rfb::CMsgWriter* msgWriter() { return writer(); }
+
+  void tight2Md5Reply(const uint8_t digest[16]) override
+  {
+    std::memcpy(lastMd5, digest, 16);
+    md5Done = true;
+    rfb::CConnection::tight2Md5Reply(digest);
+  }
+
+  void tight2DirSizeReply(uint64_t size) override
+  {
+    lastDirSize = size;
+    dirSizeDone = true;
+    rfb::CConnection::tight2DirSizeReply(size);
+  }
+
+  void initDone() override
+  {
+    initialized = true;
+    setFramebuffer(new rfb::ManagedPixelBuffer(
+      rfb::PixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
+      server.width(), server.height()));
+  }
+  void bell() override {}
+  void getUserPasswd(std::string* user, std::string* password) override
+  {
+    if (user)
+      *user = "";
+    if (password)
+      *password = "pass1234";
+  }
+  bool verifyCertificate(unsigned int, const uint8_t*, size_t) override
+  {
+    return true;
+  }
+  bool verifyHostKey(const uint8_t*, size_t, const char*) override
+  {
+    return true;
+  }
+  bool dataRect(const core::Rect& r, int encoding) override
+  {
+    if (encoding == rfb::encodingH264) {
+      if (!getInStream()->hasData(8))
+        return false;
+      getInStream()->setRestorePoint();
+      uint32_t len = getInStream()->readU32();
+      getInStream()->skip(4); // flags
+      if (!getInStream()->hasDataOrRestore(len))
+        return false;
+      getInStream()->clearRestorePoint();
+      size_t old = h264Frames.size();
+      h264Frames.resize(old + len);
+      if (len > 0)
+        getInStream()->readBytes(h264Frames.data() + old, len);
+      return true;
+    }
+    return rfb::CConnection::dataRect(r, encoding);
+  }
+};
+
+class ScrcpyFtRecordingHandler : public rfb::FileTransferHandler {
+public:
+  bool ready = false;
+  rfb::FileTransferCaps caps;
+
+  bool listDone = false;
+  bool listOk = false;
+  std::vector<rfb::FileEntry> entries;
+  std::string listErr;
+
+  bool dlStarted = false;
+  bool dlStartOk = false;
+  std::string dlStartErr;
+  std::vector<uint8_t> dlData;
+  bool dlComplete = false;
+  bool dlCompleteOk = false;
+  std::string dlCompleteErr;
+
+  bool ulReady = false;
+  bool ulReadyOk = false;
+  std::string ulReadyErr;
+  int ulAckCount = 0;
+  bool ulComplete = false;
+  bool ulCompleteOk = false;
+  std::string ulCompleteErr;
+
+  bool cmdDone = false;
+  bool cmdOk = false;
+  std::string cmdErr;
+
+  bool cancelDone = false;
+
+  void resetOp()
+  {
+    listDone = listOk = false;
+    entries.clear();
+    listErr.clear();
+    dlStarted = dlStartOk = dlComplete = dlCompleteOk = false;
+    dlStartErr.clear();
+    dlCompleteErr.clear();
+    dlData.clear();
+    ulReady = ulReadyOk = ulComplete = ulCompleteOk = false;
+    ulReadyErr.clear();
+    ulCompleteErr.clear();
+    ulAckCount = 0;
+    cmdDone = cmdOk = false;
+    cmdErr.clear();
+    cancelDone = false;
+  }
+
+  void onFileTransferReady(const rfb::FileTransferCaps& c) override
+  {
+    ready = true;
+    caps = c;
+  }
+  void onListComplete(bool ok, const std::vector<rfb::FileEntry>& e,
+                      const std::string& error) override
+  {
+    listDone = true;
+    listOk = ok;
+    entries = e;
+    listErr = error;
+  }
+  void onDownloadStarted(bool ok, uint64_t, bool,
+                         const std::string& error) override
+  {
+    dlStarted = true;
+    dlStartOk = ok;
+    dlStartErr = error;
+  }
+  void onDownloadData(const uint8_t* data, size_t len) override
+  {
+    if (data && len > 0)
+      dlData.insert(dlData.end(), data, data + len);
+  }
+  void onDownloadComplete(bool ok, const std::string& error) override
+  {
+    dlComplete = true;
+    dlCompleteOk = ok;
+    dlCompleteErr = error;
+  }
+  void onUploadReady(bool ok, const std::string& error) override
+  {
+    ulReady = true;
+    ulReadyOk = ok;
+    ulReadyErr = error;
+  }
+  void onUploadChunkAck() override { ulAckCount++; }
+  void onUploadComplete(bool ok, const std::string& error) override
+  {
+    ulComplete = true;
+    ulCompleteOk = ok;
+    ulCompleteErr = error;
+  }
+  void onCommandComplete(bool ok, const std::string& error) override
+  {
+    cmdDone = true;
+    cmdOk = ok;
+    cmdErr = error;
+  }
+  void onCancelComplete() override { cancelDone = true; }
+};
+
+class MockAdbFileDaemon {
+public:
+  struct Node {
+    bool isDir = false;
+    bool isSymlink = false;
+    bool executable = false;
+    std::string linkTarget;
+    std::vector<uint8_t> data;
+    int64_t mtime = 1700000100LL;
+  };
+
+  MockAdbFileDaemon(bool v2Features = true)
+    : v2Features_(v2Features), srvFd_(-1), port_(0), stop_(false)
+  {
+    nodes_["/"] = {true, false, false, "", {}, 1700000000LL};
+    nodes_["/storage"] = {true, false, false, "", {}, 1700000000LL};
+    nodes_["/storage/emulated"] = {true, false, false, "", {}, 1700000000LL};
+    nodes_["/sdcard"] = {false, true, false, "/storage/emulated", {}, 1700000000LL};
+    nodes_["/data"] = {true, false, false, "", {}, 1700000000LL};
+    nodes_["/data/local"] = {true, false, false, "", {}, 1700000000LL};
+    nodes_["/data/local/tmp"] = {true, false, false, "", {}, 1700000000LL};
+    nodes_["/system"] = {true, false, false, "", {}, 1700000000LL};
+    std::string hello = "Hello Android!";
+    nodes_["/data/local/tmp/hello.txt"] = {
+      false, false, false, "",
+      std::vector<uint8_t>(hello.begin(), hello.end()), 1700000500LL
+    };
+    nodes_["/data/local/tmp/empty.txt"] = {
+      false, false, false, "", {}, 1700000200LL
+    };
+    nodes_["/data/local/tmp/run.sh"] = {
+      false, false, true, "", {'#', '!', '/', 'b', 'i', 'n', '\n'}, 1700000300LL
+    };
+  }
+
+  ~MockAdbFileDaemon() { stop(); }
+
+  bool start()
+  {
+    srvFd_ = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (srvFd_ < 0)
+      return false;
+    int one = 1;
+    ::setsockopt(srvFd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
+    struct sockaddr_in addr;
+    std::memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (::bind(srvFd_, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr)) != 0 ||
+        ::listen(srvFd_, 16) != 0)
+      return false;
+    port_ = network::getSockPort(srvFd_);
+    thread_ = std::thread(&MockAdbFileDaemon::run, this);
+    return true;
+  }
+
+  void stop()
+  {
+    stop_ = true;
+    if (srvFd_ >= 0) {
+      ::shutdown(srvFd_, SHUT_RDWR);
+      ::close(srvFd_);
+      srvFd_ = -1;
+    }
+    if (thread_.joinable())
+      thread_.join();
+  }
+
+  int port() const { return port_; }
+
+  bool getFile(const std::string& path, std::vector<uint8_t>* out,
+               bool* execOut = nullptr)
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    auto it = nodes_.find(path);
+    if (it == nodes_.end() || it->second.isDir)
+      return false;
+    if (out)
+      *out = it->second.data;
+    if (execOut)
+      *execOut = it->second.executable;
+    return true;
+  }
+
+  bool hasPath(const std::string& path)
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    return nodes_.find(path) != nodes_.end();
+  }
+
+private:
+  static void putLe32(uint8_t* p, uint32_t v)
+  {
+    p[0] = static_cast<uint8_t>(v & 0xff);
+    p[1] = static_cast<uint8_t>((v >> 8) & 0xff);
+    p[2] = static_cast<uint8_t>((v >> 16) & 0xff);
+    p[3] = static_cast<uint8_t>((v >> 24) & 0xff);
+  }
+  static void putLe64(uint8_t* p, uint64_t v)
+  {
+    putLe32(p, static_cast<uint32_t>(v & 0xffffffffu));
+    putLe32(p + 4, static_cast<uint32_t>(v >> 32));
+  }
+  static uint32_t getLe32(const uint8_t* p)
+  {
+    return static_cast<uint32_t>(p[0]) |
+           (static_cast<uint32_t>(p[1]) << 8) |
+           (static_cast<uint32_t>(p[2]) << 16) |
+           (static_cast<uint32_t>(p[3]) << 24);
+  }
+  static bool readExact(int fd, uint8_t* buf, size_t len)
+  {
+    size_t off = 0;
+    while (off < len) {
+      ssize_t n = ::recv(fd, buf + off, len - off, 0);
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        return false;
+      off += static_cast<size_t>(n);
+    }
+    return true;
+  }
+  static bool writeExact(int fd, const void* buf, size_t len)
+  {
+    const uint8_t* p = static_cast<const uint8_t*>(buf);
+    size_t off = 0;
+    while (off < len) {
+      ssize_t n = ::send(fd, p + off, len - off, MSG_NOSIGNAL);
+      if (n < 0 && errno == EINTR)
+        continue;
+      if (n <= 0)
+        return false;
+      off += static_cast<size_t>(n);
+    }
+    return true;
+  }
+  static std::string readAdbCmd(int fd, bool* ok)
+  {
+    char hex[5] = {};
+    if (!readExact(fd, reinterpret_cast<uint8_t*>(hex), 4)) {
+      *ok = false;
+      return "";
+    }
+    unsigned len = 0;
+    std::sscanf(hex, "%4x", &len);
+    std::string cmd(len, '\0');
+    if (len > 0 && !readExact(fd, reinterpret_cast<uint8_t*>(&cmd[0]), len)) {
+      *ok = false;
+      return "";
+    }
+    *ok = true;
+    return cmd;
+  }
+
+  uint32_t modeForNode(const Node& n, bool follow) const
+  {
+    if (n.isSymlink && !follow)
+      return 0120777u;
+    if (n.isSymlink && follow) {
+      auto it = nodes_.find(n.linkTarget);
+      if (it != nodes_.end())
+        return modeForNode(it->second, true);
+    }
+    if (n.isDir)
+      return 0040755u;
+    return n.executable ? 0100755u : 0100644u;
+  }
+
+  const Node* resolveNode(const std::string& path, bool follow) const
+  {
+    auto it = nodes_.find(path);
+    if (it == nodes_.end())
+      return nullptr;
+    if (follow && it->second.isSymlink) {
+      auto tit = nodes_.find(it->second.linkTarget);
+      return (tit == nodes_.end()) ? nullptr : &tit->second;
+    }
+    return &it->second;
+  }
+
+  static std::string unquoteSingle(const std::string& s, size_t start,
+                                   size_t* nextPos)
+  {
+    if (start >= s.size() || s[start] != '\'')
+      return "";
+    std::string out;
+    size_t i = start + 1;
+    while (i < s.size()) {
+      if (s[i] == '\'') {
+        if (i + 3 < s.size() && s[i + 1] == '\\' && s[i + 2] == '\'' &&
+            s[i + 3] == '\'') {
+          out.push_back('\'');
+          i += 4;
+          continue;
+        }
+        *nextPos = i + 1;
+        return out;
+      }
+      out.push_back(s[i++]);
+    }
+    *nextPos = s.size();
+    return out;
+  }
+
+  void handleSync(int fd)
+  {
+    writeExact(fd, "OKAY", 4);
+    while (true) {
+      uint8_t hdr[8];
+      if (!readExact(fd, hdr, 8))
+        break;
+      uint32_t len = getLe32(hdr + 4);
+      if (std::memcmp(hdr, "QUIT", 4) == 0)
+        break;
+
+      if (std::memcmp(hdr, "STA2", 4) == 0 ||
+          std::memcmp(hdr, "LST2", 4) == 0 ||
+          std::memcmp(hdr, "STAT", 4) == 0) {
+        std::string p(len, '\0');
+        if (len > 0 && !readExact(fd, reinterpret_cast<uint8_t*>(&p[0]), len))
+          break;
+        bool follow = std::memcmp(hdr, "LST2", 4) != 0;
+        std::lock_guard<std::mutex> lk(mu_);
+        const Node* node = resolveNode(p, follow);
+        uint32_t err = node ? 0u : static_cast<uint32_t>(ENOENT);
+        uint32_t mode = 0;
+        uint64_t size = 0;
+        int64_t mtime = 0;
+        if (node) {
+          auto it = nodes_.find(p);
+          mode = (!follow && it->second.isSymlink)
+            ? 0120777u : modeForNode(*node, true);
+          size = node->isDir ? 0u : node->data.size();
+          mtime = node->mtime;
+        }
+        if (std::memcmp(hdr, "STAT", 4) == 0) {
+          uint8_t resp[16] = {};
+          std::memcpy(resp, "STAT", 4);
+          putLe32(resp + 4, mode);
+          putLe32(resp + 8, static_cast<uint32_t>(size));
+          putLe32(resp + 12, static_cast<uint32_t>(mtime));
+          writeExact(fd, resp, sizeof(resp));
+        } else {
+          uint8_t resp[72] = {};
+          std::memcpy(resp, hdr, 4);
+          putLe32(resp + 4, err);
+          putLe32(resp + 24, mode);
+          putLe64(resp + 40, size);
+          putLe64(resp + 56, static_cast<uint64_t>(mtime));
+          writeExact(fd, resp, sizeof(resp));
+        }
+        continue;
+      }
+
+      if (std::memcmp(hdr, "LIS2", 4) == 0 ||
+          std::memcmp(hdr, "LIST", 4) == 0) {
+        bool v2 = std::memcmp(hdr, "LIS2", 4) == 0;
+        std::string dir(len, '\0');
+        if (len > 0 && !readExact(fd, reinterpret_cast<uint8_t*>(&dir[0]), len))
+          break;
+        std::vector<std::pair<std::string, Node>> children;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          const Node* dn = resolveNode(dir, true);
+          std::string base = dir;
+          auto rawIt = nodes_.find(dir);
+          if (rawIt != nodes_.end() && rawIt->second.isSymlink)
+            base = rawIt->second.linkTarget;
+          std::string prefix = (base == "/") ? "/" : (base + "/");
+          if (dn && dn->isDir) {
+            for (const auto& kv : nodes_) {
+              if (kv.first == base)
+                continue;
+              if (kv.first.compare(0, prefix.size(), prefix) != 0)
+                continue;
+              std::string rest = kv.first.substr(prefix.size());
+              if (rest.find('/') != std::string::npos)
+                continue;
+              children.emplace_back(rest, kv.second);
+            }
+          }
+        }
+        for (const auto& ch : children) {
+          uint32_t mode = ch.second.isSymlink
+            ? 0120777u : (ch.second.isDir ? 0040755u : (ch.second.executable ? 0100755u : 0100644u));
+          uint64_t size = ch.second.isDir ? 0u : ch.second.data.size();
+          if (v2) {
+            uint8_t dnt[76] = {};
+            std::memcpy(dnt, "DNT2", 4);
+            putLe32(dnt + 24, mode);
+            putLe64(dnt + 40, size);
+            putLe64(dnt + 56, static_cast<uint64_t>(ch.second.mtime));
+            putLe32(dnt + 72, static_cast<uint32_t>(ch.first.size()));
+            writeExact(fd, dnt, sizeof(dnt));
+            writeExact(fd, ch.first.data(), ch.first.size());
+          } else {
+            uint8_t dnt[20] = {};
+            std::memcpy(dnt, "DENT", 4);
+            putLe32(dnt + 4, mode);
+            putLe32(dnt + 8, static_cast<uint32_t>(size));
+            putLe32(dnt + 12, static_cast<uint32_t>(ch.second.mtime));
+            putLe32(dnt + 16, static_cast<uint32_t>(ch.first.size()));
+            writeExact(fd, dnt, sizeof(dnt));
+            writeExact(fd, ch.first.data(), ch.first.size());
+          }
+        }
+        uint8_t done[76] = {};
+        std::memcpy(done, "DONE", 4);
+        writeExact(fd, done, v2 ? 76 : 20);
+        continue;
+      }
+
+      if (std::memcmp(hdr, "RECV", 4) == 0) {
+        std::string p(len, '\0');
+        if (len > 0 && !readExact(fd, reinterpret_cast<uint8_t*>(&p[0]), len))
+          break;
+        std::vector<uint8_t> data;
+        bool ok = false;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          const Node* n = resolveNode(p, true);
+          if (n && !n->isDir) {
+            data = n->data;
+            ok = true;
+          }
+        }
+        if (!ok) {
+          const char* msg = "No such file";
+          uint8_t f[8];
+          std::memcpy(f, "FAIL", 4);
+          putLe32(f + 4, static_cast<uint32_t>(std::strlen(msg)));
+          writeExact(fd, f, 8);
+          writeExact(fd, msg, std::strlen(msg));
+          continue;
+        }
+        size_t off = 0;
+        while (off < data.size()) {
+          size_t chunk = std::min<size_t>(32768u, data.size() - off);
+          uint8_t d[8];
+          std::memcpy(d, "DATA", 4);
+          putLe32(d + 4, static_cast<uint32_t>(chunk));
+          writeExact(fd, d, 8);
+          writeExact(fd, data.data() + off, chunk);
+          off += chunk;
+        }
+        uint8_t done[8] = {'D', 'O', 'N', 'E', 0, 0, 0, 0};
+        writeExact(fd, done, 8);
+        continue;
+      }
+
+      if (std::memcmp(hdr, "SEND", 4) == 0) {
+        std::string spec(len, '\0');
+        if (len > 0 && !readExact(fd, reinterpret_cast<uint8_t*>(&spec[0]), len))
+          break;
+        size_t comma = spec.rfind(',');
+        std::string path = (comma == std::string::npos) ? spec : spec.substr(0, comma);
+        if (path.compare(0, 7, "/system") == 0) {
+          const char* msg = "Read-only file system";
+          uint8_t f[8];
+          std::memcpy(f, "FAIL", 4);
+          putLe32(f + 4, static_cast<uint32_t>(std::strlen(msg)));
+          writeExact(fd, f, 8);
+          writeExact(fd, msg, std::strlen(msg));
+          continue;
+        }
+        std::vector<uint8_t> buf;
+        uint32_t mtime = 0;
+        bool aborted = false;
+        while (true) {
+          uint8_t ch[8];
+          if (!readExact(fd, ch, 8)) {
+            aborted = true;
+            break;
+          }
+          uint32_t clen = getLe32(ch + 4);
+          if (std::memcmp(ch, "DATA", 4) == 0) {
+            size_t old = buf.size();
+            buf.resize(old + clen);
+            if (clen > 0 && !readExact(fd, buf.data() + old, clen)) {
+              aborted = true;
+              break;
+            }
+          } else if (std::memcmp(ch, "DONE", 4) == 0) {
+            mtime = clen;
+            break;
+          } else if (std::memcmp(ch, "QUIT", 4) == 0) {
+            aborted = true;
+            break;
+          }
+        }
+        if (aborted)
+          break;
+        {
+          std::lock_guard<std::mutex> lk(mu_);
+          nodes_[path] = {false, false, false, "", std::move(buf),
+                          static_cast<int64_t>(mtime)};
+        }
+        uint8_t ok[8] = {'O', 'K', 'A', 'Y', 0, 0, 0, 0};
+        writeExact(fd, ok, 8);
+        continue;
+      }
+    }
+  }
+
+  void sendShellV2Pkt(int fd, uint8_t id, const void* data, size_t len)
+  {
+    uint8_t hdr[5];
+    hdr[0] = id;
+    putLe32(hdr + 1, static_cast<uint32_t>(len));
+    writeExact(fd, hdr, 5);
+    if (len > 0)
+      writeExact(fd, data, len);
+  }
+
+  void handleShell(int fd, const std::string& cmd, bool v2)
+  {
+    writeExact(fd, "OKAY", 4);
+
+    if (v2 && cmd.find("exec 4>&1; truncate -s ") == 0) {
+      unsigned long long off = 0;
+      std::sscanf(cmd.c_str(), "exec 4>&1; truncate -s %llu", &off);
+      size_t qpos = cmd.find('\'');
+      size_t next = 0;
+      std::string path = unquoteSingle(cmd, qpos, &next);
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = nodes_.find(path);
+        if (it == nodes_.end() || it->second.isDir || off > it->second.data.size()) {
+          const char* err = "truncate failed";
+          sendShellV2Pkt(fd, 2, err, std::strlen(err));
+          uint8_t ex = 1;
+          sendShellV2Pkt(fd, 3, &ex, 1);
+          return;
+        }
+        it->second.data.resize(static_cast<size_t>(off));
+      }
+      sendShellV2Pkt(fd, 1, "OK", 2);
+      std::vector<uint8_t> appended;
+      while (true) {
+        uint8_t hdr[5];
+        if (!readExact(fd, hdr, 5))
+          break;
+        uint32_t plen = getLe32(hdr + 1);
+        std::vector<uint8_t> pl(plen);
+        if (plen > 0 && !readExact(fd, pl.data(), plen))
+          break;
+        if (hdr[0] == 0) {
+          appended.insert(appended.end(), pl.begin(), pl.end());
+        } else if (hdr[0] == 4) {
+          break;
+        }
+      }
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = nodes_.find(path);
+        if (it != nodes_.end())
+          it->second.data.insert(it->second.data.end(),
+                                 appended.begin(), appended.end());
+      }
+      uint8_t ex = 0;
+      sendShellV2Pkt(fd, 3, &ex, 1);
+      return;
+    }
+
+    if (v2) {
+      // Drain stdin close packet if client sends it
+      struct pollfd pfd = { fd, POLLIN, 0 };
+      if (::poll(&pfd, 1, 20) > 0) {
+        uint8_t hdr[5];
+        if (readExact(fd, hdr, 5)) {
+          uint32_t plen = getLe32(hdr + 1);
+          if (plen > 0) {
+            std::vector<uint8_t> discard(plen);
+            readExact(fd, discard.data(), plen);
+          }
+        }
+      }
+    }
+
+    int rc = 0;
+    std::string out;
+    std::string err;
+
+    auto stripSuffix = [](const std::string& c) -> std::string {
+      size_t pos = c.find("; printf");
+      return (pos == std::string::npos) ? c : c.substr(0, pos);
+    };
+    std::string core = stripSuffix(cmd);
+
+    if (core.compare(0, 9, "mkdir -- ") == 0) {
+      size_t next = 0;
+      std::string path = unquoteSingle(core, 9, &next);
+      std::lock_guard<std::mutex> lk(mu_);
+      if (nodes_.count(path)) {
+        rc = 1;
+        err = "File exists";
+      } else {
+        nodes_[path] = {true, false, false, "", {}, 1700001000LL};
+      }
+    } else if (core.compare(0, 9, "rm -r -- ") == 0) {
+      size_t next = 0;
+      std::string path = unquoteSingle(core, 9, &next);
+      std::lock_guard<std::mutex> lk(mu_);
+      if (!nodes_.count(path)) {
+        rc = 1;
+        err = "No such file or directory";
+      } else {
+        std::string prefix = path + "/";
+        for (auto it = nodes_.begin(); it != nodes_.end();) {
+          if (it->first == path ||
+              it->first.compare(0, prefix.size(), prefix) == 0)
+            it = nodes_.erase(it);
+          else
+            ++it;
+        }
+      }
+    } else if (core.compare(0, 6, "mv -- ") == 0) {
+      size_t next = 0;
+      std::string oldP = unquoteSingle(core, 6, &next);
+      std::string newP = unquoteSingle(core, next + 1, &next);
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = nodes_.find(oldP);
+      if (it == nodes_.end()) {
+        rc = 1;
+        err = "No such file or directory";
+      } else {
+        nodes_[newP] = it->second;
+        nodes_.erase(it);
+      }
+    } else if (core.compare(0, 10, "chmod 755 ") == 0) {
+      size_t q = core.find('\'');
+      size_t next = 0;
+      std::string path = unquoteSingle(core, q, &next);
+      std::lock_guard<std::mutex> lk(mu_);
+      auto it = nodes_.find(path);
+      if (it != nodes_.end())
+        it->second.executable = true;
+    } else if (core.compare(0, 9, "touch -c ") == 0) {
+      rc = 0;
+    } else if (core.compare(0, 8, "find -H ") == 0) {
+      size_t next = 0;
+      std::string path = unquoteSingle(core, 8, &next);
+      std::lock_guard<std::mutex> lk(mu_);
+      std::string prefix = (path == "/") ? "/" : (path + "/");
+      for (const auto& kv : nodes_) {
+        if (kv.first == path ||
+            kv.first.compare(0, prefix.size(), prefix) == 0) {
+          if (!kv.second.isDir)
+            out += std::to_string(kv.second.data.size()) + "\n";
+        }
+      }
+    } else if (core.compare(0, 10, "md5sum -- ") == 0 ||
+               core.find("| md5sum") != std::string::npos) {
+      // Compute real MD5 using simple RFC1321 or host md5sum? We can invoke
+      // standard MD5 over the node bytes with a compact helper below.
+      std::string path;
+      uint64_t skip = 0;
+      uint64_t count = UINT64_MAX;
+      if (core.compare(0, 10, "md5sum -- ") == 0) {
+        size_t next = 0;
+        path = unquoteSingle(core, 10, &next);
+      } else {
+        size_t q = core.find('\'');
+        size_t next = 0;
+        path = unquoteSingle(core, q, &next);
+        std::sscanf(core.c_str() + next,
+                    " bs=65536 iflag=skip_bytes,count_bytes skip=%llu count=%llu",
+                    reinterpret_cast<unsigned long long*>(&skip),
+                    reinterpret_cast<unsigned long long*>(&count));
+      }
+      std::vector<uint8_t> slice;
+      {
+        std::lock_guard<std::mutex> lk(mu_);
+        auto it = nodes_.find(path);
+        if (it == nodes_.end() || it->second.isDir) {
+          rc = 1;
+          err = "No such file";
+        } else if (skip <= it->second.data.size()) {
+          size_t take = static_cast<size_t>(
+            std::min<uint64_t>(count, it->second.data.size() - skip));
+          slice.assign(it->second.data.begin() + static_cast<ptrdiff_t>(skip),
+                       it->second.data.begin() + static_cast<ptrdiff_t>(skip + take));
+        }
+      }
+      if (rc == 0) {
+        // Known MD5 values or compute via python3/openssl? Wait: compute MD5 directly in C++!
+        out = computeMd5Hex(slice.data(), slice.size()) + "  " + path + "\n";
+      }
+    } else {
+      out = "hello-v1\n";
+    }
+
+    if (v2) {
+      if (!out.empty())
+        sendShellV2Pkt(fd, 1, out.data(), out.size());
+      if (!err.empty())
+        sendShellV2Pkt(fd, 2, err.data(), err.size());
+      uint8_t ex = static_cast<uint8_t>(rc);
+      sendShellV2Pkt(fd, 3, &ex, 1);
+    } else {
+      std::string combined = out + err + "\n__SCRCPY_ADB_RC__" +
+                             std::to_string(rc) + "\n";
+      writeExact(fd, combined.data(), combined.size());
+    }
+  }
+
+  static std::string computeMd5Hex(const uint8_t* data, size_t len)
+  {
+    static const uint32_t kS[64] = {
+      7,12,17,22,7,12,17,22,7,12,17,22,7,12,17,22,
+      5, 9,14,20,5, 9,14,20,5, 9,14,20,5, 9,14,20,
+      4,11,16,23,4,11,16,23,4,11,16,23,4,11,16,23,
+      6,10,15,21,6,10,15,21,6,10,15,21,6,10,15,21
+    };
+    static const uint32_t kK[64] = {
+      0xd76aa478,0xe8c7b756,0x242070db,0xc1bdceee,0xf57c0faf,0x4787c62a,0xa8304613,0xfd469501,
+      0x698098d8,0x8b44f7af,0xffff5bb1,0x895cd7be,0x6b901122,0xfd987193,0xa679438e,0x49b40821,
+      0xf61e2562,0xc040b340,0x265e5a51,0xe9b6c7aa,0xd62f105d,0x02441453,0xd8a1e681,0xe7d3fbc8,
+      0x21e1cde6,0xc33707d6,0xf4d50d87,0x455a14ed,0xa9e3e905,0xfcefa3f8,0x676f02d9,0x8d2a4c8a,
+      0xfffa3942,0x8771f681,0x6d9d6122,0xfde5380c,0xa4beea44,0x4bdecfa9,0xf6bb4b60,0xbebfbc70,
+      0x289b7ec6,0xeaa127fa,0xd4ef3085,0x04881d05,0xd9d4d039,0xe6db99e5,0x1fa27cf8,0xc4ac5665,
+      0xf4292244,0x432aff97,0xab9423a7,0xfc93a039,0x655b59c3,0x8f0ccc92,0xffeff47d,0x85845dd1,
+      0x6fa87e4f,0xfe2ce6e0,0xa3014314,0x4e0811a1,0xf7537e82,0xbd3af235,0x2ad7d2bb,0xeb86d391
+    };
+    std::vector<uint8_t> msg(data, data + len);
+    msg.push_back(0x80);
+    while ((msg.size() % 64) != 56)
+      msg.push_back(0);
+    uint64_t bitLen = static_cast<uint64_t>(len) * 8ULL;
+    for (int i = 0; i < 8; ++i)
+      msg.push_back(static_cast<uint8_t>((bitLen >> (i * 8)) & 0xff));
+    uint32_t a0 = 0x67452301u, b0 = 0xefcdab89u, c0 = 0x98badcfeu, d0 = 0x10325476u;
+    for (size_t off = 0; off < msg.size(); off += 64) {
+      uint32_t M[16];
+      for (int i = 0; i < 16; ++i)
+        M[i] = getLe32(msg.data() + off + i * 4);
+      uint32_t A = a0, B = b0, C = c0, D = d0;
+      for (int i = 0; i < 64; ++i) {
+        uint32_t F, g;
+        if (i < 16) { F = (B & C) | ((~B) & D); g = static_cast<uint32_t>(i); }
+        else if (i < 32) { F = (D & B) | ((~D) & C); g = static_cast<uint32_t>((5 * i + 1) % 16); }
+        else if (i < 48) { F = B ^ C ^ D; g = static_cast<uint32_t>((3 * i + 5) % 16); }
+        else { F = C ^ (B | (~D)); g = static_cast<uint32_t>((7 * i) % 16); }
+        F = F + A + kK[i] + M[g];
+        A = D; D = C; C = B;
+        B = B + ((F << kS[i]) | (F >> (32 - kS[i])));
+      }
+      a0 += A; b0 += B; c0 += C; d0 += D;
+    }
+    uint8_t dig[16];
+    putLe32(dig, a0); putLe32(dig + 4, b0);
+    putLe32(dig + 8, c0); putLe32(dig + 12, d0);
+    char hex[33];
+    for (int i = 0; i < 16; ++i)
+      std::snprintf(hex + i * 2, 3, "%02x", dig[i]);
+    return std::string(hex, 32);
+  }
+
+  void handleClient(int fd)
+  {
+    bool ok = false;
+    std::string cmd = readAdbCmd(fd, &ok);
+    if (!ok) {
+      ::close(fd);
+      return;
+    }
+    if (cmd == "host:devices") {
+      std::string pl = "mock-dev\tdevice\n";
+      char resp[64];
+      int n = std::snprintf(resp, sizeof(resp), "OKAY%04x%s",
+                            static_cast<unsigned>(pl.size()), pl.c_str());
+      writeExact(fd, resp, static_cast<size_t>(n));
+      ::close(fd);
+      return;
+    }
+    if (cmd == "host-serial:mock-dev:features") {
+      if (v2Features_) {
+        std::string pl = "stat_v2,ls_v2,shell_v2";
+        char resp[64];
+        int n = std::snprintf(resp, sizeof(resp), "OKAY%04x%s",
+                              static_cast<unsigned>(pl.size()), pl.c_str());
+        writeExact(fd, resp, static_cast<size_t>(n));
+      } else {
+        const char* err = "unknown command";
+        char resp[64];
+        int n = std::snprintf(resp, sizeof(resp), "FAIL%04x%s",
+                              static_cast<unsigned>(std::strlen(err)), err);
+        writeExact(fd, resp, static_cast<size_t>(n));
+      }
+      ::close(fd);
+      return;
+    }
+    if (cmd == "host:transport:mock-dev") {
+      writeExact(fd, "OKAY", 4);
+      std::string sub = readAdbCmd(fd, &ok);
+      if (ok && sub == "sync:") {
+        handleSync(fd);
+      } else if (ok && sub.compare(0, 9, "shell,v2:") == 0) {
+        handleShell(fd, sub.substr(9), true);
+      } else if (ok && sub.compare(0, 6, "shell:") == 0) {
+        handleShell(fd, sub.substr(6), false);
+      }
+      ::close(fd);
+      return;
+    }
+    ::close(fd);
+  }
+
+  void run()
+  {
+    std::vector<std::thread> workers;
+    while (!stop_) {
+      struct pollfd pfd = { srvFd_, POLLIN, 0 };
+      if (::poll(&pfd, 1, 50) <= 0)
+        continue;
+      int c = ::accept(srvFd_, nullptr, nullptr);
+      if (c < 0)
+        break;
+      workers.emplace_back([this, c]() { handleClient(c); });
+    }
+    for (auto& w : workers)
+      w.join();
+  }
+
+  bool v2Features_;
+  int srvFd_;
+  int port_;
+  std::atomic<bool> stop_;
+  std::thread thread_;
+  std::mutex mu_;
+  std::map<std::string, Node> nodes_;
+};
+
+} // namespace
+
+TEST(SSecurityTightTest, NegotiatesNoneAndVncAuthAndRejectsInvalid)
+{
+  // 1. Tight + None on RFB 3.8
+  {
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    auto* srvSock = new network::UnixSocket(fds[0]);
+    auto* cliSock = new network::UnixSocket(fds[1]);
+
+    TightTestSConnection srv(srvSock, rfb::AccessDefault);
+    std::list<uint32_t> secTypes1 = {rfb::secTypeTight, rfb::secTypeNone};
+    srv.sec()->SetSecTypes(secTypes1);
+    srv.initialiseProtocol();
+
+    TightTestCConnection cli(true);
+    cli.setStreams(&cliSock->inStream(), &cliSock->outStream());
+    cli.initialiseProtocol();
+
+    std::thread serverLoop([&]() {
+      while (!srv.readyCalled) {
+        if (!srv.processMsg())
+          ::poll(nullptr, 0, 2);
+      }
+    });
+    while (!cli.initialized) {
+      if (!cli.processMsg())
+        ::poll(nullptr, 0, 2);
+    }
+    serverLoop.join();
+    EXPECT_TRUE(cli.server.tightEnabled);
+    EXPECT_TRUE(srv.client.tightEnabled);
+    delete cliSock;
+    delete srvSock;
+  }
+
+  // 1b. Tight + None on RFB 3.7 (effective type None skips SecurityResult)
+  {
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    auto* srvSock = new network::UnixSocket(fds[0]);
+
+    TightTestSConnection srv(srvSock, rfb::AccessDefault);
+    std::list<uint32_t> secTypes1b = {rfb::secTypeTight, rfb::secTypeNone};
+    srv.sec()->SetSecTypes(secTypes1b);
+    srv.initialiseProtocol();
+
+    std::atomic<bool> stopSrv{false};
+    std::thread serverLoop([&]() {
+      while (!stopSrv && !srv.readyCalled) {
+        if (!srv.processMsg())
+          ::poll(nullptr, 0, 2);
+      }
+    });
+
+    auto readFdExact = [](int fd, uint8_t* dst, size_t len) -> bool {
+      size_t off = 0;
+      while (off < len) {
+        ssize_t n = ::recv(fd, dst + off, len - off, 0);
+        if (n < 0 && errno == EINTR)
+          continue;
+        if (n <= 0)
+          return false;
+        off += static_cast<size_t>(n);
+      }
+      return true;
+    };
+
+    uint8_t srvVer[12];
+    ASSERT_TRUE(readFdExact(fds[1], srvVer, 12));
+    writeAll(fds[1], "RFB 003.007\n", 12);
+
+    uint8_t nSec = 0;
+    ASSERT_TRUE(readFdExact(fds[1], &nSec, 1));
+    ASSERT_GT(nSec, 0u);
+    std::vector<uint8_t> secList(nSec);
+    ASSERT_TRUE(readFdExact(fds[1], secList.data(), nSec));
+    EXPECT_NE(std::find(secList.begin(), secList.end(), rfb::secTypeTight),
+              secList.end());
+
+    uint8_t chooseTight = rfb::secTypeTight;
+    writeAll(fds[1], &chooseTight, 1);
+
+    uint8_t hdr[8];
+    ASSERT_TRUE(readFdExact(fds[1], hdr, 8));
+    uint32_t nTunnels = (static_cast<uint32_t>(hdr[0]) << 24) |
+                        (static_cast<uint32_t>(hdr[1]) << 16) |
+                        (static_cast<uint32_t>(hdr[2]) << 8) | hdr[3];
+    uint32_t nAuth = (static_cast<uint32_t>(hdr[4]) << 24) |
+                     (static_cast<uint32_t>(hdr[5]) << 16) |
+                     (static_cast<uint32_t>(hdr[6]) << 8) | hdr[7];
+    EXPECT_EQ(nTunnels, 0u);
+    ASSERT_GE(nAuth, 1u);
+    std::vector<uint8_t> caps(nAuth * 16);
+    ASSERT_TRUE(readFdExact(fds[1], caps.data(), caps.size()));
+    bool foundNoneAuth = false;
+    for (uint32_t i = 0; i < nAuth; ++i) {
+      uint32_t code = (static_cast<uint32_t>(caps[i * 16]) << 24) |
+                      (static_cast<uint32_t>(caps[i * 16 + 1]) << 16) |
+                      (static_cast<uint32_t>(caps[i * 16 + 2]) << 8) |
+                      caps[i * 16 + 3];
+      if (code == rfb::secTypeNone)
+        foundNoneAuth = true;
+    }
+    EXPECT_TRUE(foundNoneAuth);
+
+    // Choose None auth and immediately send ClientInit (no SecurityResult in 3.7)
+    uint8_t authNone[4] = {0, 0, 0, rfb::secTypeNone};
+    writeAll(fds[1], authNone, 4);
+    uint8_t clientInitShared = 1;
+    writeAll(fds[1], &clientInitShared, 1);
+
+    // Next 4 bytes must be ServerInit framebuffer width=640, height=480 (not SecurityResult=0)
+    uint8_t srvInitSize[4];
+    ASSERT_TRUE(readFdExact(fds[1], srvInitSize, 4));
+    uint16_t fbW = static_cast<uint16_t>((srvInitSize[0] << 8) | srvInitSize[1]);
+    uint16_t fbH = static_cast<uint16_t>((srvInitSize[2] << 8) | srvInitSize[3]);
+    EXPECT_EQ(fbW, 640u);
+    EXPECT_EQ(fbH, 480u);
+
+    stopSrv = true;
+    serverLoop.join();
+    EXPECT_TRUE(srv.client.tightEnabled);
+    ::close(fds[1]);
+    delete srvSock;
+  }
+
+  // 2. Tight + VncAuth
+  {
+    std::vector<uint8_t> obf = rfb::obfuscate("pass1234");
+    char pwTmpl[] = "/tmp/scrcpy-tight-pw-XXXXXX";
+    int pwFd = ::mkstemp(pwTmpl);
+    ASSERT_GE(pwFd, 0);
+    ASSERT_EQ(::write(pwFd, obf.data(), obf.size()),
+              static_cast<ssize_t>(obf.size()));
+    ::close(pwFd);
+    rfb::SSecurityVncAuth::vncAuthPasswdFile.setParam(pwTmpl);
+
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    auto* srvSock = new network::UnixSocket(fds[0]);
+    auto* cliSock = new network::UnixSocket(fds[1]);
+
+    TightTestSConnection srv(srvSock, rfb::AccessDefault);
+    std::list<uint32_t> secTypes2 = {rfb::secTypeTight, rfb::secTypeVncAuth};
+    srv.sec()->SetSecTypes(secTypes2);
+    srv.initialiseProtocol();
+
+    TightTestCConnection cli(true);
+    cli.setStreams(&cliSock->inStream(), &cliSock->outStream());
+    cli.initialiseProtocol();
+
+    std::thread serverLoop([&]() {
+      while (!srv.readyCalled) {
+        if (!srv.processMsg())
+          ::poll(nullptr, 0, 2);
+      }
+    });
+    while (!cli.initialized) {
+      if (!cli.processMsg())
+        ::poll(nullptr, 0, 2);
+    }
+    serverLoop.join();
+    EXPECT_TRUE(cli.server.tightEnabled);
+    rfb::SSecurityVncAuth::vncAuthPasswdFile.setParam("");
+    ::unlink(pwTmpl);
+    delete cliSock;
+    delete srvSock;
+  }
+
+  // 3. Rejects unoffered Tight auth code
+  {
+    int fds[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+    auto* srvSock = new network::UnixSocket(fds[0]);
+    TightTestSConnection srv(srvSock, rfb::AccessDefault);
+    std::list<uint32_t> secTypes3 = {rfb::secTypeTight, rfb::secTypeNone};
+    srv.sec()->SetSecTypes(secTypes3);
+
+    rfb::SSecurityTight st(&srv, srv.sec());
+    EXPECT_FALSE(st.processMsg());
+    // Client replies with tightAuthVnc (2), which was NOT offered!
+    uint8_t badChoice[4] = {0, 0, 0, 2};
+    writeAll(fds[1], badChoice, 4);
+    EXPECT_THROW(st.processMsg(), rfb::protocol_error);
+    ::close(fds[1]);
+    delete srvSock;
+  }
+}
+
+TEST(AdbFileTransferTest, PathNormalizationAndConfinement)
+{
+  std::string dev, virt, err;
+
+  EXPECT_TRUE(AdbFileTransferSession::normalizePath(
+    "", "", true, &dev, &virt, &err));
+  EXPECT_EQ(dev, "/");
+  EXPECT_EQ(virt, "/");
+
+  EXPECT_FALSE(AdbFileTransferSession::normalizePath(
+    "", "", false, &dev, &virt, &err));
+
+  EXPECT_TRUE(AdbFileTransferSession::normalizePath(
+    "\\sdcard\\..\\..\\data\\local\\tmp\\", "", false, &dev, &virt, &err));
+  EXPECT_EQ(dev, "/data/local/tmp");
+  EXPECT_EQ(virt, "/data/local/tmp");
+
+  EXPECT_TRUE(AdbFileTransferSession::normalizePath(
+    "/../../etc/passwd", "/sdcard/Work", false, &dev, &virt, &err));
+  EXPECT_EQ(dev, "/sdcard/Work/etc/passwd");
+  EXPECT_EQ(virt, "/etc/passwd");
+
+  std::string withTrailNul = std::string("/sdcard/file.txt") + '\0' + '\0';
+  EXPECT_TRUE(AdbFileTransferSession::normalizePath(
+    withTrailNul, "", false, &dev, &virt, &err));
+  EXPECT_EQ(dev, "/sdcard/file.txt");
+
+  std::string withEmbedNul = std::string("/sdcard/") + '\0' + "bad";
+  EXPECT_FALSE(AdbFileTransferSession::normalizePath(
+    withEmbedNul, "", false, &dev, &virt, &err));
+}
+
+TEST(AdbClientTest, SyncV1FallbackAndShellV1V2)
+{
+  for (bool v2 : {true, false}) {
+    MockAdbFileDaemon mock(v2);
+    ASSERT_TRUE(mock.start());
+    AdbClient adb("127.0.0.1", mock.port());
+
+    AdbFeatures feat = adb.queryFeatures("mock-dev");
+    EXPECT_EQ(feat.statV2, v2);
+    EXPECT_EQ(feat.lsV2, v2);
+    EXPECT_EQ(feat.shellV2, v2);
+
+    int syncFd = adb.openSync("mock-dev");
+    ASSERT_GE(syncFd, 0);
+    auto entries = AdbClient::syncList(syncFd, "/", feat.lsV2, feat.statV2);
+    AdbClient::syncQuit(syncFd);
+    ::close(syncFd);
+
+    bool foundSdcardDir = false;
+    for (const auto& e : entries) {
+      if (e.name == "sdcard" && S_ISDIR(e.mode))
+        foundSdcardDir = true;
+    }
+    EXPECT_TRUE(foundSdcardDir);
+
+    AdbShellResult res = adb.runShell("mock-dev", "echo hi", feat.shellV2);
+    EXPECT_EQ(res.exitCode, 0);
+  }
+}
+
+TEST(ScrcpyVncEndToEndTest, Tight2AndTight13FileTransferWithH264)
+{
+  MockAdbFileDaemon mockAdb(true);
+  ASSERT_TRUE(mockAdb.start());
+
+  rfb::SecurityServer::secTypes.setParam("None");
+  fileTransfer.setParam(true);
+  fileTransferRoot.setParam("");
+
+  int videoFds[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, videoFds), 0);
+
+  ScrcpyServer server;
+  server.attachStreamsForTest(videoFds[0], -1, ScrcpyProtocol::V2,
+                              1920, 1080, "WayDroidFT");
+  server.setAdbTargetForTest("127.0.0.1", mockAdb.port(), "mock-dev");
+
+  LoopbackListener listener(0);
+  std::list<network::SocketListener*> listeners = {&listener};
+  int port = listener.getMyPort();
+
+  std::atomic<bool> stopSrv{false};
+  std::thread srvThread([&]() {
+    while (!stopSrv) {
+      if (!server.step(listeners, 10))
+        break;
+    }
+  });
+  struct SrvJoinGuard {
+    std::atomic<bool>& stopFlag;
+    std::thread& t;
+    ~SrvJoinGuard() {
+      stopFlag = true;
+      if (t.joinable())
+        t.join();
+    }
+  } srvGuard{stopSrv, srvThread};
+
+  // --- Client 1: TightVNC 2.x ---
+  {
+    network::TcpSocket sock("127.0.0.1", port);
+    TightTestCConnection cli(true);
+    ScrcpyFtRecordingHandler ft;
+    cli.fileTransferClient().setHandler(&ft);
+    cli.setStreams(&sock.inStream(), &sock.outStream());
+    cli.initialiseProtocol();
+
+    auto pumpUntil = [&](auto pred) {
+      auto deadline = std::chrono::steady_clock::now() +
+                      std::chrono::seconds(5);
+      while (!pred() && std::chrono::steady_clock::now() < deadline) {
+        if (!cli.processMsg())
+          ::poll(nullptr, 0, 2);
+      }
+      ASSERT_TRUE(pred());
+    };
+
+    pumpUntil([&]() {
+      return cli.initialized && ft.ready &&
+             cli.server.supportsContinuousUpdates && cli.server.supportsFence;
+    });
+    EXPECT_TRUE(cli.server.tightEnabled);
+    EXPECT_EQ(ft.caps.protocol, rfb::FileTransferProtocol::Tight2);
+    EXPECT_TRUE(ft.caps.canCompress);
+    EXPECT_TRUE(ft.caps.canList);
+    EXPECT_TRUE(ft.caps.canDownload);
+    EXPECT_TRUE(ft.caps.canUpload);
+    EXPECT_TRUE(ft.caps.canMkdir);
+    EXPECT_TRUE(ft.caps.canDelete);
+    EXPECT_TRUE(ft.caps.canRename);
+
+    cli.msgWriter()->writeEnableContinuousUpdates(true, 0, 0, 1920, 1080);
+
+    // 1. List "/" and verify /sdcard symlink is a directory
+    ft.resetOp();
+    cli.fileTransferClient().listDirectory("/");
+    pumpUntil([&]() { return ft.listDone; });
+    ASSERT_TRUE(ft.listOk);
+    bool sdDir = false;
+    for (const auto& e : ft.entries) {
+      if (e.name == "sdcard" && e.isDir)
+        sdDir = true;
+    }
+    EXPECT_TRUE(sdDir);
+
+    // 2. Mkdir + Upload (multi-chunk) + Download (full & offset resume) + Rename + Remove
+    ft.resetOp();
+    cli.fileTransferClient().createDirectory("/data/local/tmp/work");
+    pumpUntil([&]() { return ft.cmdDone; });
+    EXPECT_TRUE(ft.cmdOk);
+
+    std::vector<uint8_t> big(90000);
+    for (size_t i = 0; i < big.size(); ++i)
+      big[i] = static_cast<uint8_t>((i * 73 + 19) & 0xff);
+
+    ft.resetOp();
+    cli.fileTransferClient().startUpload("/data/local/tmp/work/blob.bin", true, 0);
+    pumpUntil([&]() { return ft.ulReady; });
+    ASSERT_TRUE(ft.ulReadyOk);
+
+    for (size_t off = 0; off < big.size(); off += 30000) {
+      int prevAcks = ft.ulAckCount;
+      cli.fileTransferClient().sendUploadData(big.data() + off,
+                                              std::min<size_t>(30000, big.size() - off));
+      pumpUntil([&]() { return ft.ulAckCount > prevAcks; });
+    }
+    cli.fileTransferClient().finishUpload(1700000999ULL);
+    pumpUntil([&]() { return ft.ulComplete; });
+    ASSERT_TRUE(ft.ulCompleteOk);
+
+    // Resume upload at offset 50000 appending 1000 bytes
+    std::vector<uint8_t> tail(1000, 0x5c);
+    big.resize(50000);
+    big.insert(big.end(), tail.begin(), tail.end());
+    ft.resetOp();
+    cli.fileTransferClient().startUpload("/data/local/tmp/work/blob.bin", false, 50000);
+    pumpUntil([&]() { return ft.ulReady; });
+    ASSERT_TRUE(ft.ulReadyOk);
+    cli.fileTransferClient().sendUploadData(tail.data(), tail.size());
+    pumpUntil([&]() { return ft.ulAckCount == 1; });
+    cli.fileTransferClient().finishUpload(1700001000ULL);
+    pumpUntil([&]() { return ft.ulComplete; });
+    ASSERT_TRUE(ft.ulCompleteOk);
+
+    // Download full blob.bin (compressed!) while also streaming an H.264 frame
+    sendScrcpyPacket(videoFds[1], UINT64_C(1) << 63, kFrame1080, kFrame1080SpsPpsLen);
+    sendScrcpyPacket(videoFds[1], UINT64_C(1) << 62,
+                     kFrame1080 + kFrame1080SpsPpsLen,
+                     sizeof(kFrame1080) - kFrame1080SpsPpsLen);
+
+    ft.resetOp();
+    cli.fileTransferClient().startDownload("/data/local/tmp/work/blob.bin", 0);
+    pumpUntil([&]() { return ft.dlStarted; });
+    ASSERT_TRUE(ft.dlStartOk);
+    while (!ft.dlComplete) {
+      size_t prevSize = ft.dlData.size();
+      cli.fileTransferClient().requestMoreDownloadData();
+      pumpUntil([&]() { return ft.dlComplete || ft.dlData.size() > prevSize; });
+    }
+    EXPECT_TRUE(ft.dlCompleteOk);
+    EXPECT_EQ(ft.dlData, big);
+
+    // Resume download from offset 50000
+    ft.resetOp();
+    cli.fileTransferClient().startDownload("/data/local/tmp/work/blob.bin", 50000);
+    pumpUntil([&]() { return ft.dlStarted; });
+    ASSERT_TRUE(ft.dlStartOk);
+    while (!ft.dlComplete) {
+      size_t prevSize = ft.dlData.size();
+      cli.fileTransferClient().requestMoreDownloadData();
+      pumpUntil([&]() { return ft.dlComplete || ft.dlData.size() > prevSize; });
+    }
+    EXPECT_TRUE(ft.dlCompleteOk);
+    EXPECT_EQ(ft.dlData, tail);
+
+    // Cancel download mid-transfer
+    ft.resetOp();
+    cli.fileTransferClient().startDownload("/data/local/tmp/work/blob.bin", 0);
+    pumpUntil([&]() { return ft.dlStarted; });
+    cli.fileTransferClient().cancelDownload();
+    pumpUntil([&]() { return ft.cancelDone; });
+
+    // Rename & Remove
+    ft.resetOp();
+    cli.fileTransferClient().renameFileOrDir(
+      "/data/local/tmp/work/blob.bin", "/data/local/tmp/work/blob2.bin", false);
+    pumpUntil([&]() { return ft.cmdDone; });
+    EXPECT_TRUE(ft.cmdOk);
+
+    // DirSize & MD5
+    cli.dirSizeDone = false;
+    cli.msgWriter()->writeTight2DirSizeRequest("/data/local/tmp/work");
+    pumpUntil([&]() { return cli.dirSizeDone; });
+    EXPECT_EQ(cli.lastDirSize, big.size());
+
+    // MD5 of "Hello Android!" -> verified via raw tight2Md5Req
+    cli.md5Done = false;
+    {
+      const std::string md5Path = "/data/local/tmp/hello.txt";
+      sock.outStream().writeU32(rfb::tight2Md5Req);
+      sock.outStream().writeU32(static_cast<uint32_t>(md5Path.size()));
+      sock.outStream().writeBytes(
+        reinterpret_cast<const uint8_t*>(md5Path.data()), md5Path.size());
+      sock.outStream().writeU32(0);
+      sock.outStream().writeU32(0);
+      sock.outStream().writeU32(0);
+      sock.outStream().writeU32(100);
+      sock.outStream().flush();
+    }
+    pumpUntil([&]() { return cli.md5Done; });
+    uint8_t zero16[16] = {};
+    EXPECT_NE(std::memcmp(cli.lastMd5, zero16, 16), 0);
+
+    // Compressed Tight 2.x UPLOAD_DATA_REQUEST (zlib windowBits=15, Z_SYNC_FLUSH)
+    {
+      std::vector<uint8_t> plain(16384);
+      for (size_t i = 0; i < plain.size(); ++i)
+        plain[i] = static_cast<uint8_t>('A' + (i % 16));
+
+      z_stream zs;
+      std::memset(&zs, 0, sizeof(zs));
+      ASSERT_EQ(::deflateInit2(&zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                               15, 8, Z_DEFAULT_STRATEGY), Z_OK);
+      std::vector<uint8_t> packed(plain.size() + 128);
+      zs.next_in = plain.data();
+      zs.avail_in = static_cast<uInt>(plain.size());
+      zs.next_out = packed.data();
+      zs.avail_out = static_cast<uInt>(packed.size());
+      int zrc = ::deflate(&zs, Z_SYNC_FLUSH);
+      ASSERT_TRUE(zrc == Z_OK || zrc == Z_STREAM_END);
+      packed.resize(packed.size() - zs.avail_out);
+      ::deflateEnd(&zs);
+
+      ft.resetOp();
+      cli.fileTransferClient().startUpload("/data/local/tmp/work/comp.bin", true, 0);
+      pumpUntil([&]() { return ft.ulReady; });
+      ASSERT_TRUE(ft.ulReadyOk);
+
+      sock.outStream().writeU32(rfb::tight2UploadDataReq);
+      sock.outStream().writeU8(1);
+      sock.outStream().writeU32(static_cast<uint32_t>(packed.size()));
+      sock.outStream().writeU32(static_cast<uint32_t>(plain.size()));
+      sock.outStream().writeBytes(packed.data(), packed.size());
+      sock.outStream().flush();
+      pumpUntil([&]() { return ft.ulAckCount == 1; });
+
+      cli.fileTransferClient().finishUpload(1700001001ULL);
+      pumpUntil([&]() { return ft.ulComplete; });
+      ASSERT_TRUE(ft.ulCompleteOk);
+
+      std::vector<uint8_t> storedComp;
+      ASSERT_TRUE(mockAdb.getFile("/data/local/tmp/work/comp.bin", &storedComp));
+      EXPECT_EQ(storedComp, plain);
+    }
+
+    ft.resetOp();
+    cli.fileTransferClient().removeFileOrDir("/data/local/tmp/work", true);
+    pumpUntil([&]() { return ft.cmdDone; });
+    EXPECT_TRUE(ft.cmdOk);
+    EXPECT_FALSE(mockAdb.hasPath("/data/local/tmp/work/blob2.bin"));
+
+    // Immediate SEND failure on /system
+    ft.resetOp();
+    cli.fileTransferClient().startUpload("/system/ro.txt", true, 0);
+    pumpUntil([&]() { return ft.ulReady; });
+    EXPECT_FALSE(ft.ulReadyOk);
+
+    // Verify H.264 frame arrived cleanly without corruption
+    pumpUntil([&]() { return cli.h264Frames.size() >= sizeof(kFrame1080); });
+    EXPECT_EQ(cli.h264Frames.size(), sizeof(kFrame1080));
+  }
+
+  // --- Client 2: TightVNC 1.3.x ---
+  {
+    network::TcpSocket sock("127.0.0.1", port);
+    TightTestCConnection cli(true);
+    cli.fileTransferClient().setPreferredProtocol(rfb::FileTransferProtocol::Tight13);
+    ScrcpyFtRecordingHandler ft;
+    cli.fileTransferClient().setHandler(&ft);
+    cli.setStreams(&sock.inStream(), &sock.outStream());
+    cli.initialiseProtocol();
+
+    auto pumpUntil = [&](auto pred) {
+      auto deadline = std::chrono::steady_clock::now() +
+                      std::chrono::seconds(5);
+      while (!pred() && std::chrono::steady_clock::now() < deadline) {
+        if (!cli.processMsg())
+          ::poll(nullptr, 0, 2);
+      }
+      ASSERT_TRUE(pred());
+    };
+
+    pumpUntil([&]() {
+      return cli.initialized && ft.ready && cli.server.supportsFence;
+    });
+    EXPECT_EQ(ft.caps.protocol, rfb::FileTransferProtocol::Tight13);
+
+    ft.resetOp();
+    cli.fileTransferClient().listDirectory("/data/local/tmp");
+    pumpUntil([&]() { return ft.listDone; });
+    ASSERT_TRUE(ft.listOk);
+    EXPECT_GE(ft.entries.size(), 3u);
+
+    // 0-byte download
+    ft.resetOp();
+    cli.fileTransferClient().startDownload("/data/local/tmp/empty.txt", 0);
+    pumpUntil([&]() { return ft.dlComplete; });
+    EXPECT_TRUE(ft.dlStartOk);
+    EXPECT_TRUE(ft.dlCompleteOk);
+    EXPECT_TRUE(ft.dlData.empty());
+
+    // Non-empty download
+    ft.resetOp();
+    cli.fileTransferClient().startDownload("/data/local/tmp/hello.txt", 0);
+    pumpUntil([&]() { return ft.dlComplete; });
+    EXPECT_TRUE(ft.dlCompleteOk);
+    EXPECT_EQ(std::string(ft.dlData.begin(), ft.dlData.end()), "Hello Android!");
+
+    // Tight 1.3 upload + Fence sync
+    ft.resetOp();
+    cli.fileTransferClient().startUpload("/data/local/tmp/t13.txt", true, 0);
+    pumpUntil([&]() { return ft.ulReady; });
+    const uint8_t msg[] = "tight13-data";
+    cli.fileTransferClient().sendUploadData(msg, sizeof(msg) - 1);
+    cli.fileTransferClient().finishUpload(1700001234u);
+    pumpUntil([&]() { return ft.ulComplete; });
+    EXPECT_TRUE(ft.ulCompleteOk);
+
+    std::vector<uint8_t> stored;
+    ASSERT_TRUE(mockAdb.getFile("/data/local/tmp/t13.txt", &stored));
+    EXPECT_EQ(std::string(stored.begin(), stored.end()), "tight13-data");
+
+    // Tight 1.3 mkdir + dir list synchronization
+    ft.resetOp();
+    cli.fileTransferClient().createDirectory("/data/local/tmp/t13dir");
+    pumpUntil([&]() { return ft.cmdDone; });
+    EXPECT_TRUE(ft.cmdOk);
+    EXPECT_TRUE(mockAdb.hasPath("/data/local/tmp/t13dir"));
+  }
+
+  // --- Client 3: View-only access (AccessView, no AccessFileTransfer) ---
+  {
+    stopSrv = true;
+    srvThread.join();
+
+    int pair[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+    network::UnixSocket cliSock(pair[1]);
+    ASSERT_TRUE(server.addSocket(new network::UnixSocket(pair[0]),
+                                 rfb::AccessView));
+
+    TightTestCConnection cli(true);
+    ScrcpyFtRecordingHandler ft;
+    cli.fileTransferClient().setHandler(&ft);
+    cli.setStreams(&cliSock.inStream(), &cliSock.outStream());
+    cli.initialiseProtocol();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!cli.initialized && std::chrono::steady_clock::now() < deadline) {
+      ASSERT_TRUE(server.step({}, 5));
+      if (!cli.processMsg())
+        ::poll(nullptr, 0, 2);
+    }
+    ASSERT_TRUE(cli.initialized);
+    EXPECT_FALSE(cli.fileTransferClient().isSupported());
+  }
+
+  // --- Client 4: -FileTransfer=0 disables Tight file transfer ---
+  {
+    fileTransfer.setParam(false);
+
+    int pair[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pair), 0);
+    network::UnixSocket cliSock(pair[1]);
+    ASSERT_TRUE(server.addSocket(new network::UnixSocket(pair[0]),
+                                 rfb::AccessDefault));
+
+    TightTestCConnection cli(true);
+    ScrcpyFtRecordingHandler ft;
+    cli.fileTransferClient().setHandler(&ft);
+    cli.setStreams(&cliSock.inStream(), &cliSock.outStream());
+    cli.initialiseProtocol();
+
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!cli.initialized && std::chrono::steady_clock::now() < deadline) {
+      ASSERT_TRUE(server.step({}, 5));
+      if (!cli.processMsg())
+        ::poll(nullptr, 0, 2);
+    }
+    ASSERT_TRUE(cli.initialized);
+    EXPECT_FALSE(cli.server.tightEnabled);
+    EXPECT_FALSE(cli.fileTransferClient().isSupported());
+
+    fileTransfer.setParam(true);
+  }
+
+  ::close(videoFds[1]);
+}
