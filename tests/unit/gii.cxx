@@ -22,18 +22,17 @@
 
 #include <stdint.h>
 #include <string.h>
-#include <sys/socket.h>
-#include <unistd.h>
 
 #include <algorithm>
 #include <map>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
 
 #include <gtest/gtest.h>
 
-#include <network/UnixSocket.h>
+#include <network/TcpSocket.h>
 
 #include <rdr/FdInStream.h>
 #include <rdr/FdOutStream.h>
@@ -360,6 +359,22 @@ public:
   bool initDoneCalled;
   std::vector<uint16_t> enabledVersions;
   std::vector<uint32_t> createdOrigins;
+};
+
+struct SocketPair {
+  SocketPair()
+  {
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    network::TcpListener listener(reinterpret_cast<const sockaddr*>(&address),
+                                  sizeof(address));
+    client.reset(new network::TcpSocket("127.0.0.1", listener.getMyPort()));
+    server.reset(listener.accept());
+  }
+
+  std::unique_ptr<network::Socket> client;
+  std::unique_ptr<network::Socket> server;
 };
 
 static void pumpPair(TestCConnection* client, network::Socket* clientSock,
@@ -830,11 +845,9 @@ TEST(GIIProtocol, UnknownSubtypesEventsAndErrors)
 TEST(GIIEndToEnd, DisabledDesktopDoesNotEnableGII)
 {
   SecurityParamGuard guard;
-  int fds[2];
-  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-
-  network::UnixSocket* clientSock = new network::UnixSocket(fds[0]);
-  network::UnixSocket* serverSock = new network::UnixSocket(fds[1]);
+  SocketPair sockets;
+  auto* clientSock = sockets.client.get();
+  auto* serverSock = sockets.server.get();
 
   MockSDesktop desktop(false);
   rfb::VNCServerST server("test-no-gii", &desktop);
@@ -852,18 +865,14 @@ TEST(GIIEndToEnd, DisabledDesktopDoesNotEnableGII)
   EXPECT_TRUE(client.enabledVersions.empty());
 
   server.removeSocket(serverSock);
-  delete serverSock;
-  delete clientSock;
 }
 
 TEST(GIIEndToEnd, HandshakeDeviceLifecycleEventsAndCleanup)
 {
   SecurityParamGuard guard;
-  int fds[2];
-  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
-
-  network::UnixSocket* clientSock = new network::UnixSocket(fds[0]);
-  network::UnixSocket* serverSock = new network::UnixSocket(fds[1]);
+  SocketPair sockets;
+  auto* clientSock = sockets.client.get();
+  auto* serverSock = sockets.server.get();
 
   MockSDesktop desktop(true);
   rfb::VNCServerST server("test-gii", &desktop);
@@ -935,6 +944,20 @@ TEST(GIIEndToEnd, HandshakeDeviceLifecycleEventsAndCleanup)
   EXPECT_EQ(desktop.events[0].values[0], 500);
   EXPECT_EQ(desktop.events[1].type, rfb::giiEventPtrButtonPress);
 
+  // Events must refer to a created device and match its capabilities.
+  btn.origin = 0;
+  client.sendGIIEvent(btn);
+  btn.origin = origin1;
+  btn.button = 3;
+  client.sendGIIEvent(btn);
+  ev.first = 1;
+  client.sendGIIEvent(ev);
+  ev.first = 0;
+  ev.type = rfb::giiEventValuatorRelative;
+  client.sendGIIEvent(ev);
+  pumpPair(&client, clientSock, &server, serverSock);
+  EXPECT_EQ(desktop.events.size(), 2U);
+
   // Explicitly destroy dev1, leave dev2 open for disconnect cleanup
   client.destroyGIIDevice(origin1);
   pumpPair(&client, clientSock, &server, serverSock);
@@ -942,28 +965,24 @@ TEST(GIIEndToEnd, HandshakeDeviceLifecycleEventsAndCleanup)
   ASSERT_EQ(desktop.destroyedOrigins.size(), 1U);
   EXPECT_EQ(desktop.destroyedOrigins[0], origin1);
 
-  // Disconnecting must automatically destroy dev2
+  // Disconnecting must destroy dev2 even if support has gone away.
+  desktop.giiSupported = false;
   server.removeSocket(serverSock);
   EXPECT_EQ(desktop.activeDevices.size(), 0U);
   ASSERT_EQ(desktop.destroyedOrigins.size(), 2U);
   EXPECT_EQ(desktop.destroyedOrigins[1], origin2);
-
-  delete serverSock;
-  delete clientSock;
 }
 
 TEST(GIIEndToEnd, AccessRightsAndCrossClientIsolation)
 {
   SecurityParamGuard guard;
-
-  int fdsA[2], fdsB[2];
-  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fdsA), 0);
-  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fdsB), 0);
-
-  network::UnixSocket* cSockA = new network::UnixSocket(fdsA[0]);
-  network::UnixSocket* sSockA = new network::UnixSocket(fdsA[1]);
-  network::UnixSocket* cSockB = new network::UnixSocket(fdsB[0]);
-  network::UnixSocket* sSockB = new network::UnixSocket(fdsB[1]);
+  SocketPair socketsA, socketsB, socketsC;
+  auto* cSockA = socketsA.client.get();
+  auto* sSockA = socketsA.server.get();
+  auto* cSockB = socketsB.client.get();
+  auto* sSockB = socketsB.server.get();
+  auto* cSockC = socketsC.client.get();
+  auto* sSockC = socketsC.server.get();
 
   MockSDesktop desktop(true);
   rfb::VNCServerST server("test-isolation", &desktop);
@@ -1003,10 +1022,6 @@ TEST(GIIEndToEnd, AccessRightsAndCrossClientIsolation)
   EXPECT_EQ(clientB.createdOrigins[0], 0U);
 
   // Now test cross-client isolation with a full-rights Client C
-  int fdsC[2];
-  ASSERT_EQ(socketpair(AF_UNIX, SOCK_STREAM, 0, fdsC), 0);
-  network::UnixSocket* cSockC = new network::UnixSocket(fdsC[0]);
-  network::UnixSocket* sSockC = new network::UnixSocket(fdsC[1]);
   ASSERT_TRUE(server.addSocket(sSockC, false, rfb::AccessDefault));
 
   TestCConnection clientC(true);
@@ -1037,12 +1052,6 @@ TEST(GIIEndToEnd, AccessRightsAndCrossClientIsolation)
   server.removeSocket(sSockC);
   server.removeSocket(sSockB);
   server.removeSocket(sSockA);
-  delete cSockC;
-  delete sSockC;
-  delete cSockB;
-  delete sSockB;
-  delete cSockA;
-  delete sSockA;
 }
 
 // ---------------------------------------------------------------------------
@@ -1163,6 +1172,10 @@ TEST(GIIDeviceManager, DeviceClassification)
   EXPECT_FALSE(classifyAndBuildGIIDevice(
     mouse, &desc, &axisNums, &axisAbs, &xIdx, &yIdx));
 
+  mouse.name = "ThinkPad USB Mouse";
+  EXPECT_FALSE(classifyAndBuildGIIDevice(
+    mouse, &desc, &axisNums, &axisAbs, &xIdx, &yIdx));
+
   // Rejected: XTEST, xwayland-pointer, touchpad, touchscreen, QEMU USB Tablet
   RawInputDeviceInfo xtest = makeStylusRaw(21, "Virtual core XTEST pointer");
   EXPECT_FALSE(classifyAndBuildGIIDevice(
@@ -1273,6 +1286,11 @@ TEST(GIIDeviceManager, LifecycleScalingAndEventBatching)
   ASSERT_EQ(sender.sentBatches.size(), 3U);
   EXPECT_EQ(sender.sentBatches[2][0].type, rfb::giiEventPtrButtonRelease);
 
+  // A release for a press handled before GII activation can fall back to RFB.
+  EXPECT_FALSE(mgr.handleInputEvent(10, GIIDeviceManager::EventButtonRelease, 1,
+                                    100.0, 50.0, 1001, 501, vals));
+  EXPECT_EQ(sender.sentBatches.size(), 3U);
+
   // destroyAllDevices() destroys 101 and 103
   mgr.destroyAllDevices();
   EXPECT_FALSE(mgr.hasDevice(10));
@@ -1280,8 +1298,36 @@ TEST(GIIDeviceManager, LifecycleScalingAndEventBatching)
   ASSERT_EQ(sender.destroyedOrigins.size(), 3U);
 }
 
-int main(int argc, char** argv)
+TEST(GIIDeviceManager, LateDeviceCreationAfterDisable)
 {
-  testing::InitGoogleTest(&argc, argv);
-  return RUN_ALL_TESTS();
+  MockGIIEventSender sender;
+  GIIDeviceManager mgr(&sender);
+  rfb::GIIDevice desc;
+  desc.name = "Identical Name for Multiple Tablet Devices";
+
+  mgr.addDevice(10, false, desc, {}, {}, -1, -1);
+  mgr.addDevice(11, false, desc, {}, {}, -1, -1);
+  ASSERT_EQ(sender.createdRequests.size(), 2U);
+  EXPECT_NE(sender.createdRequests[0].name, sender.createdRequests[1].name);
+  mgr.destroyAllDevices();
+
+  mgr.addDevice(11, false, desc, {}, {}, -1, -1);
+  ASSERT_EQ(sender.createdRequests.size(), 3U);
+  EXPECT_NE(sender.createdRequests[2].name, sender.createdRequests[0].name);
+  EXPECT_NE(sender.createdRequests[2].name, sender.createdRequests[1].name);
+  EXPECT_LE(sender.createdRequests[2].name.size(), rfb::giiDeviceNameLen - 1);
+
+  mgr.handleDeviceCreated(100);
+  mgr.handleDeviceCreated(101);
+  EXPECT_FALSE(mgr.isActiveDevice(11));
+  mgr.handleDeviceCreated(102);
+  EXPECT_TRUE(mgr.isActiveDevice(11));
+
+  mgr.addDevice(12, false, desc, {}, {}, -1, -1);
+  mgr.handleDeviceCreated(102);
+  EXPECT_FALSE(mgr.isActiveDevice(12));
+  EXPECT_TRUE(mgr.isActiveDevice(11));
+
+  mgr.handleDeviceCreated(102);
+  EXPECT_EQ(sender.destroyedOrigins, (std::vector<uint32_t>{100, 101}));
 }
