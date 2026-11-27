@@ -16,6 +16,8 @@ add_executable(vncviewer
   CConn.cxx
   DesktopWindow.cxx
   EmulateMB.cxx
+  GIIDeviceManager.cxx
+  GIIInput.cxx
   ServerDialog.cxx
   ShortcutHandler.cxx
   Surface.cxx
@@ -50,6 +52,7 @@ elseif(APPLE)
 else()
   target_sources(vncviewer PRIVATE x11.cxx)
   target_sources(vncviewer PRIVATE GestureHandler.cxx XInputTouchHandler.cxx)
+  target_sources(vncviewer PRIVATE GIIInputX11.cxx)
   target_sources(vncviewer PRIVATE KeyboardX11.cxx xkb_to_qnum.c)
   target_sources(vncviewer PRIVATE Surface_X11.cxx)
 endif()

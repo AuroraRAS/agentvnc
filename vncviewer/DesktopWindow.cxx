@@ -52,6 +52,7 @@
 #include <FL/Fl_Image_Surface.H>
 #include <FL/Fl_Scrollbar.H>
 #include <FL/fl_draw.H>
+#include <FL/x.H>
 
 #if defined(WIN32)
 #include "win32.h"
@@ -603,6 +604,22 @@ void DesktopWindow::handleClipboardAnnounce(bool available)
 void DesktopWindow::handleClipboardData(const char* data)
 {
   viewport->handleClipboardData(data);
+}
+
+
+void DesktopWindow::enableGII()
+{
+  viewport->enableGII();
+}
+
+void DesktopWindow::disableGII()
+{
+  viewport->disableGII();
+}
+
+void DesktopWindow::handleGIIDeviceCreated(uint32_t deviceOrigin)
+{
+  viewport->handleGIIDeviceCreated(deviceOrigin);
 }
 
 

@@ -365,6 +365,9 @@ void OptionsDialog::loadOptions(void)
 #ifdef HAVE_AUDIO
   audioCheckbox->value(playAudio);
 #endif
+#if !defined(WIN32) && !defined(__APPLE__)
+  giiCheckbox->value(enableGII);
+#endif
   alwaysCursorCheckbox->value(alwaysCursor);
   if (cursorType == "system") {
     cursorTypeChoice->value(1);
@@ -522,6 +525,9 @@ void OptionsDialog::storeOptions(void)
   reconnectOnError.setParam(reconnectCheckbox->value());
 #ifdef HAVE_AUDIO
   playAudio.setParam(audioCheckbox->value());
+#endif
+#if !defined(WIN32) && !defined(__APPLE__)
+  enableGII.setParam(giiCheckbox->value());
 #endif
   alwaysCursor.setParam(alwaysCursorCheckbox->value());
 
@@ -1264,6 +1270,14 @@ void OptionsDialog::createMiscPage(int tx, int ty, int tw, int th)
                                                CHECK_MIN_WIDTH,
                                                CHECK_HEIGHT,
                                                _("Play audio from the server")));
+  ty += CHECK_HEIGHT + TIGHT_MARGIN;
+#endif
+
+#if !defined(WIN32) && !defined(__APPLE__)
+  giiCheckbox = new Fl_Check_Button(LBLRIGHT(tx, ty,
+                                             CHECK_MIN_WIDTH,
+                                             CHECK_HEIGHT,
+                                             _("Enable extended input devices (GII)")));
   ty += CHECK_HEIGHT + TIGHT_MARGIN;
 #endif
 

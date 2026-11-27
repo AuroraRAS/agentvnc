@@ -51,6 +51,7 @@
 #include "fltk/util.h"
 #include "Viewport.h"
 #include "CConn.h"
+#include "GIIInput.h"
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
 #include "parameters.h"
@@ -99,7 +100,7 @@ Viewport::Viewport(int w, int h, CConn* cc_)
     keyboard(nullptr), shortcutBypass(false), shortcutActive(false),
     firstLEDState(true), pendingClientClipboard(false),
     menuCtrlKey(false), menuAltKey(false), cursor(nullptr),
-    cursorIsBlank(false)
+    cursorIsBlank(false), giiInput(nullptr)
 {
 #if defined(WIN32)
   keyboard = new KeyboardWin32(this);
@@ -150,6 +151,8 @@ Viewport::Viewport(int w, int h, CConn* cc_)
 
 Viewport::~Viewport()
 {
+  disableGII();
+
   // Unregister all timeouts in case they get a change tro trigger
   // again later when this object is already gone.
   Fl::remove_timeout(handlePointerTimeout, this);
@@ -528,6 +531,8 @@ int Viewport::handle(int event)
   case FL_UNFOCUS:
     // We won't get more key events, so reset our knowledge about keys
     resetKeyboard();
+    if (giiInput != nullptr)
+      giiInput->releaseAllButtons();
     return 1;
 
   case FL_KEYDOWN:
@@ -1071,4 +1076,76 @@ void Viewport::handleOptions(void *data)
 
   if (Fl::belowmouse() == self)
     self->showCursor();
+
+  if (viewOnly && (self->giiInput != nullptr))
+    self->giiInput->releaseAllButtons();
+}
+
+void Viewport::enableGII()
+{
+  if (giiInput != nullptr)
+    return;
+  if (!::enableGII || !GIIInput::isSupported())
+    return;
+
+  giiInput = GIIInput::create(window(), this, this);
+}
+
+void Viewport::disableGII()
+{
+  if (giiInput == nullptr)
+    return;
+
+  GIIInput* input = giiInput;
+  giiInput = nullptr;
+  input->shutdown();
+  delete input;
+}
+
+void Viewport::handleGIIDeviceCreated(uint32_t deviceOrigin)
+{
+  if (giiInput != nullptr)
+    giiInput->handleDeviceCreated(deviceOrigin);
+}
+
+void Viewport::createGIIDevice(const rfb::GIIDevice& device)
+{
+  if ((cc->state() != rfb::CConnection::RFBSTATE_NORMAL) ||
+      !cc->server.supportsGII)
+    return;
+
+  try {
+    cc->createGIIDevice(device);
+  } catch (std::exception& e) {
+    vlog.error("%s", e.what());
+    abort_connection_unexpected(e);
+  }
+}
+
+void Viewport::destroyGIIDevice(uint32_t deviceOrigin)
+{
+  if ((cc->state() != rfb::CConnection::RFBSTATE_NORMAL) ||
+      !cc->server.supportsGII)
+    return;
+
+  try {
+    cc->destroyGIIDevice(deviceOrigin);
+  } catch (std::exception& e) {
+    vlog.debug("Failed to destroy GII device %u: %s",
+               deviceOrigin, e.what());
+  }
+}
+
+void Viewport::sendGIIEvents(const std::vector<rfb::GIIEvent>& events)
+{
+  if (viewOnly || (cc->state() != rfb::CConnection::RFBSTATE_NORMAL) ||
+      !cc->server.supportsGII)
+    return;
+
+  try {
+    cc->sendGIIEvents(events);
+  } catch (std::exception& e) {
+    vlog.error("%s", e.what());
+    abort_connection_unexpected(e);
+  }
 }

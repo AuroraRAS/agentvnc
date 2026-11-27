@@ -169,6 +169,9 @@ protected:
 #ifdef HAVE_AUDIO
   Fl_Check_Button *audioCheckbox;
 #endif
+#if !defined(WIN32) && !defined(__APPLE__)
+  Fl_Check_Button *giiCheckbox;
+#endif
 
 private:
   static int fltk_event_handler(int event);

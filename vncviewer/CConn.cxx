@@ -64,6 +64,7 @@
 #include "AudioOutput.h"
 #include "AuthDialog.h"
 #include "CConn.h"
+#include "GIIInput.h"
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
 #include "PlatformPixelBuffer.h"
@@ -112,6 +113,9 @@ CConn::CConn()
   }
 #endif
 
+  if (enableGII && GIIInput::isSupported())
+    supportsGII = true;
+
   if (customCompressLevel)
     setCompressLevel(::compressLevel);
 
@@ -122,6 +126,9 @@ CConn::CConn()
 
 CConn::~CConn()
 {
+  if (desktop)
+    desktop->disableGII();
+
   close();
 
   OptionsDialog::removeCallback(handleOptions);
@@ -431,6 +438,9 @@ void CConn::initDone()
   // Force a switch to the format and encoding we'd like
   updateEncoding();
   updatePixelFormat();
+
+  if (server.supportsGII)
+    desktop->enableGII();
 }
 
 bool CConn::verifyCertificate(unsigned int status,
@@ -950,6 +960,18 @@ void CConn::handleAudioData(const uint8_t* data, size_t length)
   audioOutput->play(data, length);
 }
 
+void CConn::handleGIIEnabled(uint16_t /*version*/)
+{
+  if (desktop != nullptr)
+    desktop->enableGII();
+}
+
+void CConn::handleGIIDeviceCreated(uint32_t deviceOrigin)
+{
+  if (desktop != nullptr)
+    desktop->handleGIIDeviceCreated(deviceOrigin);
+}
+
 
 ////////////////////// Internal methods //////////////////////
 
@@ -1053,6 +1075,19 @@ void CConn::handleOptions(void *data)
   self->updateCompressLevel();
   self->updateQualityLevel();
   self->updatePixelFormat();
+
+  if (enableGII && GIIInput::isSupported()) {
+    if (!self->supportsGII) {
+      self->supportsGII = true;
+      if (self->state() == rfb::CConnection::RFBSTATE_NORMAL)
+        self->updateEncodings();
+    }
+    if (self->server.supportsGII && (self->desktop != nullptr))
+      self->desktop->enableGII();
+  } else {
+    if (self->desktop != nullptr)
+      self->desktop->disableGII();
+  }
 }
 
 void CConn::handleUpdateTimeout(void *data)
