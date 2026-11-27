@@ -28,7 +28,6 @@
 #define __RFB_VNCSCONNECTIONST_H__
 
 #include <map>
-#include <set>
 
 #include <core/Timer.h>
 
@@ -211,7 +210,12 @@ namespace rfb {
     core::Point pointerEventPos;
     bool clientHasCursor;
     bool giiVersionSent;
-    std::set<uint32_t> giiDevices;
+    struct GIIDeviceLimits {
+      uint32_t eventMask;
+      uint32_t buttons;
+      size_t valuators;
+    };
+    std::map<uint32_t, GIIDeviceLimits> giiDevices;
 
     std::string closeReason;
   };

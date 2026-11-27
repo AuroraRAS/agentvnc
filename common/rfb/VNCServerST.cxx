@@ -614,15 +614,15 @@ uint32_t VNCServerST::giiDeviceCreate(VNCSConnectionST* /*client*/,
 void VNCServerST::giiDeviceDestroy(VNCSConnectionST* /*client*/,
                                    uint32_t deviceOrigin)
 {
-  if (!desktop->supportsGII())
-    return;
-
   desktop->giiDeviceDestroy(deviceOrigin);
 }
 
 void VNCServerST::giiEvent(VNCSConnectionST* /*client*/,
                            const GIIEvent& event)
 {
+  if (!desktop->supportsGII())
+    return;
+
   if (giiIsKeyEvent(event.type)) {
     if (!rfb::Server::acceptKeyEvents)
       return;

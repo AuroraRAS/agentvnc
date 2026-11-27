@@ -98,7 +98,7 @@ VNCSConnectionST::~VNCSConnectionST()
 
   // Destroy any GII devices created by this client
   while (!giiDevices.empty()) {
-    uint32_t origin = *giiDevices.begin();
+    uint32_t origin = giiDevices.begin()->first;
     giiDevices.erase(giiDevices.begin());
     vlog.debug("Destroying GII device %u on client disconnect", origin);
     server->giiDeviceDestroy(this, origin);
@@ -873,7 +873,9 @@ void VNCSConnectionST::giiDeviceCreate(const GIIDevice& device)
 
   uint32_t origin = server->giiDeviceCreate(this, device);
   if (origin != 0)
-    giiDevices.insert(origin);
+    giiDevices.emplace(origin, GIIDeviceLimits{device.canGenerate,
+                                               device.numButtons,
+                                               device.valuators.size()});
 
   writer()->writeGIIDeviceCreateResponse(origin);
 }
@@ -897,13 +899,11 @@ void VNCSConnectionST::giiEvent(const GIIEvent& event)
   if (!giiVersionSent || (client.giiVersion() == 0))
     throw protocol_error(_("Client sent GII message before version negotiation"));
 
-  if ((event.origin != 0) && (giiDevices.count(event.origin) == 0)) {
+  auto device = giiDevices.find(event.origin);
+  if (device == giiDevices.end()) {
     vlog.error(_("Ignoring GII event for unknown device %u"), event.origin);
     return;
   }
-
-  if (rfb::Server::idleTimeout)
-    idleTimer.start(core::secsToMillis(rfb::Server::idleTimeout));
 
   if (giiIsKeyEvent(event.type)) {
     if (!accessCheck(AccessKeyEvents))
@@ -914,6 +914,26 @@ void VNCSConnectionST::giiEvent(const GIIEvent& event)
   } else {
     return;
   }
+
+  const GIIDeviceLimits& limits = device->second;
+  if (!(limits.eventMask & (1U << event.type)))
+    return;
+
+  if ((event.type == giiEventPtrButtonPress) ||
+      (event.type == giiEventPtrButtonRelease)) {
+    if ((event.button == 0) || (event.button > limits.buttons))
+      return;
+  }
+
+  if ((event.type == giiEventValuatorRelative) ||
+      (event.type == giiEventValuatorAbsolute)) {
+    if (event.values.empty() || (event.first >= limits.valuators) ||
+        (event.values.size() > limits.valuators - event.first))
+      return;
+  }
+
+  if (rfb::Server::idleTimeout)
+    idleTimer.start(core::secsToMillis(rfb::Server::idleTimeout));
 
   server->giiEvent(this, event);
 }
