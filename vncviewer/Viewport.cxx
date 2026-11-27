@@ -83,7 +83,7 @@ static core::LogWriter vlog("Viewport");
 
 enum { ID_DISCONNECT, ID_FULLSCREEN, ID_MINIMIZE, ID_RESIZE,
        ID_CTRL, ID_ALT, ID_CTRLALTDEL,
-       ID_REFRESH, ID_OPTIONS, ID_INFO, ID_ABOUT };
+       ID_REFRESH, ID_FTPSERVER, ID_OPTIONS, ID_INFO, ID_ABOUT };
 
 // Used for fake key presses from the menu
 static const int FAKE_CTRL_KEY_CODE = 0x10001;
@@ -956,6 +956,11 @@ void Viewport::initContextMenu()
   fltk_menu_add(contextMenu, C_("ContextMenu|", "&Refresh screen"),
                 0, nullptr, (void*)ID_REFRESH, FL_MENU_DIVIDER);
 
+  fltk_menu_add(contextMenu, C_("ContextMenu|", "FTP &server"),
+                0, nullptr, (void*)ID_FTPSERVER,
+                FL_MENU_TOGGLE | FL_MENU_DIVIDER |
+                  (cc->isFtpServerRunning() ? FL_MENU_VALUE : 0));
+
   fltk_menu_add(contextMenu, C_("ContextMenu|", "&Options..."),
                 0, nullptr, (void*)ID_OPTIONS, 0);
   fltk_menu_add(contextMenu, C_("ContextMenu|", "Connection &info..."),
@@ -1044,6 +1049,24 @@ void Viewport::popupContextMenu()
     break;
   case ID_REFRESH:
     cc->refreshFramebuffer();
+    break;
+  case ID_FTPSERVER:
+    if (cc->isFtpServerRunning()) {
+      ftpServer.setParam(false);
+      cc->stopFtpServer();
+      if (DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window()))
+        dw->showOverlayMessage(_("FTP server stopped"));
+    } else {
+      std::string err;
+      if (cc->startFtpServer(&err)) {
+        ftpServer.setParam(true);
+        if (DesktopWindow* dw = dynamic_cast<DesktopWindow*>(window()))
+          dw->showOverlayMessage(core::format(_("FTP server listening at %s"),
+                                              cc->ftpServerUrl().c_str()).c_str());
+      } else {
+        fl_alert("%s", err.c_str());
+      }
+    }
     break;
   case ID_OPTIONS:
     OptionsDialog::showDialog();

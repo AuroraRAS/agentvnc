@@ -74,7 +74,8 @@ CConnection::CConnection()
   : csecurity(nullptr),
     supportsLocalCursor(false), supportsCursorPosition(false),
     supportsDesktopResize(false), supportsLEDState(false),
-    supportsAudio(false),
+    supportsAudio(false), supportsFileTransfer(false),
+    preferTightForFileTransfer(false),
     is(nullptr), os(nullptr), reader_(nullptr), writer_(nullptr),
     shared(false),
     state_(RFBSTATE_UNINITIALISED),
@@ -85,7 +86,8 @@ CConnection::CConnection()
     forceNonincremental(true),
     framebuffer(nullptr), decoder(this),
     hasRemoteClipboard(false), hasLocalClipboard(false),
-    audioRequested(false)
+    audioRequested(false),
+    fileTransfer(&server)
 {
 }
 
@@ -110,6 +112,7 @@ void CConnection::setStreams(rdr::InStream* is_, rdr::OutStream* os_)
   reader_ = new CMsgReader(this, is);
   delete writer_;
   writer_ = new CMsgWriter(&server, os);
+  fileTransfer.setWriter(writer_);
 }
 
 void CConnection::setFramebuffer(ModifiablePixelBuffer* fb)
@@ -285,10 +288,14 @@ bool CConnection::processSecurityTypesMsg()
       return true;
     }
 
+    bool serverOffersTight = false;
     for (int i = 0; i < nServerSecTypes; i++) {
       uint8_t serverSecType = is->readU8();
       vlog.debug("Server offers security type %s(%d)",
                  secTypeName(serverSecType), serverSecType);
+
+      if (serverSecType == secTypeTight)
+        serverOffersTight = true;
 
       /*
        * Use the first type sent by server which matches client's type.
@@ -299,6 +306,19 @@ bool CConnection::processSecurityTypesMsg()
                       serverSecType) != secTypes.end())
           secType = serverSecType;
       }
+    }
+
+    // Prefer Tight security type when the server offers it alongside
+    // None or VncAuth on RFB >= 3.7 so Tight InteractionCaps (needed for
+    // TightVNC 1.3 and 2.x file transfer) are negotiated.
+    if (preferTightForFileTransfer && serverOffersTight &&
+        !server.beforeVersion(3, 7) &&
+        (secType == secTypeNone || secType == secTypeVncAuth) &&
+        std::find(secTypes.begin(), secTypes.end(),
+                  secTypeTight) != secTypes.end()) {
+      vlog.debug("Upgrading security type %s (%d) to Tight (%d) for file transfer",
+                 secTypeName(secType), secType, secTypeTight);
+      secType = secTypeTight;
     }
 
     // Inform the server of our decision
@@ -338,7 +358,8 @@ bool CConnection::processSecurityResultMsg()
   vlog.debug("Processing security result message");
   int result;
 
-  if (server.beforeVersion(3,8) && csecurity->getType() == secTypeNone) {
+  if (server.beforeVersion(3,8) &&
+      csecurity->getEffectiveType() == secTypeNone) {
     result = secResultOK;
   } else {
     if (!is->hasData(4))
@@ -403,6 +424,7 @@ bool CConnection::processInitMsg()
 void CConnection::securityCompleted()
 {
   state_ = RFBSTATE_INITIALISATION;
+  server.tightEnabled = (csecurity->getType() == secTypeTight);
   vlog.debug("Authentication success!");
   writer_->writeClientInit(shared);
 }
@@ -410,6 +432,7 @@ void CConnection::securityCompleted()
 void CConnection::close()
 {
   state_ = RFBSTATE_CLOSING;
+  fileTransfer.reset();
 
   /*
    * We're already shutting down, so just log any pending decoder
@@ -505,6 +528,10 @@ void CConnection::fence(uint32_t flags, unsigned len, const uint8_t data[])
     writer()->writeFence(flags, len, data);
     return;
   }
+
+  if (len == 4 && data[0] == 'F' && data[1] == 'T' &&
+      data[2] == '1' && data[3] == '3')
+    fileTransfer.onFenceReply();
 }
 
 void CConnection::endOfContinuousUpdates()
@@ -553,6 +580,8 @@ void CConnection::serverInit(int width, int height,
   assert(framebuffer != nullptr);
   assert(framebuffer->width() == server.width());
   assert(framebuffer->height() == server.height());
+
+  fileTransfer.onServerInit();
 
   // We want to make sure we call SetEncodings at least once
   encodingChange = true;
@@ -1150,6 +1179,10 @@ void CConnection::updateEncodings()
   encodings.push_back(pseudoEncodingFence);
   encodings.push_back(pseudoEncodingQEMUKeyEvent);
   encodings.push_back(pseudoEncodingExtendedMouseButtons);
+  if (supportsFileTransfer) {
+    encodings.push_back(pseudoEncodingFTProtocolVersion);
+    encodings.push_back(pseudoEncodingSupportedMessages);
+  }
 
   if (Decoder::supported(preferredEncoding)) {
     if (!noJpeg || preferredEncoding != encodingJPEG)
@@ -1175,4 +1208,123 @@ void CConnection::updateEncodings()
   }
 
   writer()->writeSetEncodings(encodings);
+}
+
+void CConnection::serverTightCaps(const std::vector<TightCapability>& serverMsgs,
+                                  const std::vector<TightCapability>& clientMsgs,
+                                  const std::vector<TightCapability>& encodings)
+{
+  fileTransfer.onServerTightCaps(serverMsgs, clientMsgs, encodings);
+}
+
+void CConnection::supportedMessages(const uint8_t client2server[32],
+                                    const uint8_t server2client[32])
+{
+  fileTransfer.onSupportedMessages(client2server, server2client);
+}
+
+void CConnection::tight13FileListData(uint8_t flags,
+                                      const std::vector<FileEntry>& entries)
+{
+  fileTransfer.onTight13FileListData(flags, entries);
+}
+
+void CConnection::tight13FileDownloadData(const uint8_t* data, size_t len)
+{
+  fileTransfer.onTight13FileDownloadData(data, len);
+}
+
+void CConnection::tight13FileDownloadEnd(uint32_t modTime)
+{
+  fileTransfer.onTight13FileDownloadEnd(modTime);
+}
+
+void CConnection::tight13FileUploadCancel(const std::string& reason)
+{
+  fileTransfer.onTight13FileUploadCancel(reason);
+}
+
+void CConnection::tight13FileDownloadFailed(const std::string& reason)
+{
+  fileTransfer.onTight13FileDownloadFailed(reason);
+}
+
+void CConnection::tight2CompressionSupportReply(bool supported)
+{
+  fileTransfer.onTight2CompressionSupportReply(supported);
+}
+
+void CConnection::tight2FileListReply(const std::vector<FileEntry>& entries)
+{
+  fileTransfer.onTight2FileListReply(entries);
+}
+
+void CConnection::tight2Md5Reply(const uint8_t digest[16])
+{
+  fileTransfer.onTight2Md5Reply(digest);
+}
+
+void CConnection::tight2UploadStartReply()
+{
+  fileTransfer.onTight2UploadStartReply();
+}
+
+void CConnection::tight2UploadDataReply()
+{
+  fileTransfer.onTight2UploadDataReply();
+}
+
+void CConnection::tight2UploadEndReply()
+{
+  fileTransfer.onTight2UploadEndReply();
+}
+
+void CConnection::tight2DownloadStartReply()
+{
+  fileTransfer.onTight2DownloadStartReply();
+}
+
+void CConnection::tight2DownloadDataReply(const uint8_t* data, size_t len)
+{
+  fileTransfer.onTight2DownloadDataReply(data, len);
+}
+
+void CConnection::tight2DownloadEndReply(uint8_t flags, uint64_t modTimeMs)
+{
+  fileTransfer.onTight2DownloadEndReply(flags, modTimeMs);
+}
+
+void CConnection::tight2MkdirReply()
+{
+  fileTransfer.onTight2MkdirReply();
+}
+
+void CConnection::tight2RemoveReply()
+{
+  fileTransfer.onTight2RemoveReply();
+}
+
+void CConnection::tight2RenameReply()
+{
+  fileTransfer.onTight2RenameReply();
+}
+
+void CConnection::tight2DirSizeReply(uint64_t size)
+{
+  fileTransfer.onTight2DirSizeReply(size);
+}
+
+void CConnection::tight2LastRequestFailedReply(const std::string& message)
+{
+  fileTransfer.onTight2LastRequestFailedReply(message);
+}
+
+void CConnection::ultraFileTransferMessage(uint8_t contentType,
+                                           uint16_t contentParam,
+                                           uint32_t size, uint32_t sizeH,
+                                           const uint8_t* payload,
+                                           size_t length)
+{
+  fileTransfer.onUltraFileTransferMessage(contentType, contentParam,
+                                          size, sizeH, payload, length);
 }

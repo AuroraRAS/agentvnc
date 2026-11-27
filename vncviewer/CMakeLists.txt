@@ -27,6 +27,10 @@ add_executable(vncviewer
   MonitorIndicesParameter.cxx
   vncviewer.cxx)
 
+if(NOT WIN32)
+  target_sources(vncviewer PRIVATE FtpProtocol.cxx FtpServer.cxx)
+endif()
+
 if(WIN32 AND NOT CMAKE_BUILD_TYPE STREQUAL "Debug")
   set_target_properties(vncviewer PROPERTIES WIN32_EXECUTABLE TRUE)
 endif()

@@ -24,6 +24,10 @@
 #define __RFB_SERVERPARAMS_H__
 
 #include <string>
+#include <vector>
+
+#include <rfb/TightCapability.h>
+#include <rfb/fileTransferTypes.h>
 
 namespace rfb {
 
@@ -81,6 +85,17 @@ namespace rfb {
     bool supportsFence;
     bool supportsContinuousUpdates;
     bool supportsExtendedMouseButtons;
+
+    bool tightEnabled;
+    std::vector<TightCapability> serverMsgCaps;
+    std::vector<TightCapability> clientMsgCaps;
+    std::vector<TightCapability> encodingCaps;
+    FileTransferCaps fileTransferCaps;
+
+    bool hasServerMsgCap(int32_t code, const char* vendor,
+                         const char* sig) const;
+    bool hasClientMsgCap(int32_t code, const char* vendor,
+                         const char* sig) const;
 
   private:
 

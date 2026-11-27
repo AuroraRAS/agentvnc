@@ -34,6 +34,7 @@
 #include <rfb/CSecurityVeNCrypt.h>
 #include <rfb/CSecurityVncAuth.h>
 #include <rfb/CSecurityPlain.h>
+#include <rfb/CSecurityTight.h>
 #include <rfb/Security.h>
 #include <rfb/SecurityClient.h>
 #ifdef HAVE_GNUTLS
@@ -52,7 +53,7 @@ core::EnumListParameter SecurityClient::secTypes
  core::format(
   "%s (%s)",
   _("Specify which security scheme to use"),
-  "None, VncAuth, Plain"
+  "None, VncAuth, Plain, Tight"
 #ifdef HAVE_GNUTLS
   ", TLSNone, TLSVnc, TLSPlain, X509None, X509Vnc, X509Plain"
 #endif
@@ -60,7 +61,7 @@ core::EnumListParameter SecurityClient::secTypes
   ", RA2, RA2ne, RA2_256, RA2ne_256, DH, MSLogonII"
 #endif
   ).c_str(),
- { "None", "VncAuth", "Plain",
+ { "None", "VncAuth", "Plain", "Tight",
 #ifdef HAVE_GNUTLS
  "TLSNone", "TLSVnc", "TLSPlain", "X509None", "X509Vnc", "X509Plain",
 #endif
@@ -68,7 +69,7 @@ core::EnumListParameter SecurityClient::secTypes
  "RA2", "RA2ne", "RA2_256", "RA2ne_256", "DH", "MSLogonII",
 #endif
  },
- { "None", "VncAuth", "Plain",
+ { "None", "VncAuth", "Plain", "Tight",
 #ifdef HAVE_GNUTLS
  "TLSNone", "TLSVnc", "TLSPlain", "X509None", "X509Vnc", "X509Plain",
 #endif
@@ -85,6 +86,7 @@ CSecurity* SecurityClient::GetCSecurity(CConnection* cc, uint32_t secType)
   switch (secType) {
   case secTypeNone: return new CSecurityNone(cc);
   case secTypeVncAuth: return new CSecurityVncAuth(cc);
+  case secTypeTight: return new CSecurityTight(cc, this);
   case secTypeVeNCrypt: return new CSecurityVeNCrypt(cc, this);
   case secTypePlain: return new CSecurityPlain(cc);
 #ifdef HAVE_GNUTLS
