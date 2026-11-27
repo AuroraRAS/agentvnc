@@ -29,6 +29,9 @@
 
 namespace rfb {
 
+  struct GIIDevice;
+  struct GIIEvent;
+
   class SMsgHandler {
   public:
     virtual ~SMsgHandler() {}
@@ -66,6 +69,11 @@ namespace rfb {
     virtual void clipboardProvide(uint32_t flags,
                                   const size_t* lengths,
                                   const uint8_t* const* data) = 0;
+
+    virtual void giiVersion(uint16_t version) = 0;
+    virtual void giiDeviceCreate(const GIIDevice& device) = 0;
+    virtual void giiDeviceDestroy(uint32_t deviceOrigin) = 0;
+    virtual void giiEvent(const GIIEvent& event) = 0;
 
     ClientParams client;
   };

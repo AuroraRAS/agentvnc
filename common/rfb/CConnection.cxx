@@ -34,6 +34,7 @@
 #include <rfb/Exception.h>
 #include <rfb/clipboardTypes.h>
 #include <rfb/fenceTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/qemuTypes.h>
 #include <rfb/screenTypes.h>
 #include <rfb/CMsgReader.h>
@@ -74,7 +75,7 @@ CConnection::CConnection()
   : csecurity(nullptr),
     supportsLocalCursor(false), supportsCursorPosition(false),
     supportsDesktopResize(false), supportsLEDState(false),
-    supportsAudio(false),
+    supportsAudio(false), supportsGII(false),
     is(nullptr), os(nullptr), reader_(nullptr), writer_(nullptr),
     shared(false),
     state_(RFBSTATE_UNINITIALISED),
@@ -671,6 +672,43 @@ void CConnection::audioData(const uint8_t* data, size_t length)
   handleAudioData(data, length);
 }
 
+void CConnection::giiServerVersion(uint16_t maxVersion, uint16_t minVersion)
+{
+  if (!supportsGII)
+    throw protocol_error(_("Unexpected GII message"));
+
+  if (minVersion > maxVersion)
+    throw protocol_error(_("Invalid GII version range"));
+
+  uint16_t negotiated = std::min(maxVersion, giiVersionMax);
+  if ((negotiated < minVersion) || (negotiated < giiVersionMin)) {
+    vlog.error(_("Incompatible GII version range from server (%u-%u)"),
+               (unsigned)minVersion, (unsigned)maxVersion);
+    return;
+  }
+
+  if (server.supportsGII) {
+    vlog.debug("Ignoring duplicate GII version message from server");
+    return;
+  }
+
+  server.supportsGII = true;
+  server.giiVersion = negotiated;
+
+  writer()->writeGIIVersion(negotiated);
+  vlog.info(_("Enabling GII version %u"), (unsigned)negotiated);
+
+  handleGIIEnabled(negotiated);
+}
+
+void CConnection::giiDeviceCreated(uint32_t deviceOrigin)
+{
+  if (!server.supportsGII)
+    throw protocol_error(_("Unexpected GII message"));
+
+  handleGIIDeviceCreated(deviceOrigin);
+}
+
 bool CConnection::dataRect(const core::Rect& r, int encoding)
 {
   return decoder.decodeRect(r, encoding, framebuffer);
@@ -831,6 +869,14 @@ void CConnection::handleAudioEnd()
 
 void CConnection::handleAudioData(const uint8_t* /*data*/,
                                   size_t /*length*/)
+{
+}
+
+void CConnection::handleGIIEnabled(uint16_t /*version*/)
+{
+}
+
+void CConnection::handleGIIDeviceCreated(uint32_t /*deviceOrigin*/)
 {
 }
 
@@ -1002,6 +1048,26 @@ void CConnection::requestScreenLayout(int width, int height,
   writer()->writeSetDesktopSize(width, height, layout);
 }
 
+void CConnection::createGIIDevice(const GIIDevice& device)
+{
+  writer()->writeGIIDeviceCreate(device);
+}
+
+void CConnection::destroyGIIDevice(uint32_t deviceOrigin)
+{
+  writer()->writeGIIDeviceDestroy(deviceOrigin);
+}
+
+void CConnection::sendGIIEvent(const GIIEvent& event)
+{
+  writer()->writeGIIEvent(event);
+}
+
+void CConnection::sendGIIEvents(const std::vector<GIIEvent>& events)
+{
+  writer()->writeGIIEvents(events);
+}
+
 void CConnection::setPreferredEncoding(int encoding)
 {
   if (preferredEncoding == encoding)
@@ -1142,6 +1208,8 @@ void CConnection::updateEncodings()
   }
   if (supportsAudio)
     encodings.push_back(pseudoEncodingQEMUAudio);
+  if (supportsGII)
+    encodings.push_back(pseudoEncodingGII);
 
   encodings.push_back(pseudoEncodingDesktopName);
   encodings.push_back(pseudoEncodingLastRect);

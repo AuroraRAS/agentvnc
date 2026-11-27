@@ -59,6 +59,8 @@ namespace rfb {
     bool readQEMUMessage();
     bool readQEMUKeyEvent();
 
+    bool readGIIClientMessage();
+
   private:
     SMsgHandler* handler;
     rdr::InStream* is;

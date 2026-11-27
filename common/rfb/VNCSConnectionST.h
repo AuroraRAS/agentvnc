@@ -28,6 +28,7 @@
 #define __RFB_VNCSCONNECTIONST_H__
 
 #include <map>
+#include <set>
 
 #include <core/Timer.h>
 
@@ -36,6 +37,8 @@
 #include <rfb/SConnection.h>
 
 namespace rfb {
+  struct GIIDevice;
+  struct GIIEvent;
   class VNCServerST;
 
   class VNCSConnectionST : public SConnection,
@@ -145,6 +148,11 @@ namespace rfb {
     void supportsFence() override;
     void supportsContinuousUpdates() override;
     void supportsLEDState() override;
+    void supportsGII() override;
+    void giiVersion(uint16_t version) override;
+    void giiDeviceCreate(const GIIDevice& device) override;
+    void giiDeviceDestroy(uint32_t deviceOrigin) override;
+    void giiEvent(const GIIEvent& event) override;
 
     // Timer callbacks
     void handleTimeout(core::Timer* t) override;
@@ -202,6 +210,8 @@ namespace rfb {
     time_t pointerEventTime;
     core::Point pointerEventPos;
     bool clientHasCursor;
+    bool giiVersionSent;
+    std::set<uint32_t> giiDevices;
 
     std::string closeReason;
   };

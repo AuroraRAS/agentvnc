@@ -30,6 +30,8 @@ namespace rfb {
 
   const int msgTypeServerFence = 248;
 
+  const int msgTypeGIIServerMessage = 253;
+
   // client to server
 
   const int msgTypeSetPixelFormat = 0;
@@ -45,6 +47,8 @@ namespace rfb {
   const int msgTypeClientFence = 248;
 
   const int msgTypeSetDesktopSize = 251;
+
+  const int msgTypeGIIClientMessage = 253;
 
   const int msgTypeQEMUClientMessage = 255;
 

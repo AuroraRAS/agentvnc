@@ -43,6 +43,7 @@ ServerParams::ServerParams()
     supportsQEMUKeyEvent(false), supportsQEMUAudio(false),
     supportsSetDesktopSize(false), supportsFence(false),
     supportsContinuousUpdates(false), supportsExtendedMouseButtons(false),
+    supportsGII(false), giiVersion(0),
     width_(0), height_(0),
     ledState_(ledUnknown)
 {

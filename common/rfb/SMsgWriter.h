@@ -95,6 +95,10 @@ namespace rfb {
     // let the client know we support extended mouse button support
     void writeExtendedMouseButtonsSupport();
 
+    // GII (General Input Interface) server messages
+    void writeGIIVersion(uint16_t maxVersion, uint16_t minVersion);
+    void writeGIIDeviceCreateResponse(uint32_t deviceOrigin);
+
     // needFakeUpdate() returns true when an immediate update is needed in
     // order to flush out pseudo-rectangles to the client.
     bool needFakeUpdate();

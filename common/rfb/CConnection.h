@@ -26,6 +26,7 @@
 
 #include <map>
 #include <string>
+#include <vector>
 
 #include <core/Configuration.h>
 
@@ -44,6 +45,8 @@ namespace rfb {
   class CMsgReader;
   class CMsgWriter;
   class CSecurity;
+  struct GIIDevice;
+  struct GIIEvent;
 
   class CConnection : public CMsgHandler {
   public:
@@ -138,6 +141,12 @@ namespace rfb {
     // the dimensions of the framebuffer and/or the screen layout
     void requestScreenLayout(int width, int height,
                              const ScreenSet& layout);
+
+    // GII (General Input Interface) client requests
+    void createGIIDevice(const GIIDevice& device);
+    void destroyGIIDevice(uint32_t deviceOrigin);
+    void sendGIIEvent(const GIIEvent& event);
+    void sendGIIEvents(const std::vector<GIIEvent>& events);
 
     // setPreferredEncoding()/getPreferredEncoding() adjusts which
     // encoding is listed first as a hint to the server that it is the
@@ -257,6 +266,9 @@ namespace rfb {
     void audioEnd() override;
     void audioData(const uint8_t* data, size_t length) override;
 
+    void giiServerVersion(uint16_t maxVersion, uint16_t minVersion) override;
+    void giiDeviceCreated(uint32_t deviceOrigin) override;
+
 
     // Methods to be overridden in a derived class
 
@@ -303,6 +315,15 @@ namespace rfb {
     // anything in particular, and may even be empty.
     virtual void handleAudioData(const uint8_t* data, size_t length);
 
+    // handleGIIEnabled() is called once GII version negotiation with
+    // the server succeeds.
+    virtual void handleGIIEnabled(uint16_t version);
+
+    // handleGIIDeviceCreated() is called when the server responds to a
+    // previous createGIIDevice() call. A non-zero deviceOrigin is the
+    // handle for subsequent events/destruction; 0 indicates failure.
+    virtual void handleGIIDeviceCreated(uint32_t deviceOrigin);
+
   protected:
     CSecurity *csecurity;
     SecurityClient security;
@@ -315,6 +336,8 @@ namespace rfb {
 
     ModifiablePixelBuffer* getFramebuffer() { return framebuffer; }
 
+    void updateEncodings();
+
   protected:
     // Optional capabilities that a subclass is expected to set to true
     // if supported
@@ -323,6 +346,7 @@ namespace rfb {
     bool supportsDesktopResize;
     bool supportsLEDState;
     bool supportsAudio;
+    bool supportsGII;
 
   private:
     bool processVersionMsg();
@@ -336,7 +360,6 @@ namespace rfb {
 
     void requestAudio();
     void requestNewUpdate();
-    void updateEncodings();
 
     rdr::InStream* is;
     rdr::OutStream* os;

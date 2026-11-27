@@ -47,6 +47,7 @@
 #include <rfb/encodings.h>
 #include <rfb/screenTypes.h>
 #include <rfb/fenceTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/ledStates.h>
 #define XK_LATIN1
 #define XK_MISCELLANY
@@ -69,7 +70,8 @@ VNCSConnectionST::VNCSConnectionST(VNCServerST* server_, network::Socket *s,
     losslessTimer(this), server(server_),
     updateRenderedCursor(false), removeRenderedCursor(false),
     continuousUpdates(false), encodeManager(this), idleTimer(this),
-    pointerEventTime(0), clientHasCursor(false)
+    pointerEventTime(0), clientHasCursor(false),
+    giiVersionSent(false)
 {
 }
 
@@ -92,6 +94,14 @@ VNCSConnectionST::~VNCSConnectionST()
     vlog.debug("Releasing key 0x%04x / XK_%s (0x%04x) on client disconnect",
                keycode, KeySymName(keysym), keysym);
     server->keyEvent(keysym, keycode, false);
+  }
+
+  // Destroy any GII devices created by this client
+  while (!giiDevices.empty()) {
+    uint32_t origin = *giiDevices.begin();
+    giiDevices.erase(giiDevices.begin());
+    vlog.debug("Destroying GII device %u on client disconnect", origin);
+    server->giiDeviceDestroy(this, origin);
   }
 
   delete [] fenceData;
@@ -823,6 +833,89 @@ void VNCSConnectionST::supportsLEDState()
     return;
 
   writer()->writeLEDState();
+}
+
+void VNCSConnectionST::supportsGII()
+{
+  if (!server->supportsGII())
+    return;
+
+  giiVersionSent = true;
+  writer()->writeGIIVersion(giiVersionMax, giiVersionMin);
+}
+
+void VNCSConnectionST::giiVersion(uint16_t version)
+{
+  if (!giiVersionSent)
+    throw protocol_error(_("Client sent unexpected GII version message"));
+
+  SConnection::giiVersion(version);
+}
+
+void VNCSConnectionST::giiDeviceCreate(const GIIDevice& device)
+{
+  static const size_t maxGIIDevicesPerClient = 64;
+
+  if (!giiVersionSent || (client.giiVersion() == 0))
+    throw protocol_error(_("Client sent GII message before version negotiation"));
+
+  if (!accessCheck(AccessPtrEvents) && !accessCheck(AccessKeyEvents)) {
+    vlog.debug("Rejecting unauthorized GII device creation");
+    writer()->writeGIIDeviceCreateResponse(0);
+    return;
+  }
+
+  if (giiDevices.size() >= maxGIIDevicesPerClient) {
+    vlog.error(_("Client exceeded maximum number of GII devices"));
+    writer()->writeGIIDeviceCreateResponse(0);
+    return;
+  }
+
+  uint32_t origin = server->giiDeviceCreate(this, device);
+  if (origin != 0)
+    giiDevices.insert(origin);
+
+  writer()->writeGIIDeviceCreateResponse(origin);
+}
+
+void VNCSConnectionST::giiDeviceDestroy(uint32_t deviceOrigin)
+{
+  if (!giiVersionSent || (client.giiVersion() == 0))
+    throw protocol_error(_("Client sent GII message before version negotiation"));
+
+  if (giiDevices.erase(deviceOrigin) == 0) {
+    vlog.error(_("Client tried to destroy unknown GII device %u"),
+               deviceOrigin);
+    return;
+  }
+
+  server->giiDeviceDestroy(this, deviceOrigin);
+}
+
+void VNCSConnectionST::giiEvent(const GIIEvent& event)
+{
+  if (!giiVersionSent || (client.giiVersion() == 0))
+    throw protocol_error(_("Client sent GII message before version negotiation"));
+
+  if ((event.origin != 0) && (giiDevices.count(event.origin) == 0)) {
+    vlog.error(_("Ignoring GII event for unknown device %u"), event.origin);
+    return;
+  }
+
+  if (rfb::Server::idleTimeout)
+    idleTimer.start(core::secsToMillis(rfb::Server::idleTimeout));
+
+  if (giiIsKeyEvent(event.type)) {
+    if (!accessCheck(AccessKeyEvents))
+      return;
+  } else if (giiIsPointerEvent(event.type)) {
+    if (!accessCheck(AccessPtrEvents))
+      return;
+  } else {
+    return;
+  }
+
+  server->giiEvent(this, event);
 }
 
 void VNCSConnectionST::handleTimeout(core::Timer* t)

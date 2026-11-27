@@ -23,6 +23,8 @@
 #ifndef __RFB_SERVERPARAMS_H__
 #define __RFB_SERVERPARAMS_H__
 
+#include <stdint.h>
+
 #include <string>
 
 namespace rfb {
@@ -81,6 +83,8 @@ namespace rfb {
     bool supportsFence;
     bool supportsContinuousUpdates;
     bool supportsExtendedMouseButtons;
+    bool supportsGII;
+    uint16_t giiVersion;
 
   private:
 

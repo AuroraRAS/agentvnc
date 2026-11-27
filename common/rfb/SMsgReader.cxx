@@ -35,6 +35,7 @@
 
 #include <rfb/msgTypes.h>
 #include <rfb/qemuTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/clipboardTypes.h>
 #include <rfb/Exception.h>
 #include <rfb/PixelFormat.h>
@@ -111,6 +112,9 @@ bool SMsgReader::readMsg()
     break;
   case msgTypeQEMUClientMessage:
     ret = readQEMUMessage();
+    break;
+  case msgTypeGIIClientMessage:
+    ret = readGIIClientMessage();
     break;
   default:
     vlog.error(_("Unknown message type %d"), currentMsgType);
@@ -512,5 +516,224 @@ bool SMsgReader::readQEMUKeyEvent()
     return true;
   }
   handler->keyEvent(keysym, keycode, down);
+  return true;
+}
+
+static uint16_t readEU16(rdr::InStream* is, bool bigEndian)
+{
+  uint8_t b0 = is->readU8();
+  uint8_t b1 = is->readU8();
+  if (bigEndian)
+    return ((uint16_t)b0 << 8) | (uint16_t)b1;
+  else
+    return ((uint16_t)b1 << 8) | (uint16_t)b0;
+}
+
+static uint32_t readEU32(rdr::InStream* is, bool bigEndian)
+{
+  uint8_t b0 = is->readU8();
+  uint8_t b1 = is->readU8();
+  uint8_t b2 = is->readU8();
+  uint8_t b3 = is->readU8();
+  if (bigEndian)
+    return ((uint32_t)b0 << 24) | ((uint32_t)b1 << 16) |
+           ((uint32_t)b2 << 8) | (uint32_t)b3;
+  else
+    return ((uint32_t)b3 << 24) | ((uint32_t)b2 << 16) |
+           ((uint32_t)b1 << 8) | (uint32_t)b0;
+}
+
+static int32_t readES32(rdr::InStream* is, bool bigEndian)
+{
+  return (int32_t)readEU32(is, bigEndian);
+}
+
+static std::string readFixedString(rdr::InStream* is, size_t fieldLen)
+{
+  std::vector<char> buf(fieldLen);
+  is->readBytes((uint8_t*)buf.data(), fieldLen);
+  size_t len = 0;
+  while (len < fieldLen - 1 && buf[len] != '\0')
+    len++;
+  return std::string(buf.data(), len);
+}
+
+bool SMsgReader::readGIIClientMessage()
+{
+  uint8_t endianAndSubType;
+  bool bigEndian;
+  uint8_t subType;
+  uint16_t length;
+
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+
+  endianAndSubType = is->readU8();
+  bigEndian = (endianAndSubType & giiBigEndian) != 0;
+  subType = endianAndSubType & giiSubTypeMask;
+
+  length = readEU16(is, bigEndian);
+
+  if (!is->hasDataOrRestore(length))
+    return false;
+
+  is->clearRestorePoint();
+
+  switch (subType) {
+  case giiClientVersion:
+    if (length != 2)
+      throw protocol_error(_("Invalid GII version message"));
+    handler->giiVersion(readEU16(is, bigEndian));
+    break;
+
+  case giiClientDeviceCreate: {
+    if (length < giiDeviceCreateFixedSize)
+      throw protocol_error(_("Invalid GII device creation message"));
+
+    GIIDevice device;
+    device.name = readFixedString(is, giiDeviceNameLen);
+    device.vendorID = readEU32(is, bigEndian);
+    device.productID = readEU32(is, bigEndian);
+    device.canGenerate = readEU32(is, bigEndian);
+    device.numRegisters = readEU32(is, bigEndian);
+    uint32_t numValuators = readEU32(is, bigEndian);
+    device.numButtons = readEU32(is, bigEndian);
+
+    if ((numValuators > giiMaxValuatorsPerDevice) ||
+        (length != giiDeviceCreateFixedSize +
+                   numValuators * giiValuatorWireSize))
+      throw protocol_error(_("Invalid GII device creation message"));
+
+    device.valuators.resize(numValuators);
+    for (uint32_t i = 0; i < numValuators; i++) {
+      GIIValuator& val = device.valuators[i];
+      val.index = readEU32(is, bigEndian);
+      val.longName = readFixedString(is, giiValuatorLongNameLen);
+      val.shortName = readFixedString(is, giiValuatorShortNameLen);
+      val.rangeMin = readES32(is, bigEndian);
+      val.rangeCenter = readES32(is, bigEndian);
+      val.rangeMax = readES32(is, bigEndian);
+      val.siUnit = readEU32(is, bigEndian);
+      val.siAdd = readES32(is, bigEndian);
+      val.siMul = readES32(is, bigEndian);
+      val.siDiv = readES32(is, bigEndian);
+      val.siShift = readES32(is, bigEndian);
+    }
+
+    handler->giiDeviceCreate(device);
+    break;
+  }
+
+  case giiClientDeviceDestroy:
+    if (length != 4)
+      throw protocol_error(_("Invalid GII device destruction message"));
+    handler->giiDeviceDestroy(readEU32(is, bigEndian));
+    break;
+
+  case giiClientEvent: {
+    size_t remaining = length;
+    std::vector<GIIEvent> events;
+
+    while (remaining > 0) {
+      if (remaining < 2)
+        throw protocol_error(_("Invalid GII event message"));
+
+      uint8_t eventSize = is->readU8();
+      uint8_t eventType = is->readU8();
+
+      if ((eventSize < 8) || (eventSize > remaining))
+        throw protocol_error(_("Invalid GII event size"));
+
+      switch (eventType) {
+      case giiEventKeyPress:
+      case giiEventKeyRelease:
+      case giiEventKeyRepeat: {
+        if (eventSize != giiKeyEventSize)
+          throw protocol_error(_("Invalid GII key event size"));
+        is->skip(2);
+        GIIEvent ev;
+        ev.type = eventType;
+        ev.origin = readEU32(is, bigEndian);
+        ev.modifiers = readEU32(is, bigEndian);
+        ev.symbol = readEU32(is, bigEndian);
+        ev.label = readEU32(is, bigEndian);
+        ev.button = readEU32(is, bigEndian);
+        events.push_back(ev);
+        break;
+      }
+
+      case giiEventPtrRelative:
+      case giiEventPtrAbsolute: {
+        if (eventSize != giiPtrMoveEventSize)
+          throw protocol_error(_("Invalid GII pointer move event size"));
+        is->skip(2);
+        GIIEvent ev;
+        ev.type = eventType;
+        ev.origin = readEU32(is, bigEndian);
+        ev.x = readES32(is, bigEndian);
+        ev.y = readES32(is, bigEndian);
+        ev.z = readES32(is, bigEndian);
+        ev.wheel = readES32(is, bigEndian);
+        events.push_back(ev);
+        break;
+      }
+
+      case giiEventPtrButtonPress:
+      case giiEventPtrButtonRelease: {
+        if (eventSize != giiPtrButtonEventSize)
+          throw protocol_error(_("Invalid GII pointer button event size"));
+        is->skip(2);
+        GIIEvent ev;
+        ev.type = eventType;
+        ev.origin = readEU32(is, bigEndian);
+        ev.button = readEU32(is, bigEndian);
+        events.push_back(ev);
+        break;
+      }
+
+      case giiEventValuatorRelative:
+      case giiEventValuatorAbsolute: {
+        if ((eventSize < giiValuatorEventHeaderSize) ||
+            (((eventSize - giiValuatorEventHeaderSize) % 4) != 0))
+          throw protocol_error(_("Invalid GII valuator event size"));
+        is->skip(2);
+        GIIEvent ev;
+        ev.type = eventType;
+        ev.origin = readEU32(is, bigEndian);
+        ev.first = readEU32(is, bigEndian);
+        uint32_t count = readEU32(is, bigEndian);
+        if ((count > giiMaxValuatorsPerEvent) ||
+            (eventSize != giiValuatorEventHeaderSize + count * 4))
+          throw protocol_error(_("Invalid GII valuator count"));
+        ev.values.resize(count);
+        for (uint32_t i = 0; i < count; i++)
+          ev.values[i] = readES32(is, bigEndian);
+        events.push_back(ev);
+        break;
+      }
+
+      default:
+        vlog.debug("Ignoring unknown GII event type %d (size %d)",
+                   (int)eventType, (int)eventSize);
+        is->skip(eventSize - 2);
+        break;
+      }
+
+      remaining -= eventSize;
+    }
+
+    for (const GIIEvent& ev : events)
+      handler->giiEvent(ev);
+    break;
+  }
+
+  default:
+    vlog.error(_("Unknown GII client submessage type %d"), (int)subType);
+    is->skip(length);
+    break;
+  }
+
   return true;
 }

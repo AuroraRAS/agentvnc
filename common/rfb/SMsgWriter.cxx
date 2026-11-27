@@ -33,6 +33,7 @@
 
 #include <rfb/msgTypes.h>
 #include <rfb/fenceTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/clipboardTypes.h>
 #include <rfb/ClientParams.h>
 #include <rfb/Cursor.h>
@@ -767,4 +768,29 @@ void SMsgWriter::writeExtendedMouseButtonsRect()
   os->writeU16(0);
   os->writeU16(0);
   os->writeU32(pseudoEncodingExtendedMouseButtons);
+}
+
+void SMsgWriter::writeGIIVersion(uint16_t maxVersion, uint16_t minVersion)
+{
+  if (!client->supportsGII())
+    throw std::logic_error("Client does not support GII");
+
+  startMsg(msgTypeGIIServerMessage);
+  os->writeU8(giiBigEndian | giiServerVersion);
+  os->writeU16(4);
+  os->writeU16(maxVersion);
+  os->writeU16(minVersion);
+  endMsg();
+}
+
+void SMsgWriter::writeGIIDeviceCreateResponse(uint32_t deviceOrigin)
+{
+  if (!client->supportsGII())
+    throw std::logic_error("Client does not support GII");
+
+  startMsg(msgTypeGIIServerMessage);
+  os->writeU8(giiBigEndian | giiServerDeviceCreateResponse);
+  os->writeU16(4);
+  os->writeU32(deviceOrigin);
+  endMsg();
 }

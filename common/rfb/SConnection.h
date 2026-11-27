@@ -43,6 +43,8 @@ namespace network {
 
 namespace rfb {
 
+  struct GIIDevice;
+  struct GIIEvent;
   class SMsgReader;
   class SMsgWriter;
   class SSecurity;
@@ -173,6 +175,11 @@ namespace rfb {
     void clipboardProvide(uint32_t flags, const size_t* lengths,
                           const uint8_t* const* data) override;
 
+    void giiVersion(uint16_t version) override;
+    void giiDeviceCreate(const GIIDevice& device) override;
+    void giiDeviceDestroy(uint32_t deviceOrigin) override;
+    void giiEvent(const GIIEvent& event) override;
+
     // Methods to be overridden in a derived class
 
     // supportsLocalCursor() is called whenever the status of
@@ -197,6 +204,10 @@ namespace rfb {
     // should be sent back to the client to inform it of the current
     // server state.
     virtual void supportsLEDState();
+
+    // supportsGII() is called the first time we detect that the
+    // client supports the GII extension.
+    virtual void supportsGII();
 
     // authSuccess() is called when authentication has succeeded.
     virtual void authSuccess();

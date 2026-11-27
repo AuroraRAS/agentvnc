@@ -41,6 +41,7 @@
 #include <rfb/clipboardTypes.h>
 #include <rfb/msgTypes.h>
 #include <rfb/fenceTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/SMsgReader.h>
 #include <rfb/SMsgWriter.h>
 #include <rfb/SConnection.h>
@@ -400,7 +401,7 @@ void SConnection::setEncodings(int nEncodings, const int32_t* encodings)
 {
   int i;
   bool firstFence, firstContinuousUpdates, firstLEDState,
-       firstQEMUKeyEvent, firstExtMouseButtonsEvent;
+       firstQEMUKeyEvent, firstExtMouseButtonsEvent, firstGII;
 
   preferredEncoding = encodingRaw;
   for (i = 0;i < nEncodings;i++) {
@@ -415,6 +416,7 @@ void SConnection::setEncodings(int nEncodings, const int32_t* encodings)
   firstLEDState = !client.supportsLEDState();
   firstQEMUKeyEvent = !client.supportsEncoding(pseudoEncodingQEMUKeyEvent);
   firstExtMouseButtonsEvent = !client.supportsEncoding(pseudoEncodingExtendedMouseButtons);
+  firstGII = !client.supportsGII();
 
   client.setEncodings(nEncodings, encodings);
 
@@ -430,6 +432,8 @@ void SConnection::setEncodings(int nEncodings, const int32_t* encodings)
     writer()->writeQEMUKeyEvent();
   if (client.supportsEncoding(pseudoEncodingExtendedMouseButtons) && firstExtMouseButtonsEvent)
     writer()->writeExtendedMouseButtonsSupport();
+  if (client.supportsGII() && firstGII)
+    supportsGII();
 
   if (client.supportsEncoding(pseudoEncodingExtendedClipboard)) {
     uint32_t sizes[] = { 0 };
@@ -573,6 +577,43 @@ void SConnection::supportsContinuousUpdates()
 
 void SConnection::supportsLEDState()
 {
+}
+
+void SConnection::supportsGII()
+{
+}
+
+void SConnection::giiVersion(uint16_t version)
+{
+  if (!client.supportsGII())
+    throw protocol_error(_("Client sent GII message without advertising GII support"));
+
+  if ((version < giiVersionMin) || (version > giiVersionMax))
+    throw protocol_error(core::format(_("Unsupported GII version %u"),
+                                      (unsigned)version));
+
+  client.setGIIVersion(version);
+  vlog.info(_("Using GII version %u"), (unsigned)version);
+}
+
+void SConnection::giiDeviceCreate(const GIIDevice& /*device*/)
+{
+  if (client.giiVersion() == 0)
+    throw protocol_error(_("Client sent GII message before version negotiation"));
+
+  writer()->writeGIIDeviceCreateResponse(0);
+}
+
+void SConnection::giiDeviceDestroy(uint32_t /*deviceOrigin*/)
+{
+  if (client.giiVersion() == 0)
+    throw protocol_error(_("Client sent GII message before version negotiation"));
+}
+
+void SConnection::giiEvent(const GIIEvent& /*event*/)
+{
+  if (client.giiVersion() == 0)
+    throw protocol_error(_("Client sent GII message before version negotiation"));
 }
 
 void SConnection::authSuccess()

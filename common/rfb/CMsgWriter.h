@@ -24,6 +24,7 @@
 #define __RFB_CMSGWRITER_H__
 
 #include <list>
+#include <vector>
 
 #include <stdint.h>
 
@@ -38,6 +39,8 @@ namespace rfb {
 
   class PixelFormat;
   class ServerParams;
+  struct GIIDevice;
+  struct GIIEvent;
   struct ScreenSet;
 
   class CMsgWriter {
@@ -72,6 +75,12 @@ namespace rfb {
     void writeQEMUAudioEnable(bool enable);
     void writeQEMUAudioSetFormat(uint8_t sampleFormat, uint8_t channels,
                                  uint32_t frequency);
+
+    void writeGIIVersion(uint16_t version);
+    void writeGIIDeviceCreate(const GIIDevice& device);
+    void writeGIIDeviceDestroy(uint32_t deviceOrigin);
+    void writeGIIEvent(const GIIEvent& event);
+    void writeGIIEvents(const std::vector<GIIEvent>& events);
 
   protected:
     void startMsg(int type);

@@ -90,6 +90,9 @@ namespace rfb {
     virtual void audioEnd() = 0;
     virtual void audioData(const uint8_t* data, size_t length) = 0;
 
+    virtual void giiServerVersion(uint16_t maxVersion, uint16_t minVersion) = 0;
+    virtual void giiDeviceCreated(uint32_t deviceOrigin) = 0;
+
     ServerParams server;
   };
 }

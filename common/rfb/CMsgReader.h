@@ -70,6 +70,7 @@ namespace rfb {
     bool readVMwareLEDState();
 
     bool readQEMUServerMessage();
+    bool readGIIServerMessage();
 
   private:
     CMsgHandler* handler;
