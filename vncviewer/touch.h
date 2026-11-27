@@ -25,6 +25,17 @@ void enable_touch();
 void disable_touch();
 
 #if !defined(WIN32) && !defined(__APPLE__)
+class XInputGIIObserver {
+public:
+  virtual ~XInputGIIObserver() {}
+
+  virtual bool handleXIDeviceEvent(const void* xiDeviceEvent) = 0;
+  virtual void handleXIHierarchyEvent(const void* xiHierarchyEvent) = 0;
+};
+
+void x11_register_gii_observer(Fl_Window* win, XInputGIIObserver* observer);
+void x11_unregister_gii_observer(Fl_Window* win, XInputGIIObserver* observer);
+
 bool x11_grab_pointer(Fl_Window* win);
 void x11_ungrab_pointer(Fl_Window* win);
 #endif

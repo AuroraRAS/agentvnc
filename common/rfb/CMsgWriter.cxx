@@ -35,6 +35,7 @@
 #include <rfb/fenceTypes.h>
 #include <rfb/fileTransferTypes.h>
 #include <rfb/qemuTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/clipboardTypes.h>
 #include <rfb/PixelFormat.h>
 #include <rfb/ScreenSet.h>
@@ -593,6 +594,179 @@ void CMsgWriter::writeUltraFileTransfer(uint8_t contentType,
   if (hasSizeH)
     os->writeU32(sizeH);
   endMsg();
+}
+
+static void writeFixedString(rdr::OutStream* os, const std::string& str,
+                             size_t fieldLen)
+{
+  size_t len = str.size();
+  if (len >= fieldLen)
+    len = fieldLen - 1;
+  if (len > 0)
+    os->writeBytes((const uint8_t*)str.data(), len);
+  os->pad(fieldLen - len);
+}
+
+static size_t giiEventWireSize(const GIIEvent& event)
+{
+  switch (event.type) {
+  case giiEventKeyPress:
+  case giiEventKeyRelease:
+  case giiEventKeyRepeat:
+    return giiKeyEventSize;
+  case giiEventPtrRelative:
+  case giiEventPtrAbsolute:
+    return giiPtrMoveEventSize;
+  case giiEventPtrButtonPress:
+  case giiEventPtrButtonRelease:
+    return giiPtrButtonEventSize;
+  case giiEventValuatorRelative:
+  case giiEventValuatorAbsolute:
+    if (event.values.size() > giiMaxValuatorsPerEvent)
+      throw std::out_of_range("Too many GII valuators in event");
+    return giiValuatorEventHeaderSize + event.values.size() * 4;
+  default:
+    throw std::invalid_argument("Unknown GII event type");
+  }
+}
+
+static void writeSingleGIIEvent(rdr::OutStream* os, const GIIEvent& event,
+                                size_t eventSize)
+{
+  os->writeU8((uint8_t)eventSize);
+  os->writeU8(event.type);
+  os->pad(2);
+  os->writeU32(event.origin);
+
+  switch (event.type) {
+  case giiEventKeyPress:
+  case giiEventKeyRelease:
+  case giiEventKeyRepeat:
+    os->writeU32(event.modifiers);
+    os->writeU32(event.symbol);
+    os->writeU32(event.label);
+    os->writeU32(event.button);
+    break;
+  case giiEventPtrRelative:
+  case giiEventPtrAbsolute:
+    os->writeS32(event.x);
+    os->writeS32(event.y);
+    os->writeS32(event.z);
+    os->writeS32(event.wheel);
+    break;
+  case giiEventPtrButtonPress:
+  case giiEventPtrButtonRelease:
+    os->writeU32(event.button);
+    break;
+  case giiEventValuatorRelative:
+  case giiEventValuatorAbsolute:
+    os->writeU32(event.first);
+    os->writeU32((uint32_t)event.values.size());
+    for (int32_t val : event.values)
+      os->writeS32(val);
+    break;
+  }
+}
+
+void CMsgWriter::writeGIIVersion(uint16_t version)
+{
+  if (!server->supportsGII)
+    throw std::logic_error("Server does not support GII");
+
+  startMsg(msgTypeGIIClientMessage);
+  os->writeU8(giiBigEndian | giiClientVersion);
+  os->writeU16(2);
+  os->writeU16(version);
+  endMsg();
+}
+
+void CMsgWriter::writeGIIDeviceCreate(const GIIDevice& device)
+{
+  if (!server->supportsGII)
+    throw std::logic_error("Server does not support GII");
+  if (device.valuators.size() > giiMaxValuatorsPerDevice)
+    throw std::out_of_range("Too many GII valuators");
+
+  uint16_t length = (uint16_t)(giiDeviceCreateFixedSize +
+                               device.valuators.size() * giiValuatorWireSize);
+
+  startMsg(msgTypeGIIClientMessage);
+  os->writeU8(giiBigEndian | giiClientDeviceCreate);
+  os->writeU16(length);
+
+  writeFixedString(os, device.name, giiDeviceNameLen);
+  os->writeU32(device.vendorID);
+  os->writeU32(device.productID);
+  os->writeU32(device.canGenerate);
+  os->writeU32(device.numRegisters);
+  os->writeU32((uint32_t)device.valuators.size());
+  os->writeU32(device.numButtons);
+
+  for (const GIIValuator& val : device.valuators) {
+    os->writeU32(val.index);
+    writeFixedString(os, val.longName, giiValuatorLongNameLen);
+    writeFixedString(os, val.shortName, giiValuatorShortNameLen);
+    os->writeS32(val.rangeMin);
+    os->writeS32(val.rangeCenter);
+    os->writeS32(val.rangeMax);
+    os->writeU32(val.siUnit);
+    os->writeS32(val.siAdd);
+    os->writeS32(val.siMul);
+    os->writeS32(val.siDiv);
+    os->writeS32(val.siShift);
+  }
+
+  endMsg();
+}
+
+void CMsgWriter::writeGIIDeviceDestroy(uint32_t deviceOrigin)
+{
+  if (!server->supportsGII)
+    throw std::logic_error("Server does not support GII");
+
+  startMsg(msgTypeGIIClientMessage);
+  os->writeU8(giiBigEndian | giiClientDeviceDestroy);
+  os->writeU16(4);
+  os->writeU32(deviceOrigin);
+  endMsg();
+}
+
+void CMsgWriter::writeGIIEvent(const GIIEvent& event)
+{
+  std::vector<GIIEvent> events(1, event);
+  writeGIIEvents(events);
+}
+
+void CMsgWriter::writeGIIEvents(const std::vector<GIIEvent>& events)
+{
+  if (!server->supportsGII)
+    throw std::logic_error("Server does not support GII");
+  if (events.empty())
+    return;
+
+  std::vector<size_t> sizes(events.size());
+  for (size_t i = 0; i < events.size(); i++)
+    sizes[i] = giiEventWireSize(events[i]);
+
+  size_t idx = 0;
+  while (idx < events.size()) {
+    size_t chunkStart = idx;
+    size_t chunkBytes = 0;
+
+    while (idx < events.size() && (chunkBytes + sizes[idx]) <= 65535) {
+      chunkBytes += sizes[idx];
+      idx++;
+    }
+
+    startMsg(msgTypeGIIClientMessage);
+    os->writeU8(giiBigEndian | giiClientEvent);
+    os->writeU16((uint16_t)chunkBytes);
+
+    for (size_t j = chunkStart; j < idx; j++)
+      writeSingleGIIEvent(os, events[j], sizes[j]);
+
+    endMsg();
+  }
 }
 
 void CMsgWriter::startMsg(int type)

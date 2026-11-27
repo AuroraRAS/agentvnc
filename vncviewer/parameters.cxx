@@ -207,6 +207,10 @@ core::BoolParameter
             _("Play audio sent by the server, if it offers any"),
             true);
 #endif
+core::BoolParameter
+  enableGII("GII",
+            _("Enable extended input devices (RFB GII extension)"),
+            true);
 
 core::BoolParameter
   acceptClipboard("AcceptClipboard",
@@ -335,6 +339,7 @@ static core::Parameter* parameterArray[] = {
 #if !defined(WIN32) && !defined(__APPLE__)
   &sendPrimary,
   &setPrimary,
+  &enableGII,
 #endif
   &fullscreenSystemKeys,
   /* Keyboard shortcuts */

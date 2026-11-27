@@ -71,6 +71,7 @@
 #include <rfb/ServerCore.h>
 #include <rfb/VNCServerST.h>
 #include <rfb/VNCSConnectionST.h>
+#include <rfb/giiTypes.h>
 #include <rfb/ledStates.h>
 
 // Limit the number of unauthenticated clients to mitigate the effects
@@ -594,6 +595,48 @@ void VNCServerST::pointerEvent(VNCSConnectionST* client,
     pointerClient = nullptr;
 
   desktop->pointerEvent(pos, buttonMask);
+}
+
+bool VNCServerST::supportsGII() const
+{
+  return desktop->supportsGII();
+}
+
+uint32_t VNCServerST::giiDeviceCreate(VNCSConnectionST* /*client*/,
+                                      const GIIDevice& device)
+{
+  if (!desktop->supportsGII())
+    return 0;
+
+  return desktop->giiDeviceCreate(device);
+}
+
+void VNCServerST::giiDeviceDestroy(VNCSConnectionST* /*client*/,
+                                   uint32_t deviceOrigin)
+{
+  desktop->giiDeviceDestroy(deviceOrigin);
+}
+
+void VNCServerST::giiEvent(VNCSConnectionST* /*client*/,
+                           const GIIEvent& event)
+{
+  if (!desktop->supportsGII())
+    return;
+
+  if (giiIsKeyEvent(event.type)) {
+    if (!rfb::Server::acceptKeyEvents)
+      return;
+  } else if (giiIsPointerEvent(event.type)) {
+    if (!rfb::Server::acceptPointerEvents)
+      return;
+  } else {
+    return;
+  }
+
+  if (rfb::Server::maxIdleTime)
+    idleTimer.start(core::secsToMillis(rfb::Server::maxIdleTime));
+
+  desktop->giiEvent(event);
 }
 
 void VNCServerST::handleClipboardRequest(VNCSConnectionST* client)

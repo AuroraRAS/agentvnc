@@ -46,7 +46,8 @@ ClientParams::ClientParams()
     subsampling(subsampleUndefined),
     tightEnabled(false),
     width_(0), height_(0),
-    cursorPos_(0, 0), ledState_(ledUnknown)
+    cursorPos_(0, 0), ledState_(ledUnknown),
+    giiVersion_(0)
 {
   setName("");
 
@@ -257,4 +258,16 @@ bool ClientParams::supportsExtendedMouseButtons() const
   if (supportsEncoding(pseudoEncodingExtendedMouseButtons))
     return true;
   return false;
+}
+
+bool ClientParams::supportsGII() const
+{
+  if (supportsEncoding(pseudoEncodingGII))
+    return true;
+  return false;
+}
+
+void ClientParams::setGIIVersion(uint16_t version)
+{
+  giiVersion_ = version;
 }

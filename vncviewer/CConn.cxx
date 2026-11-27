@@ -72,6 +72,7 @@
 #ifndef WIN32
 #include "FtpServer.h"
 #endif
+#include "GIIInput.h"
 #include "OptionsDialog.h"
 #include "DesktopWindow.h"
 #include "PlatformPixelBuffer.h"
@@ -211,6 +212,9 @@ CConn::CConn()
   }
 #endif
 
+  if (enableGII && GIIInput::isSupported())
+    supportsGII = true;
+
   if (customCompressLevel)
     setCompressLevel(::compressLevel);
 
@@ -236,6 +240,9 @@ CConn::CConn()
 
 CConn::~CConn()
 {
+  if (desktop)
+    desktop->disableGII();
+
 #ifndef WIN32
   stopFtpServer();
   delete ftpServer;
@@ -1090,6 +1097,18 @@ void CConn::handleAudioData(const uint8_t* data, size_t length)
   audioOutput->play(data, length);
 }
 
+void CConn::handleGIIEnabled(uint16_t /*version*/)
+{
+  if (desktop != nullptr)
+    desktop->enableGII();
+}
+
+void CConn::handleGIIDeviceCreated(uint32_t deviceOrigin)
+{
+  if (desktop != nullptr)
+    desktop->handleGIIDeviceCreated(deviceOrigin);
+}
+
 
 ////////////////////// Internal methods //////////////////////
 
@@ -1196,6 +1215,27 @@ void CConn::handleOptions(void *data)
 #ifndef WIN32
   self->updateFtpServer();
 #endif
+
+  if (enableGII && GIIInput::isSupported()) {
+    if (!self->supportsGII) {
+      self->supportsGII = true;
+      if (self->state() == rfb::CConnection::RFBSTATE_NORMAL) {
+        try {
+          self->updateEncodings();
+        } catch (std::exception& e) {
+          vlog.error("%s", e.what());
+          abort_connection_unexpected(e);
+          return;
+        }
+      }
+    }
+    if (self->server.supportsGII && (self->desktop != nullptr))
+      self->desktop->enableGII();
+  } else {
+    // Keep accepting GII replies for requests sent before disabling input.
+    if (self->desktop != nullptr)
+      self->desktop->disableGII();
+  }
 }
 
 void CConn::handleUpdateTimeout(void *data)

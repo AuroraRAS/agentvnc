@@ -78,6 +78,8 @@ namespace rfb {
                                             size_t compressedSize,
                                             size_t uncompressedSize);
 
+    bool readGIIClientMessage();
+
   private:
     SMsgHandler* handler;
     rdr::InStream* is;

@@ -34,6 +34,9 @@
 
 namespace rfb {
 
+  struct GIIDevice;
+  struct GIIEvent;
+
   class SMsgHandler {
   public:
     virtual ~SMsgHandler() {}
@@ -111,6 +114,11 @@ namespace rfb {
     virtual void tight13FileDownloadCancel(const std::string& /*reason*/) {}
     virtual void tight13FileUploadFailed(const std::string& /*reason*/) {}
     virtual void tight13FileCreateDirRequest(const std::string& /*dir*/) {}
+
+    virtual void giiVersion(uint16_t version) = 0;
+    virtual void giiDeviceCreate(const GIIDevice& device) = 0;
+    virtual void giiDeviceDestroy(uint32_t deviceOrigin) = 0;
+    virtual void giiEvent(const GIIEvent& event) = 0;
 
     ClientParams client;
   };

@@ -57,6 +57,7 @@
 #include <FL/Fl_PNG_Image.H>
 #include <FL/Fl_Sys_Menu_Bar.H>
 #include <FL/fl_ask.H>
+#include <FL/x.H>
 
 #include "fltk/Fl_Password_Input.h"
 #include "fltk/theme.h"

@@ -46,6 +46,8 @@ namespace core { struct Point; }
 
 namespace rfb {
 
+  struct GIIDevice;
+  struct GIIEvent;
   class SConnection;
   struct ScreenSet;
   class VNCServer;
@@ -105,6 +107,22 @@ namespace rfb {
     // the pointer moved, or a button was pressed or released.
     virtual void pointerEvent(const core::Point& /*pos*/,
                               uint16_t /*buttonMask*/) {};
+
+    // supportsGII() returns true if the desktop back-end supports the
+    // RFB General Input Interface (GII) extension.
+    virtual bool supportsGII() const { return false; }
+
+    // giiDeviceCreate() creates a virtual GII input device on the
+    // desktop and returns a unique non-zero device origin handle, or 0
+    // on failure.
+    virtual uint32_t giiDeviceCreate(const GIIDevice& /*device*/) { return 0; }
+
+    // giiDeviceDestroy() destroys a previously created GII input
+    // device.
+    virtual void giiDeviceDestroy(uint32_t /*deviceOrigin*/) {}
+
+    // giiEvent() injects a GII input event into the desktop.
+    virtual void giiEvent(const GIIEvent& /*event*/) {}
 
     // handleClipboardRequest() is called whenever a client requests
     // the server to send over its clipboard data. It will only be

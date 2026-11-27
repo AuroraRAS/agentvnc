@@ -136,6 +136,10 @@ namespace rfb {
     void writeTight13FileUploadCancel(const std::string& reason);
     void writeTight13FileDownloadFailed(const std::string& reason);
 
+    // GII (General Input Interface) server messages
+    void writeGIIVersion(uint16_t maxVersion, uint16_t minVersion);
+    void writeGIIDeviceCreateResponse(uint32_t deviceOrigin);
+
     // needFakeUpdate() returns true when an immediate update is needed in
     // order to flush out pseudo-rectangles to the client.
     bool needFakeUpdate();

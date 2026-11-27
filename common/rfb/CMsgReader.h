@@ -73,6 +73,7 @@ namespace rfb {
     bool readVMwareLEDState();
 
     bool readQEMUServerMessage();
+    bool readGIIServerMessage();
 
     bool readUltraFileTransfer();
     bool readTight13FileListData();

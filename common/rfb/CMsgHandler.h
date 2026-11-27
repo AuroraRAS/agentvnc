@@ -130,6 +130,9 @@ namespace rfb {
                                           const uint8_t* /*payload*/,
                                           size_t /*length*/) {}
 
+    virtual void giiServerVersion(uint16_t maxVersion, uint16_t minVersion) = 0;
+    virtual void giiDeviceCreated(uint32_t deviceOrigin) = 0;
+
     ServerParams server;
   };
 }

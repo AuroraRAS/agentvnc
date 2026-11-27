@@ -25,6 +25,7 @@
 
 #include <list>
 #include <string>
+#include <vector>
 
 #include <stdint.h>
 
@@ -39,6 +40,8 @@ namespace rfb {
 
   class PixelFormat;
   class ServerParams;
+  struct GIIDevice;
+  struct GIIEvent;
   struct ScreenSet;
 
   class CMsgWriter {
@@ -111,6 +114,12 @@ namespace rfb {
                                 uint32_t size, const uint8_t* data,
                                 uint32_t length, bool hasSizeH = false,
                                 uint32_t sizeH = 0);
+
+    void writeGIIVersion(uint16_t version);
+    void writeGIIDeviceCreate(const GIIDevice& device);
+    void writeGIIDeviceDestroy(uint32_t deviceOrigin);
+    void writeGIIEvent(const GIIEvent& event);
+    void writeGIIEvents(const std::vector<GIIEvent>& events);
 
   protected:
     void startMsg(int type);

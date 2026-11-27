@@ -72,6 +72,7 @@ extern core::BoolParameter shared;
 #ifdef HAVE_AUDIO
 extern core::BoolParameter playAudio;
 #endif
+extern core::BoolParameter enableGII;
 
 extern core::BoolParameter acceptClipboard;
 extern core::BoolParameter setPrimary;
