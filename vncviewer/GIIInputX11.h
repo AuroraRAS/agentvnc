@@ -33,9 +33,9 @@ public:
   GIIInputX11(Fl_Window* win_, Viewport* viewport_, GIIEventSender* sender_);
   ~GIIInputX11();
 
+  void setEnabled(bool enabled) override;
   void handleDeviceCreated(uint32_t deviceOrigin) override;
   void releaseAllButtons() override;
-  void shutdown() override;
 
   bool handleXIDeviceEvent(const void* xiDeviceEvent) override;
   void handleXIHierarchyEvent(const void* xiHierarchyEvent) override;
@@ -46,7 +46,7 @@ private:
   Fl_Window* win;
   Viewport* viewport;
   GIIDeviceManager manager;
-  bool shutDown;
+  bool enabled;
 };
 
 #endif

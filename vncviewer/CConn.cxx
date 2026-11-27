@@ -438,9 +438,6 @@ void CConn::initDone()
   // Force a switch to the format and encoding we'd like
   updateEncoding();
   updatePixelFormat();
-
-  if (server.supportsGII)
-    desktop->enableGII();
 }
 
 bool CConn::verifyCertificate(unsigned int status,
@@ -1079,12 +1076,20 @@ void CConn::handleOptions(void *data)
   if (enableGII && GIIInput::isSupported()) {
     if (!self->supportsGII) {
       self->supportsGII = true;
-      if (self->state() == rfb::CConnection::RFBSTATE_NORMAL)
-        self->updateEncodings();
+      if (self->state() == rfb::CConnection::RFBSTATE_NORMAL) {
+        try {
+          self->updateEncodings();
+        } catch (std::exception& e) {
+          vlog.error("%s", e.what());
+          abort_connection_unexpected(e);
+          return;
+        }
+      }
     }
     if (self->server.supportsGII && (self->desktop != nullptr))
       self->desktop->enableGII();
   } else {
+    // Keep accepting GII replies for requests sent before disabling input.
     if (self->desktop != nullptr)
       self->desktop->disableGII();
   }

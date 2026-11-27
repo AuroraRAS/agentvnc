@@ -42,6 +42,18 @@ static bool containsSubstr(const std::string& haystack, const char* needle)
   return haystack.find(needle) != std::string::npos;
 }
 
+static bool containsWord(const std::string& name, const std::string& word)
+{
+  for (size_t pos = name.find(word); pos != std::string::npos;
+       pos = name.find(word, pos + word.size())) {
+    size_t end = pos + word.size();
+    if ((pos == 0 || !std::isalnum((unsigned char)name[pos - 1])) &&
+        (end == name.size() || !std::isalnum((unsigned char)name[end])))
+      return true;
+  }
+  return false;
+}
+
 static int32_t clampToInt32(double v)
 {
   if (v <= (double)INT32_MIN)
@@ -179,10 +191,10 @@ bool classifyAndBuildGIIDevice(const RawInputDeviceInfo& raw,
   bool hasNamedExtended =
     !isTouchpadName &&
     (containsSubstr(lowerName, "tablet") ||
-     containsSubstr(lowerName, "pen") ||
+     containsWord(lowerName, "pen") ||
      containsSubstr(lowerName, "stylus") ||
      containsSubstr(lowerName, "eraser") ||
-     containsSubstr(lowerName, "pad") ||
+     containsWord(lowerName, "pad") ||
      containsSubstr(lowerName, "wacom") ||
      containsSubstr(lowerName, "huion") ||
      containsSubstr(lowerName, "xp-pen") ||
@@ -335,6 +347,23 @@ void GIIDeviceManager::addDevice(int localId, bool isFloatingSlave,
 
   DeviceEntry entry;
   entry.desc = desc;
+
+  // Some servers reuse an existing origin when wire names coincide.
+  std::set<std::string> names;
+  for (const auto& device : devices) {
+    if (device.second.active)
+      names.insert(device.second.desc.name);
+  }
+  for (const PendingCreation& pending : pendingCreations)
+    names.insert(pending.name);
+
+  const size_t maxNameLength = rfb::giiDeviceNameLen - 1;
+  entry.desc.name.resize(std::min(desc.name.size(), maxNameLength));
+  for (unsigned id = 2; names.count(entry.desc.name); id++) {
+    std::string suffix = " " + std::to_string(id);
+    entry.desc.name = desc.name.substr(0, maxNameLength - suffix.size()) + suffix;
+  }
+
   entry.axisNumbers = axisNumbers;
   entry.axisAbsolute = axisAbsolute;
   entry.xValIdx = xValIdx;
@@ -349,9 +378,10 @@ void GIIDeviceManager::addDevice(int localId, bool isFloatingSlave,
   PendingCreation pending;
   pending.localId = localId;
   pending.generation = gen;
+  pending.name = entry.desc.name;
   pendingCreations.push_back(pending);
 
-  sender->createGIIDevice(desc);
+  sender->createGIIDevice(entry.desc);
 }
 
 void GIIDeviceManager::removeDevice(int localId)
@@ -370,24 +400,23 @@ void GIIDeviceManager::removeDevice(int localId)
 
 void GIIDeviceManager::handleDeviceCreated(uint32_t remoteOrigin)
 {
-  if (pendingCreations.empty()) {
-    if (remoteOrigin != 0)
-      sender->destroyGIIDevice(remoteOrigin);
+  if (pendingCreations.empty())
     return;
-  }
 
   PendingCreation pending = pendingCreations.front();
   pendingCreations.pop_front();
 
-  std::map<int, DeviceEntry>::iterator it = devices.find(pending.localId);
-  if ((it == devices.end()) || (it->second.generation != pending.generation)) {
-    if (remoteOrigin != 0)
-      sender->destroyGIIDevice(remoteOrigin);
+  if (remoteOrigin == 0)
     return;
+
+  for (const auto& device : devices) {
+    if (device.second.active && (device.second.remoteOrigin == remoteOrigin))
+      return;
   }
 
-  if (remoteOrigin == 0) {
-    devices.erase(it);
+  std::map<int, DeviceEntry>::iterator it = devices.find(pending.localId);
+  if ((it == devices.end()) || (it->second.generation != pending.generation)) {
+    sender->destroyGIIDevice(remoteOrigin);
     return;
   }
 
@@ -444,6 +473,14 @@ bool GIIDeviceManager::handleInputEvent(
     return false;
 
   DeviceEntry& entry = it->second;
+  if (kind != EventMotion) {
+    if ((button == 0) || (button > entry.desc.numButtons))
+      return false;
+    if ((kind == EventButtonRelease) &&
+        (entry.pressedButtons.count(button) == 0))
+      return false;
+  }
+
   size_t nVals = entry.desc.valuators.size();
 
   std::vector<bool> hasVal(nVals, false);
@@ -520,19 +557,17 @@ bool GIIDeviceManager::handleInputEvent(
   }
 
   if ((kind == EventButtonPress) || (kind == EventButtonRelease)) {
-    if ((button >= 1) && (button <= entry.desc.numButtons)) {
-      if (kind == EventButtonPress)
-        entry.pressedButtons.insert(button);
-      else
-        entry.pressedButtons.erase(button);
+    if (kind == EventButtonPress)
+      entry.pressedButtons.insert(button);
+    else
+      entry.pressedButtons.erase(button);
 
-      rfb::GIIEvent ev;
-      ev.type = (kind == EventButtonPress) ? rfb::giiEventPtrButtonPress
-                                           : rfb::giiEventPtrButtonRelease;
-      ev.origin = entry.remoteOrigin;
-      ev.button = button;
-      events.push_back(ev);
-    }
+    rfb::GIIEvent ev;
+    ev.type = (kind == EventButtonPress) ? rfb::giiEventPtrButtonPress
+                                         : rfb::giiEventPtrButtonRelease;
+    ev.origin = entry.remoteOrigin;
+    ev.button = button;
+    events.push_back(ev);
   }
 
   if (events.empty())
@@ -578,5 +613,5 @@ void GIIDeviceManager::destroyAllDevices()
   }
 
   devices.clear();
-  pendingCreations.clear();
+  // Replies for outstanding requests must still be drained in order.
 }

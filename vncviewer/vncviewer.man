@@ -232,9 +232,9 @@ window will be placed by the window manager by default.
 .
 .TP
 .B \-GII
-Enable the RFB General Input Interface (GII) extension to forward events from
-extended input devices such as graphics tablets, styluses, and multi-axis
-controllers. Default is on.
+Forward events from extended input devices such as graphics tablets and
+multi-axis controllers using the RFB General Input Interface (GII) extension.
+This option is enabled by default on X11 and requires GII support on the server.
 .
 .TP
 .B \-GnuTLSPriority \fIpriority\fP

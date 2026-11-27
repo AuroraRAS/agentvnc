@@ -33,9 +33,9 @@ public:
   static GIIInput* create(Fl_Window* win, Viewport* viewport,
                           GIIEventSender* sender);
 
+  virtual void setEnabled(bool enabled) = 0;
   virtual void handleDeviceCreated(uint32_t deviceOrigin) = 0;
   virtual void releaseAllButtons() = 0;
-  virtual void shutdown() = 0;
 };
 
 #endif

@@ -57,9 +57,10 @@ static void queryDeviceProductID(int deviceid,
                     &data) == Success) {
     if ((typeReturn == XA_INTEGER) && (formatReturn == 32) &&
         (numItems >= 2) && (data != nullptr)) {
-      const long* vals = (const long*)data;
-      *vendorID = (uint32_t)vals[0];
-      *productID = (uint32_t)vals[1];
+      // libXi returns packed property data, including on 64-bit systems.
+      const uint32_t* vals = reinterpret_cast<const uint32_t*>(data);
+      *vendorID = vals[0];
+      *productID = vals[1];
     }
     if (data != nullptr)
       XFree(data);
@@ -68,40 +69,37 @@ static void queryDeviceProductID(int deviceid,
 
 GIIInputX11::GIIInputX11(Fl_Window* win_, Viewport* viewport_,
                          GIIEventSender* sender_)
-  : win(win_), viewport(viewport_), manager(sender_), shutDown(false)
+  : win(win_), viewport(viewport_), manager(sender_), enabled(false)
 {
-  x11_register_gii_observer(win, this);
-  syncDevices();
 }
 
 GIIInputX11::~GIIInputX11()
 {
-  shutdown();
+  setEnabled(false);
 }
 
-void GIIInputX11::shutdown()
+void GIIInputX11::setEnabled(bool newEnabled)
 {
-  if (shutDown)
+  if (enabled == newEnabled)
     return;
 
-  shutDown = true;
-  x11_unregister_gii_observer(win, this);
-  manager.destroyAllDevices();
+  enabled = newEnabled;
+  if (enabled) {
+    x11_register_gii_observer(win, this);
+    syncDevices();
+  } else {
+    x11_unregister_gii_observer(win, this);
+    manager.destroyAllDevices();
+  }
 }
 
 void GIIInputX11::handleDeviceCreated(uint32_t deviceOrigin)
 {
-  if (shutDown)
-    return;
-
   manager.handleDeviceCreated(deviceOrigin);
 }
 
 void GIIInputX11::releaseAllButtons()
 {
-  if (shutDown)
-    return;
-
   manager.releaseAllButtons();
 }
 
@@ -143,6 +141,9 @@ void GIIInputX11::syncDevices()
         const XIButtonClassInfo* bc = (const XIButtonClassInfo*)cls;
         if (bc->num_buttons > 0)
           raw.numButtons = (uint32_t)bc->num_buttons;
+        // X11 button 2 (middle) is GII button 3.
+        if (raw.numButtons == 2)
+          raw.numButtons = 3;
       } else if (cls->type == XITouchClass) {
         const XITouchClassInfo* tc = (const XITouchClassInfo*)cls;
         raw.hasTouch = true;
@@ -167,8 +168,6 @@ void GIIInputX11::syncDevices()
       }
     }
 
-    queryDeviceProductID(dev.deviceid, &raw.vendorID, &raw.productID);
-
     rfb::GIIDevice giiDesc;
     std::vector<int> axisNumbers;
     std::vector<bool> axisAbsolute;
@@ -181,7 +180,9 @@ void GIIInputX11::syncDevices()
 
     currentAccepted.insert(dev.deviceid);
 
-    if (!manager.hasDevice(dev.deviceid)) {
+    if (!manager.hasDevice(dev.deviceid) ||
+        (manager.isFloatingDevice(dev.deviceid) != raw.isFloatingSlave)) {
+      queryDeviceProductID(dev.deviceid, &giiDesc.vendorID, &giiDesc.productID);
       vlog.debug("Registering GII device %d: %s (%u valuators, %u buttons)",
                  dev.deviceid, giiDesc.name.c_str(),
                  (unsigned)giiDesc.valuators.size(),
@@ -202,23 +203,21 @@ void GIIInputX11::syncDevices()
   }
 }
 
-void GIIInputX11::handleXIHierarchyEvent(const void* /*xiHierarchyEvent*/)
+void GIIInputX11::handleXIHierarchyEvent(const void* xiHierarchyEvent)
 {
-  if (shutDown)
-    return;
+  const XIHierarchyEvent* event = (const XIHierarchyEvent*)xiHierarchyEvent;
+  for (int i = 0; i < event->num_info; i++) {
+    const XIHierarchyInfo& device = event->info[i];
+    if (device.flags & (XISlaveRemoved | XIDeviceDisabled))
+      manager.removeDevice(device.deviceid);
+  }
 
   syncDevices();
 }
 
 bool GIIInputX11::handleXIDeviceEvent(const void* xiDeviceEvent)
 {
-  if (shutDown)
-    return false;
-
   const XIDeviceEvent* devev = (const XIDeviceEvent*)xiDeviceEvent;
-
-  if (devev->flags & XIPointerEmulated)
-    return false;
 
   GIIDeviceManager::EventKind kind;
   uint32_t button = 0;
@@ -239,6 +238,15 @@ bool GIIInputX11::handleXIDeviceEvent(const void* xiDeviceEvent)
     return false;
   }
 
+  if (devev->flags & XIPointerEmulated)
+    return false;
+
+  // GII orders the secondary and tertiary buttons opposite to X11.
+  if (button == 2)
+    button = 3;
+  else if (button == 3)
+    button = 2;
+
   if (!manager.isActiveDevice(devev->sourceid))
     return false;
 
@@ -253,14 +261,15 @@ bool GIIInputX11::handleXIDeviceEvent(const void* xiDeviceEvent)
   if (viewOnly || (Fl::grab() != nullptr))
     return false;
 
-  double fbX = devev->event_x - viewport->x();
-  double fbY = devev->event_y - viewport->y();
+  double scale = 1.0;
+#if FL_API_VERSION >= 10400
+  scale = Fl::screen_scale(win->screen_num());
+#endif
+  double fbX = devev->event_x / scale - viewport->x();
+  double fbY = devev->event_y / scale - viewport->y();
 
-  bool inViewport =
-    (devev->event_x >= viewport->x()) &&
-    (devev->event_x < (viewport->x() + viewport->w())) &&
-    (devev->event_y >= viewport->y()) &&
-    (devev->event_y < (viewport->y() + viewport->h()));
+  bool inViewport = (fbX >= 0) && (fbX < viewport->w()) &&
+                    (fbY >= 0) && (fbY < viewport->h());
 
   if (!inViewport && !manager.hasPressedButtons(devev->sourceid) && !isFloating)
     return false;
@@ -275,8 +284,7 @@ bool GIIInputX11::handleXIDeviceEvent(const void* xiDeviceEvent)
     }
   }
 
-  manager.handleInputEvent(devev->sourceid, kind, button,
-                           fbX, fbY, viewport->w(), viewport->h(),
-                           axisValues);
-  return true;
+  return manager.handleInputEvent(devev->sourceid, kind, button,
+                                  fbX, fbY, viewport->w(), viewport->h(),
+                                  axisValues);
 }

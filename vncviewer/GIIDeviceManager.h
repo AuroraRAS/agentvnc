@@ -138,6 +138,7 @@ private:
   struct PendingCreation {
     int localId;
     uint64_t generation;
+    std::string name;
   };
 
   void releaseDeviceButtons(DeviceEntry& entry);

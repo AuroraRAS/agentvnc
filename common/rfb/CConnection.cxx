@@ -1166,10 +1166,8 @@ void CConnection::requestNewUpdate()
     formatChange = false;
   }
 
-  if (encodingChange) {
+  if (encodingChange)
     updateEncodings();
-    encodingChange = false;
-  }
 
   if (forceNonincremental || !continuousUpdates) {
     pendingUpdate = true;
@@ -1243,4 +1241,5 @@ void CConnection::updateEncodings()
   }
 
   writer()->writeSetEncodings(encodings);
+  encodingChange = false;
 }

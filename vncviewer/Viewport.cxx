@@ -152,6 +152,7 @@ Viewport::Viewport(int w, int h, CConn* cc_)
 Viewport::~Viewport()
 {
   disableGII();
+  delete giiInput;
 
   // Unregister all timeouts in case they get a change tro trigger
   // again later when this object is already gone.
@@ -507,7 +508,7 @@ int Viewport::handle(int event)
       // release below
       handlePointerEvent({Fl::event_x() - x(), Fl::event_y() - y()},
                          buttonMask | wheelMask);
-    } 
+    }
 
     handlePointerEvent({Fl::event_x() - x(), Fl::event_y() - y()}, buttonMask);
     return 1;
@@ -1083,23 +1084,18 @@ void Viewport::handleOptions(void *data)
 
 void Viewport::enableGII()
 {
-  if (giiInput != nullptr)
-    return;
   if (!::enableGII || !GIIInput::isSupported())
     return;
 
-  giiInput = GIIInput::create(window(), this, this);
+  if (giiInput == nullptr)
+    giiInput = GIIInput::create(window(), this, this);
+  giiInput->setEnabled(true);
 }
 
 void Viewport::disableGII()
 {
-  if (giiInput == nullptr)
-    return;
-
-  GIIInput* input = giiInput;
-  giiInput = nullptr;
-  input->shutdown();
-  delete input;
+  if (giiInput != nullptr)
+    giiInput->setEnabled(false);
 }
 
 void Viewport::handleGIIDeviceCreated(uint32_t deviceOrigin)
@@ -1138,7 +1134,9 @@ void Viewport::destroyGIIDevice(uint32_t deviceOrigin)
 
 void Viewport::sendGIIEvents(const std::vector<rfb::GIIEvent>& events)
 {
-  if (viewOnly || (cc->state() != rfb::CConnection::RFBSTATE_NORMAL) ||
+  // Input is filtered by the backend. Cleanup releases must still be sent
+  // when switching to view-only mode.
+  if ((cc->state() != rfb::CConnection::RFBSTATE_NORMAL) ||
       !cc->server.supportsGII)
     return;
 
