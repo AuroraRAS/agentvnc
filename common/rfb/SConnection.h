@@ -276,6 +276,7 @@ namespace rfb {
     SMsgReader* reader() { return reader_; }
     SMsgWriter* writer() { return writer_; }
     SecurityServer* getSecurity() { return &security; }
+    bool preferTightSecurity = false;
 
     virtual void getTightCapabilities(std::vector<TightCapability>* serverMsgs,
                                       std::vector<TightCapability>* clientMsgs,

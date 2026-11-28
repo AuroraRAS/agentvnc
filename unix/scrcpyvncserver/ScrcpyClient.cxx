@@ -109,13 +109,16 @@ ScrcpyClient::ScrcpyClient(ScrcpyServer* server, network::Socket* s,
 
   if (fileTransferEnabled()) {
     rfb::SecurityServer* sec = getSecurity();
+    auto types = sec->GetEnabledSecTypes();
     bool hasTightAuth =
-      !sec->GetEnabledExtSecTypes().empty() ||
+      (!types.empty() && types.front() == rfb::secTypeVeNCrypt) ||
       sec->IsSupported(rfb::secTypeNone) ||
       sec->IsSupported(rfb::secTypeVncAuth) ||
       sec->IsSupported(rfb::secTypePlain);
-    if (hasTightAuth)
+    if (hasTightAuth) {
       sec->EnableSecType(rfb::secTypeTight);
+      preferTightSecurity = (ar & rfb::AccessFileTransfer) != 0;
+    }
   }
 }
 

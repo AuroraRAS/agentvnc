@@ -210,6 +210,12 @@ bool SConnection::processVersionMsg()
   if (secTypes.empty())
     failConnection(_("No supported security types"));
 
+  if (preferTightSecurity && secTypes.front() == secTypeVeNCrypt) {
+    auto tight = std::find(secTypes.begin(), secTypes.end(), secTypeTight);
+    if (tight != secTypes.end())
+      secTypes.splice(secTypes.begin(), secTypes, tight);
+  }
+
   os->writeU8(secTypes.size());
   for (i=secTypes.begin(); i!=secTypes.end(); i++)
     os->writeU8(*i);
