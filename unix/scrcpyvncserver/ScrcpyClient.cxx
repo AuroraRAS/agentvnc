@@ -888,11 +888,8 @@ void ScrcpyClient::processFileTransferEvents()
   if (!ftSession_ || state() != RFBSTATE_NORMAL)
     return;
 
-  std::vector<AdbFileTransferSession::Reply> replies = ftSession_->drainReplies();
-  if (replies.empty())
-    return;
-
   try {
+    auto replies = ftSession_->drainReplies();
     using Kind = AdbFileTransferSession::Reply::Kind;
     for (const auto& reply : replies) {
       if (state() == RFBSTATE_CLOSING)

@@ -22,6 +22,7 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <functional>
 #include <string>
 #include <vector>
 
@@ -58,7 +59,8 @@ struct AdbShellResult {
 
 class AdbClient {
 public:
-  AdbClient(const std::string& host = "127.0.0.1", int port = 5037);
+  AdbClient(const std::string& host = "127.0.0.1", int port = 5037,
+            std::function<void(int)> activeFd = {});
 
   int connectDaemon(int timeoutMs = 5000) const;
 
@@ -81,7 +83,8 @@ public:
   static std::vector<AdbDirEntry> syncList(int syncFd,
                                            const std::string& dirPath,
                                            bool useLsV2,
-                                           bool useStatV2);
+                                           bool useStatV2,
+                                           bool followSymlinks = true);
 
   static void syncStartRecv(int syncFd, const std::string& remotePath);
   // Returns 1 on DATA (appended to chunkOut), 0 on DONE, -1 on FAIL (errOut).
@@ -125,6 +128,7 @@ public:
 private:
   std::string host_;
   int port_;
+  std::function<void(int)> activeFd_;
 };
 
 #endif // __SCRCPYVNCSERVER_ADBCLIENT_H__

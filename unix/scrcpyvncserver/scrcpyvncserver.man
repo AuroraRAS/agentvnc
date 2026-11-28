@@ -67,8 +67,11 @@ listeners. Connections that require interactive approval are rejected.
 Enable or disable TightVNC File Transfer over ADB (enabled by default).
 .TP
 .BI \-FileTransferRoot " path"
-Confine TightVNC File Transfer operations to the specified directory on the
-Android device (empty exposes the full device filesystem).
+Resolve TightVNC File Transfer paths under this directory on the Android
+device and reject paths that resolve outside it. An empty value exposes the
+full device filesystem accessible to ADB. Use a directory tree whose paths
+are controlled by trusted Android users, since ADB resolves and opens paths
+in separate operations.
 .TP
 .BI \-GII " [0|1]"
 Enable or disable RFB General Input Interface (GII) extended input

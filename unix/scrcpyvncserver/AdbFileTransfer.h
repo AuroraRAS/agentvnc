@@ -21,6 +21,7 @@
 
 #include <stdint.h>
 
+#include <atomic>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
@@ -77,7 +78,7 @@ public:
   int wakeupFd() const { return wakeupPipe_[0]; }
   void stop();
 
-  // Normalizes a client-supplied path and confines it within rootDir.
+  // Maps a client-supplied path into the device namespace.
   static bool normalizePath(const std::string& rawPath,
                             const std::string& rootDir,
                             bool allowEmptyAsRoot,
@@ -165,6 +166,11 @@ private:
   void notifyMainThread();
   void workerMain();
   void ensureFeatures();
+  AdbShellResult runShell(const std::string& command);
+  bool resolvePath(const std::string& rawPath, bool allowEmptyAsRoot,
+                   std::string* devicePath, std::string* virtualPath,
+                   std::string* error, bool keepLeaf = false);
+  std::string canonicalPath(const std::string& path, bool mustExist);
 
   void setActiveIoFd(int fd);
   void closeManagedFd(int* fd);
@@ -213,18 +219,22 @@ private:
   AdbClient adb_;
   std::string serial_;
   std::string rootDir_;
+  std::string resolvedRoot_;
 
   int wakeupPipe_[2];
 
   std::mutex reqMu_;
   std::condition_variable reqCv_;
   std::deque<Request> reqQueue_;
-  bool stopping_;
+  size_t requestBytes_ = 0;
+  std::atomic<bool> stopping_;
   bool workerStarted_;
   std::thread worker_;
 
   std::mutex replyMu_;
   std::deque<Reply> replyQueue_;
+  size_t replyBytes_ = 0;
+  bool replyQueueOverflow_ = false;
 
   std::mutex ioFdMu_;
   int activeIoFd_;
@@ -246,7 +256,6 @@ private:
   UploadMode uploadMode_;
   int uploadFd_;
   int uploadTempFd_;
-  std::string uploadTempPath_;
   std::string uploadPath_;
   bool tight13UploadActive_;
 

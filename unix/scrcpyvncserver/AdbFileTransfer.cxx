@@ -46,6 +46,8 @@ namespace {
 
 static const size_t kMaxDownloadChunk = 1024u * 1024u;
 static const size_t kTight13DownloadChunk = 32768u;
+static const size_t kMaxQueuedMessages = 256;
+static const size_t kMaxQueuedBytes = 32u * 1024u * 1024u;
 static const int kMaxDirSizeDepth = 64;
 static const int kAdbTransferTimeoutMs = 30000;
 
@@ -190,17 +192,23 @@ std::string extractShellError(const AdbShellResult& res,
 
 class IoFdScope {
 public:
-  IoFdScope(std::function<void(int)> setFn, int fd)
-    : setFn_(std::move(setFn))
+  IoFdScope(std::function<void(int)> setFn, int fd, bool ownsFd = false)
+    : setFn_(std::move(setFn)), ownedFd_(ownsFd ? fd : -1)
   {
     setFn_(fd);
   }
   ~IoFdScope()
   {
     setFn_(-1);
+    if (ownedFd_ >= 0)
+      ::close(ownedFd_);
   }
 private:
+  IoFdScope(const IoFdScope&) = delete;
+  IoFdScope& operator=(const IoFdScope&) = delete;
+
   std::function<void(int)> setFn_;
+  int ownedFd_;
 };
 
 } // namespace
@@ -209,7 +217,7 @@ AdbFileTransferSession::AdbFileTransferSession(std::string adbHost,
                                                int adbPort,
                                                std::string serial,
                                                std::string rootDir)
-  : adb_(std::move(adbHost), adbPort),
+  : adb_(adbHost, adbPort, [this](int fd) { setActiveIoFd(fd); }),
     serial_(std::move(serial)),
     rootDir_(std::move(rootDir)),
     stopping_(false),
@@ -250,6 +258,7 @@ void AdbFileTransferSession::stop()
     std::lock_guard<std::mutex> lk(reqMu_);
     stopping_ = true;
     reqQueue_.clear();
+    requestBytes_ = 0;
   }
   reqCv_.notify_all();
 
@@ -301,17 +310,84 @@ bool AdbFileTransferSession::normalizePath(const std::string& rawPath,
   return true;
 }
 
+std::string AdbFileTransferSession::canonicalPath(const std::string& path,
+                                                  bool mustExist)
+{
+  AdbShellResult result = runShell(
+    std::string(mustExist ? "readlink -e -- " : "readlink -f -- ") +
+    AdbClient::quoteShellArg(path));
+  std::string& resolved = result.stdoutData;
+  if (result.exitCode != 0 || resolved.empty() || resolved.front() != '/' ||
+      resolved.back() != '\n' || resolved.find('\0') != std::string::npos)
+    throw std::runtime_error("Could not resolve Android file transfer path");
+  resolved.pop_back();
+  return resolved;
+}
+
+bool AdbFileTransferSession::resolvePath(const std::string& rawPath,
+                                         bool allowEmptyAsRoot,
+                                         std::string* devicePath,
+                                         std::string* virtualPath,
+                                         std::string* error,
+                                         bool keepLeaf)
+{
+  if (!normalizePath(rawPath, "", allowEmptyAsRoot, devicePath,
+                     virtualPath, error))
+    return false;
+  if (rootDir_.empty())
+    return true;
+
+  try {
+    if (resolvedRoot_.empty()) {
+      std::string root;
+      if (!normalizePath("/", rootDir_, false, &root, nullptr, error))
+        return false;
+      resolvedRoot_ = canonicalPath(root, true);
+    }
+
+    if (*devicePath == "/") {
+      // Check the root again in case the device filesystem changed.
+      *devicePath = canonicalPath(resolvedRoot_, true);
+    } else {
+      std::string path = resolvedRoot_ == "/" ? *devicePath
+                                             : resolvedRoot_ + *devicePath;
+      if (keepLeaf) {
+        // Rename and removal operate on the directory entry itself.
+        std::string parent = canonicalPath(parentDirectory(path), true);
+        *devicePath = (parent == "/" ? "" : parent) + path.substr(path.rfind('/'));
+      } else {
+        *devicePath = canonicalPath(path, false);
+      }
+    }
+
+    if (resolvedRoot_ != "/" && *devicePath != resolvedRoot_ &&
+        devicePath->compare(0, resolvedRoot_.size() + 1, resolvedRoot_ + "/") != 0)
+      throw std::runtime_error("Path is outside FileTransferRoot");
+
+    return true;
+  } catch (const std::exception& e) {
+    if (error)
+      *error = e.what();
+    return false;
+  }
+}
+
 void AdbFileTransferSession::enqueue(Request req)
 {
   {
     std::lock_guard<std::mutex> lk(reqMu_);
     if (stopping_)
       return;
+    size_t bytes = req.data.size() + req.path.size() + req.path2.size();
+    if (reqQueue_.size() >= kMaxQueuedMessages ||
+        bytes > kMaxQueuedBytes - requestBytes_)
+      throw std::runtime_error("Too many pending file transfer requests");
     if (!workerStarted_) {
-      workerStarted_ = true;
       worker_ = std::thread(&AdbFileTransferSession::workerMain, this);
+      workerStarted_ = true;
     }
     reqQueue_.push_back(std::move(req));
+    requestBytes_ += bytes;
   }
   reqCv_.notify_one();
 }
@@ -329,7 +405,20 @@ void AdbFileTransferSession::postReply(Reply reply)
 {
   {
     std::lock_guard<std::mutex> lk(replyMu_);
-    replyQueue_.push_back(std::move(reply));
+    if (replyQueueOverflow_)
+      return;
+    size_t bytes = reply.data.size() + reply.text.size();
+    for (const rfb::FileEntry& entry : reply.entries)
+      bytes += sizeof(entry) + entry.name.size();
+    if (replyQueue_.size() >= kMaxQueuedMessages ||
+        bytes > kMaxQueuedBytes - replyBytes_) {
+      replyQueue_.clear();
+      replyBytes_ = 0;
+      replyQueueOverflow_ = true;
+    } else {
+      replyQueue_.push_back(std::move(reply));
+      replyBytes_ += bytes;
+    }
   }
   notifyMainThread();
 }
@@ -348,10 +437,13 @@ std::vector<AdbFileTransferSession::Reply> AdbFileTransferSession::drainReplies(
 
   std::vector<Reply> out;
   std::lock_guard<std::mutex> lk(replyMu_);
+  if (replyQueueOverflow_)
+    throw std::runtime_error("Too many pending file transfer replies");
   while (!replyQueue_.empty()) {
     out.push_back(std::move(replyQueue_.front()));
     replyQueue_.pop_front();
   }
+  replyBytes_ = 0;
   return out;
 }
 
@@ -359,6 +451,8 @@ void AdbFileTransferSession::setActiveIoFd(int fd)
 {
   std::lock_guard<std::mutex> lk(ioFdMu_);
   activeIoFd_ = fd;
+  if (stopping_ && fd >= 0)
+    ::shutdown(fd, SHUT_RDWR);
 }
 
 void AdbFileTransferSession::closeManagedFd(int* fd)
@@ -373,8 +467,6 @@ void AdbFileTransferSession::closeManagedFd(int* fd)
 void AdbFileTransferSession::closeDownload()
 {
   if (downloadSyncFd_ >= 0) {
-    setActiveIoFd(downloadSyncFd_);
-    AdbClient::syncQuit(downloadSyncFd_);
     closeManagedFd(&downloadSyncFd_);
   }
   downloadPath_.clear();
@@ -388,25 +480,11 @@ void AdbFileTransferSession::closeDownload()
 
 void AdbFileTransferSession::abortUpload()
 {
-  if (uploadMode_ == UploadMode::SyncSend && uploadFd_ >= 0) {
-    setActiveIoFd(uploadFd_);
-    AdbClient::syncQuit(uploadFd_);
+  if (uploadFd_ >= 0)
     closeManagedFd(&uploadFd_);
-  } else if (uploadMode_ == UploadMode::ShellV2Append && uploadFd_ >= 0) {
-    setActiveIoFd(uploadFd_);
-    try {
-      AdbClient::shellV2CloseStdin(uploadFd_);
-    } catch (const std::exception&) {
-    }
-    closeManagedFd(&uploadFd_);
-  }
   if (uploadTempFd_ >= 0) {
     ::close(uploadTempFd_);
     uploadTempFd_ = -1;
-  }
-  if (!uploadTempPath_.empty()) {
-    ::unlink(uploadTempPath_.c_str());
-    uploadTempPath_.clear();
   }
   uploadMode_ = UploadMode::None;
   uploadPath_.clear();
@@ -434,6 +512,15 @@ void AdbFileTransferSession::ensureFeatures()
   featuresQueried_ = true;
 }
 
+AdbShellResult AdbFileTransferSession::runShell(const std::string& command)
+{
+  if (stopping_)
+    throw std::runtime_error("ADB file transfer session closed");
+  ensureFeatures();
+  return adb_.runShell(serial_, command, features_.shellV2,
+                       kAdbTransferTimeoutMs);
+}
+
 void AdbFileTransferSession::workerMain()
 {
   while (true) {
@@ -445,6 +532,7 @@ void AdbFileTransferSession::workerMain()
         break;
       req = std::move(reqQueue_.front());
       reqQueue_.pop_front();
+      requestBytes_ -= req.data.size() + req.path.size() + req.path2.size();
     }
 
     handleRequest(req);
@@ -540,7 +628,7 @@ void AdbFileTransferSession::handleTight2FileList(uint8_t compressLevel,
 {
   std::string devicePath;
   std::string err;
-  if (!normalizePath(rawPath, rootDir_, true, &devicePath, nullptr, &err)) {
+  if (!resolvePath(rawPath, true, &devicePath, nullptr, &err)) {
     Reply r;
     r.kind = Reply::Kind::Tight2Failed;
     r.text = err;
@@ -557,8 +645,7 @@ void AdbFileTransferSession::handleTight2FileList(uint8_t compressLevel,
     AdbStat st;
     if (!AdbClient::syncStat(syncFd, devicePath, features_.statV2, true, &st) ||
         !S_ISDIR(st.mode)) {
-      AdbClient::syncQuit(syncFd);
-      ::close(syncFd);
+      closeManagedFd(&syncFd);
       Reply r;
       r.kind = Reply::Kind::Tight2Failed;
       r.text = (st.error != 0) ? std::strerror(static_cast<int>(st.error))
@@ -568,10 +655,10 @@ void AdbFileTransferSession::handleTight2FileList(uint8_t compressLevel,
     }
 
     std::vector<AdbDirEntry> raw =
-      AdbClient::syncList(syncFd, devicePath, features_.lsV2, features_.statV2);
+      AdbClient::syncList(syncFd, devicePath, features_.lsV2, features_.statV2,
+                          rootDir_.empty());
     AdbClient::syncQuit(syncFd);
-    ::close(syncFd);
-    syncFd = -1;
+    closeManagedFd(&syncFd);
 
     Reply r;
     r.kind = Reply::Kind::Tight2FileList;
@@ -605,7 +692,7 @@ void AdbFileTransferSession::handleTight2Md5(const std::string& rawPath,
 {
   std::string devicePath;
   std::string err;
-  if (!normalizePath(rawPath, rootDir_, false, &devicePath, nullptr, &err)) {
+  if (!resolvePath(rawPath, false, &devicePath, nullptr, &err)) {
     Reply r;
     r.kind = Reply::Kind::Tight2Failed;
     r.text = err;
@@ -627,11 +714,11 @@ void AdbFileTransferSession::handleTight2Md5(const std::string& rawPath,
     ::close(syncFd);
     syncFd = -1;
 
-    if (!okStat || S_ISDIR(st.mode)) {
+    if (!okStat || !S_ISREG(st.mode)) {
       Reply r;
       r.kind = Reply::Kind::Tight2Failed;
-      r.text = S_ISDIR(st.mode)
-        ? "Cannot compute MD5 of a directory"
+      r.text = okStat
+        ? "Cannot compute MD5 of a non-regular file"
         : (st.error ? std::strerror(static_cast<int>(st.error))
                     : "File not found");
       postReply(std::move(r));
@@ -666,17 +753,15 @@ void AdbFileTransferSession::handleTight2Md5(const std::string& rawPath,
       cmd = "md5sum -- " + qpath;
     } else {
       cmd = core::format(
-        "(dd if=%s bs=65536 iflag=skip_bytes,count_bytes skip=%llu count=%llu status=none"
-        " || printf '__SCRCPY_DD_FAIL__' >&2) | md5sum",
+        "set -o pipefail && dd if=%s bs=65536 iflag=skip_bytes,count_bytes"
+        " skip=%llu count=%llu status=none | md5sum",
         qpath.c_str(),
         static_cast<unsigned long long>(offset),
         static_cast<unsigned long long>(len));
     }
 
-    AdbShellResult res =
-      adb_.runShell(serial_, cmd, features_.shellV2, kAdbTransferTimeoutMs);
-    if (res.exitCode != 0 ||
-        res.stderrData.find("__SCRCPY_DD_FAIL__") != std::string::npos) {
+    AdbShellResult res = runShell(cmd);
+    if (res.exitCode != 0) {
       Reply r;
       r.kind = Reply::Kind::Tight2Failed;
       r.text = extractShellError(res, "Failed to compute MD5");
@@ -719,7 +804,7 @@ bool AdbFileTransferSession::openDownloadInternal(const std::string& rawPath,
   }
 
   std::string devicePath;
-  if (!normalizePath(trimmed, rootDir_, false, &devicePath, nullptr, errOut))
+  if (!resolvePath(trimmed, false, &devicePath, nullptr, errOut))
     return false;
 
   try {
@@ -728,12 +813,12 @@ bool AdbFileTransferSession::openDownloadInternal(const std::string& rawPath,
     IoFdScope scope([this](int f) { setActiveIoFd(f); }, downloadSyncFd_);
 
     AdbStat st;
-    if (!AdbClient::syncStat(downloadSyncFd_, devicePath, features_.statV2,
-                             true, &st) ||
-        S_ISDIR(st.mode)) {
+    bool exists = AdbClient::syncStat(downloadSyncFd_, devicePath,
+                                     features_.statV2, true, &st);
+    if (!exists || !S_ISREG(st.mode)) {
       if (errOut) {
-        *errOut = S_ISDIR(st.mode)
-          ? "Cannot download a directory"
+        *errOut = exists
+          ? "Cannot download a non-regular file"
           : (st.error ? std::strerror(static_cast<int>(st.error))
                       : "File not found");
       }
@@ -764,6 +849,8 @@ bool AdbFileTransferSession::openDownloadInternal(const std::string& rawPath,
         return false;
       }
       if (rc == 0) {
+        if (remainingSkip != 0)
+          throw std::runtime_error("File ended before the requested download offset");
         downloadEof_ = true;
         gotInitial = true;
         break;
@@ -915,7 +1002,7 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
   abortUpload();
 
   std::string devicePath;
-  if (!normalizePath(rawPath, rootDir_, false, &devicePath, nullptr, errOut))
+  if (!resolvePath(rawPath, false, &devicePath, nullptr, errOut))
     return false;
 
   try {
@@ -927,7 +1014,7 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
     AdbStat parentSt;
     bool parentExists = false;
     {
-      IoFdScope scope([this](int f) { setActiveIoFd(f); }, statFd);
+      IoFdScope scope([this](int f) { setActiveIoFd(f); }, statFd, true);
       exists = AdbClient::syncStat(statFd, devicePath, features_.statV2,
                                    true, &st);
       if (overwrite) {
@@ -937,7 +1024,6 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
       }
       AdbClient::syncQuit(statFd);
     }
-    ::close(statFd);
 
     if (overwrite) {
       if (offset > 0) {
@@ -945,9 +1031,9 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
           *errOut = "Specified file pointer position is more than file length";
         return false;
       }
-      if (exists && S_ISDIR(st.mode)) {
+      if (exists && !S_ISREG(st.mode)) {
         if (errOut)
-          *errOut = "Cannot overwrite a directory";
+          *errOut = "Cannot overwrite a non-regular file";
         return false;
       }
       if (!parentExists || !S_ISDIR(parentSt.mode)) {
@@ -956,9 +1042,9 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
         return false;
       }
     } else {
-      if (!exists || S_ISDIR(st.mode)) {
+      if (!exists || !S_ISREG(st.mode)) {
         if (errOut)
-          *errOut = exists ? "Cannot upload over a directory"
+          *errOut = exists ? "Cannot upload over a non-regular file"
                            : "The system cannot find the file specified";
         return false;
       }
@@ -1035,17 +1121,18 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
 
     // Fallback when shell_v2 is unavailable: pull prefix [0..offset) locally.
     char tmpl[] = "/tmp/scrcpy-ft-up-XXXXXX";
-    uploadTempFd_ = ::mkstemp(tmpl);
+    uploadTempFd_ = ::mkostemp(tmpl, O_CLOEXEC);
     if (uploadTempFd_ < 0) {
       if (errOut)
         *errOut = std::strerror(errno);
       return false;
     }
-    uploadTempPath_ = tmpl;
+    if (::unlink(tmpl) < 0)
+      throw core::posix_error("Failed to unlink temporary upload file", errno);
 
     int pullFd = adb_.openSync(serial_, kAdbTransferTimeoutMs);
     {
-      IoFdScope scope([this](int f) { setActiveIoFd(f); }, pullFd);
+      IoFdScope scope([this](int f) { setActiveIoFd(f); }, pullFd, true);
       AdbClient::syncStartRecv(pullFd, devicePath);
       uint64_t copied = 0;
       while (copied < offset) {
@@ -1056,13 +1143,11 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
           if (errOut)
             *errOut = recvErr.empty() ? "Failed to read existing file prefix"
                                       : recvErr;
-          AdbClient::syncQuit(pullFd);
-          ::close(pullFd);
           abortUpload();
           return false;
         }
         if (rc == 0)
-          break;
+          throw std::runtime_error("File ended before the requested upload offset");
         size_t take = static_cast<size_t>(
           std::min<uint64_t>(chunk.size(), offset - copied));
         size_t off = 0;
@@ -1073,8 +1158,6 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
           if (wn <= 0) {
             if (errOut)
               *errOut = std::strerror(errno);
-            AdbClient::syncQuit(pullFd);
-            ::close(pullFd);
             abortUpload();
             return false;
           }
@@ -1082,9 +1165,7 @@ bool AdbFileTransferSession::openUploadInternal(const std::string& rawPath,
         }
         copied += take;
       }
-      AdbClient::syncQuit(pullFd);
     }
-    ::close(pullFd);
 
     uploadMode_ = UploadMode::TempFileFallback;
     uploadPath_ = devicePath;
@@ -1174,8 +1255,11 @@ bool AdbFileTransferSession::finishUploadInternal(uint16_t fileFlags,
                                                   uint64_t modTimeMs,
                                                   std::string* errOut)
 {
-  if (uploadMode_ == UploadMode::None)
-    return true;
+  if (uploadMode_ == UploadMode::None) {
+    if (errOut)
+      *errOut = "No active upload";
+    return false;
+  }
 
   std::string targetPath = uploadPath_;
   uint32_t mtimeSec = static_cast<uint32_t>(modTimeMs / 1000ULL);
@@ -1228,67 +1312,51 @@ bool AdbFileTransferSession::finishUploadInternal(uint16_t fileFlags,
       }
 
       if (modTimeMs > 0) {
-        std::string cmd = "touch -c -d " +
+        std::string cmd = "touch -c -m -d " +
                           AdbClient::quoteShellArg(
                             formatTouchDateUtc(static_cast<time_t>(mtimeSec))) +
                           " -- " + AdbClient::quoteShellArg(targetPath);
         try {
-          adb_.runShell(serial_, cmd, features_.shellV2, kAdbTransferTimeoutMs);
+          if (rootDir_.empty() || canonicalPath(targetPath, true) == targetPath)
+            runShell(cmd);
         } catch (const std::exception&) {
         }
       }
     } else if (uploadMode_ == UploadMode::TempFileFallback) {
-      ::close(uploadTempFd_);
-      uploadTempFd_ = -1;
-      std::string tmpPath = uploadTempPath_;
-      uploadTempPath_.clear();
-      uploadMode_ = UploadMode::None;
-      uploadPath_.clear();
-
+      if (!rootDir_.empty() && canonicalPath(targetPath, true) != targetPath)
+        throw std::runtime_error("Upload target changed during transfer");
+      if (::lseek(uploadTempFd_, 0, SEEK_SET) < 0)
+        throw core::posix_error("Failed to rewind temporary upload file", errno);
       int syncFd = adb_.openSync(serial_, kAdbTransferTimeoutMs);
-      try {
-        IoFdScope scope([this](int f) { setActiveIoFd(f); }, syncFd);
+      {
+        IoFdScope scope([this](int f) { setActiveIoFd(f); }, syncFd, true);
         AdbClient::syncStartSend(syncFd, targetPath, 0100644);
-        int inFd = ::open(tmpPath.c_str(), O_RDONLY | O_CLOEXEC);
-        if (inFd < 0)
-          throw core::posix_error("Failed to reopen temp upload file", errno);
         uint8_t buf[65536];
         while (true) {
-          ssize_t n = ::read(inFd, buf, sizeof(buf));
+          ssize_t n = ::read(uploadTempFd_, buf, sizeof(buf));
           if (n < 0 && errno == EINTR)
             continue;
-          if (n < 0) {
-            int saved = errno;
-            ::close(inFd);
-            throw core::posix_error("Failed reading temp upload file", saved);
-          }
+          if (n < 0)
+            throw core::posix_error("Failed reading temporary upload file", errno);
           if (n == 0)
             break;
           AdbClient::syncWriteSendData(syncFd, buf, static_cast<size_t>(n));
         }
-        ::close(inFd);
         std::string sendErr;
         bool ok = AdbClient::syncFinishSend(syncFd, mtimeSec, &sendErr);
-        ::close(syncFd);
-        ::unlink(tmpPath.c_str());
+        abortUpload();
         if (!ok) {
           if (errOut)
             *errOut = sendErr.empty() ? "ADB SEND failed" : sendErr;
           return false;
         }
-      } catch (...) {
-        setActiveIoFd(-1);
-        ::close(syncFd);
-        ::unlink(tmpPath.c_str());
-        throw;
       }
     }
 
     if ((fileFlags & rfb::tight2FlagExec) != 0 && !targetPath.empty()) {
       try {
-        adb_.runShell(serial_,
-                      "chmod 755 -- " + AdbClient::quoteShellArg(targetPath),
-                      features_.shellV2, kAdbTransferTimeoutMs);
+        if (rootDir_.empty() || canonicalPath(targetPath, true) == targetPath)
+          runShell("chmod 755 -- " + AdbClient::quoteShellArg(targetPath));
       } catch (const std::exception&) {
       }
     }
@@ -1360,7 +1428,7 @@ void AdbFileTransferSession::handleTight2Mkdir(const std::string& rawPath)
   std::string devicePath;
   std::string virtualPath;
   std::string err;
-  if (!normalizePath(rawPath, rootDir_, false, &devicePath, &virtualPath, &err)) {
+  if (!resolvePath(rawPath, false, &devicePath, &virtualPath, &err)) {
     Reply r;
     r.kind = Reply::Kind::Tight2Failed;
     r.text = err;
@@ -1376,10 +1444,7 @@ void AdbFileTransferSession::handleTight2Mkdir(const std::string& rawPath)
   }
 
   try {
-    ensureFeatures();
-    AdbShellResult res = adb_.runShell(
-      serial_, "mkdir -- " + AdbClient::quoteShellArg(devicePath),
-      features_.shellV2, kAdbTransferTimeoutMs);
+    AdbShellResult res = runShell("mkdir -- " + AdbClient::quoteShellArg(devicePath));
     Reply r;
     if (res.exitCode != 0) {
       r.kind = Reply::Kind::Tight2Failed;
@@ -1401,7 +1466,7 @@ void AdbFileTransferSession::handleTight2Remove(const std::string& rawPath)
   std::string devicePath;
   std::string virtualPath;
   std::string err;
-  if (!normalizePath(rawPath, rootDir_, false, &devicePath, &virtualPath, &err)) {
+  if (!resolvePath(rawPath, false, &devicePath, &virtualPath, &err, true)) {
     Reply r;
     r.kind = Reply::Kind::Tight2Failed;
     r.text = err;
@@ -1424,10 +1489,7 @@ void AdbFileTransferSession::handleTight2Remove(const std::string& rawPath)
   }
 
   try {
-    ensureFeatures();
-    AdbShellResult res = adb_.runShell(
-      serial_, "rm -r -- " + AdbClient::quoteShellArg(devicePath),
-      features_.shellV2, kAdbTransferTimeoutMs);
+    AdbShellResult res = runShell("rm -r -- " + AdbClient::quoteShellArg(devicePath));
     Reply r;
     if (res.exitCode != 0) {
       r.kind = Reply::Kind::Tight2Failed;
@@ -1453,8 +1515,8 @@ void AdbFileTransferSession::handleTight2Rename(const std::string& oldRaw,
   std::string newVirtual;
   std::string err;
 
-  if (!normalizePath(oldRaw, rootDir_, false, &oldDevice, &oldVirtual, &err) ||
-      !normalizePath(newRaw, rootDir_, false, &newDevice, &newVirtual, &err)) {
+  if (!resolvePath(oldRaw, false, &oldDevice, &oldVirtual, &err, true) ||
+      !resolvePath(newRaw, false, &newDevice, &newVirtual, &err, true)) {
     Reply r;
     r.kind = Reply::Kind::Tight2Failed;
     r.text = err;
@@ -1495,7 +1557,7 @@ void AdbFileTransferSession::handleTight2Rename(const std::string& oldRaw,
       srcOk = AdbClient::syncStat(syncFd, oldDevice, features_.statV2,
                                   false, &srcSt);
       dstOk = AdbClient::syncStat(syncFd, newDevice, features_.statV2,
-                                  true, &dstSt);
+                                  false, &dstSt);
       AdbClient::syncQuit(syncFd);
     }
     ::close(syncFd);
@@ -1517,11 +1579,9 @@ void AdbFileTransferSession::handleTight2Rename(const std::string& oldRaw,
       return;
     }
 
-    AdbShellResult res = adb_.runShell(
-      serial_,
-      "mv -- " + AdbClient::quoteShellArg(oldDevice) + " " +
-      AdbClient::quoteShellArg(newDevice),
-      features_.shellV2, kAdbTransferTimeoutMs);
+    AdbShellResult res = runShell(
+      "mv -T -- " + AdbClient::quoteShellArg(oldDevice) + " " +
+      AdbClient::quoteShellArg(newDevice));
     Reply r;
     if (res.exitCode != 0) {
       r.kind = Reply::Kind::Tight2Failed;
@@ -1550,14 +1610,14 @@ bool AdbFileTransferSession::computeDirSizeFallback(int syncFd,
   if (depth > kMaxDirSizeDepth)
     return false;
   std::vector<AdbDirEntry> entries =
-    AdbClient::syncList(syncFd, dirPath, features_.lsV2, features_.statV2);
+    AdbClient::syncList(syncFd, dirPath, features_.lsV2, features_.statV2, false);
   std::string prefix = (dirPath == "/") ? "/" : (dirPath + "/");
   for (const AdbDirEntry& e : entries) {
     if (S_ISDIR(e.mode)) {
       if (!computeDirSizeFallback(syncFd, prefix + e.name, depth + 1, totalOut))
         return false;
-    } else {
-      *totalOut += e.size;
+    } else if (S_ISREG(e.mode)) {
+      *totalOut += std::min(e.size, UINT64_MAX - *totalOut);
     }
   }
   return true;
@@ -1567,7 +1627,7 @@ void AdbFileTransferSession::handleTight2DirSize(const std::string& rawPath)
 {
   std::string devicePath;
   std::string err;
-  if (!normalizePath(rawPath, rootDir_, true, &devicePath, nullptr, &err)) {
+  if (!resolvePath(rawPath, true, &devicePath, nullptr, &err)) {
     Reply r;
     r.kind = Reply::Kind::Tight2Failed;
     r.text = err;
@@ -1599,11 +1659,9 @@ void AdbFileTransferSession::handleTight2DirSize(const std::string& rawPath)
       return;
     }
 
-    AdbShellResult res = adb_.runShell(
-      serial_,
+    AdbShellResult res = runShell(
       "find -H " + AdbClient::quoteShellArg(devicePath) +
-        " -type f -printf '%s\\n'",
-      features_.shellV2, kAdbTransferTimeoutMs);
+      " -type f -printf '%s\\n'");
     if (res.exitCode == 0) {
       uint64_t total = 0;
       bool parsedOk = true;
@@ -1652,7 +1710,8 @@ void AdbFileTransferSession::handleTight2DirSize(const std::string& rawPath)
     uint64_t total = 0;
     {
       IoFdScope scope([this](int f) { setActiveIoFd(f); }, syncFd);
-      computeDirSizeFallback(syncFd, devicePath, 0, &total);
+      if (!computeDirSizeFallback(syncFd, devicePath, 0, &total))
+        throw std::runtime_error("Directory tree is too deep");
       AdbClient::syncQuit(syncFd);
     }
     ::close(syncFd);
@@ -1679,7 +1738,7 @@ void AdbFileTransferSession::handleTight13FileList(uint8_t flags,
 {
   std::string devicePath;
   std::string err;
-  if (!normalizePath(rawPath, rootDir_, true, &devicePath, nullptr, &err)) {
+  if (!resolvePath(rawPath, true, &devicePath, nullptr, &err)) {
     Reply r;
     r.kind = Reply::Kind::Tight13FileList;
     r.flags = flags | rfb::tight13FlagError;
@@ -1696,8 +1755,7 @@ void AdbFileTransferSession::handleTight13FileList(uint8_t flags,
     AdbStat st;
     if (!AdbClient::syncStat(syncFd, devicePath, features_.statV2, true, &st) ||
         !S_ISDIR(st.mode)) {
-      AdbClient::syncQuit(syncFd);
-      ::close(syncFd);
+      closeManagedFd(&syncFd);
       Reply r;
       r.kind = Reply::Kind::Tight13FileList;
       r.flags = flags | rfb::tight13FlagError;
@@ -1706,10 +1764,10 @@ void AdbFileTransferSession::handleTight13FileList(uint8_t flags,
     }
 
     std::vector<AdbDirEntry> raw =
-      AdbClient::syncList(syncFd, devicePath, features_.lsV2, features_.statV2);
+      AdbClient::syncList(syncFd, devicePath, features_.lsV2, features_.statV2,
+                          rootDir_.empty());
     AdbClient::syncQuit(syncFd);
-    ::close(syncFd);
-    syncFd = -1;
+    closeManagedFd(&syncFd);
 
     Reply r;
     r.kind = Reply::Kind::Tight13FileList;
@@ -1748,7 +1806,7 @@ void AdbFileTransferSession::handleTight13DownloadStart(
   if (!openDownloadInternal(rawPath, position, false, &err)) {
     Reply r;
     r.kind = Reply::Kind::Tight13DownloadFailed;
-    r.u64Val = tight13DownloadSerial_;
+    r.u64Val = serial;
     r.text = err;
     postReply(std::move(r));
     return;
@@ -1772,7 +1830,7 @@ void AdbFileTransferSession::handleTight13DownloadNextChunk()
     closeDownload();
     Reply r;
     r.kind = Reply::Kind::Tight13DownloadFailed;
-    r.u64Val = serial;
+    r.u64Val = tight13DownloadSerial_;
     r.text = err;
     postReply(std::move(r));
     return;
@@ -1848,7 +1906,7 @@ void AdbFileTransferSession::handleTight13CreateDir(const std::string& rawPath)
   std::string devicePath;
   std::string virtualPath;
   std::string err;
-  if (!normalizePath(rawPath, rootDir_, false, &devicePath, &virtualPath, &err) ||
+  if (!resolvePath(rawPath, false, &devicePath, &virtualPath, &err) ||
       virtualPath == "/") {
     vlog.error("Tight 1.3 mkdir rejected '%s': %s", rawPath.c_str(),
                err.empty() ? "invalid path" : err.c_str());
@@ -1856,10 +1914,7 @@ void AdbFileTransferSession::handleTight13CreateDir(const std::string& rawPath)
   }
 
   try {
-    ensureFeatures();
-    AdbShellResult res = adb_.runShell(
-      serial_, "mkdir -- " + AdbClient::quoteShellArg(devicePath),
-      features_.shellV2, kAdbTransferTimeoutMs);
+    AdbShellResult res = runShell("mkdir -- " + AdbClient::quoteShellArg(devicePath));
     if (res.exitCode != 0) {
       vlog.error("Tight 1.3 mkdir '%s' failed: %s", devicePath.c_str(),
                  extractShellError(res, "mkdir failed").c_str());

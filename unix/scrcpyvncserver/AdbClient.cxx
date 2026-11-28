@@ -49,6 +49,8 @@ namespace {
 static const int kAdbTimeoutMs = 5000;
 static const size_t kChunkMax = 65536;
 static const size_t kShellV2ChunkMax = 32768;
+static const size_t kMaxShellOutput = 16u * 1024u * 1024u;
+static const size_t kMaxDirectoryData = 8u * 1024u * 1024u;
 static const size_t kSyncPathMax = 1024;
 static const uint8_t kShellV2IdStdin = 0;
 static const uint8_t kShellV2IdStdout = 1;
@@ -136,9 +138,16 @@ int64_t getLeS64(const uint8_t* src)
 
 class FdGuard {
 public:
-  explicit FdGuard(int fd) : fd_(fd) {}
+  explicit FdGuard(int fd, const std::function<void(int)>* activeFd = nullptr)
+    : fd_(fd), activeFd_(activeFd)
+  {
+    if (activeFd_ && *activeFd_)
+      (*activeFd_)(fd_);
+  }
   ~FdGuard()
   {
+    if (activeFd_ && *activeFd_)
+      (*activeFd_)(-1);
     if (fd_ >= 0)
       ::close(fd_);
   }
@@ -153,12 +162,14 @@ private:
   FdGuard(const FdGuard&) = delete;
   FdGuard& operator=(const FdGuard&) = delete;
   int fd_;
+  const std::function<void(int)>* activeFd_;
 };
 
 } // namespace
 
-AdbClient::AdbClient(const std::string& host, int port)
-  : host_(host), port_(port)
+AdbClient::AdbClient(const std::string& host, int port,
+                     std::function<void(int)> activeFd)
+  : host_(host), port_(port), activeFd_(std::move(activeFd))
 {
 }
 
@@ -385,7 +396,7 @@ AdbFeatures AdbClient::queryFeatures(const std::string& serial) const
 {
   AdbFeatures features;
   try {
-    FdGuard fd(connectDaemon());
+    FdGuard fd(connectDaemon(), &activeFd_);
     sendCommand(fd.get(), "host-serial:" + serial + ":features");
     std::string err;
     if (!readStatus(fd.get(), &err)) {
@@ -516,7 +527,7 @@ void AdbClient::pushFile(const std::string& serial,
 
 int AdbClient::openSync(const std::string& serial, int timeoutMs) const
 {
-  FdGuard fd(connectDaemon(timeoutMs));
+  FdGuard fd(connectDaemon(timeoutMs), &activeFd_);
   selectTransport(fd.get(), serial);
 
   sendCommand(fd.get(), "sync:");
@@ -595,7 +606,8 @@ bool AdbClient::syncStat(int syncFd, const std::string& remotePath,
 std::vector<AdbDirEntry> AdbClient::syncList(int syncFd,
                                              const std::string& dirPath,
                                              bool useLsV2,
-                                             bool useStatV2)
+                                             bool useStatV2,
+                                             bool followSymlinks)
 {
   if (dirPath.empty() || dirPath.size() > kSyncPathMax)
     throw std::invalid_argument("Invalid ADB sync directory path length");
@@ -609,6 +621,13 @@ std::vector<AdbDirEntry> AdbClient::syncList(int syncFd,
            dirPath.size());
 
   std::vector<AdbDirEntry> entries;
+  size_t directoryBytes = 0;
+  auto addEntry = [&](AdbDirEntry entry) {
+    directoryBytes += sizeof(entry) + entry.name.size();
+    if (directoryBytes > kMaxDirectoryData)
+      throw std::runtime_error("ADB directory listing is too large");
+    entries.push_back(std::move(entry));
+  };
   while (true) {
     uint8_t id[4];
     readAll(syncFd, id, sizeof(id));
@@ -645,14 +664,16 @@ std::vector<AdbDirEntry> AdbClient::syncList(int syncFd,
       std::string name(nameLen, '\0');
       if (nameLen > 0)
         readAll(syncFd, reinterpret_cast<uint8_t*>(&name[0]), nameLen);
-      if (name == "." || name == "..")
+      if (name.empty() || name == "." || name == ".." ||
+          name.find('/') != std::string::npos ||
+          name.find('\0') != std::string::npos)
         continue;
       AdbDirEntry e;
       e.name = std::move(name);
       e.mode = (err == 0) ? mode : 0;
       e.size = (err == 0) ? size : 0;
       e.mtime = (err == 0) ? mtime : 0;
-      entries.push_back(std::move(e));
+      addEntry(std::move(e));
       continue;
     }
 
@@ -668,19 +689,24 @@ std::vector<AdbDirEntry> AdbClient::syncList(int syncFd,
       std::string name(nameLen, '\0');
       if (nameLen > 0)
         readAll(syncFd, reinterpret_cast<uint8_t*>(&name[0]), nameLen);
-      if (name == "." || name == "..")
+      if (name.empty() || name == "." || name == ".." ||
+          name.find('/') != std::string::npos ||
+          name.find('\0') != std::string::npos)
         continue;
       AdbDirEntry e;
       e.name = std::move(name);
       e.mode = mode;
       e.size = size;
       e.mtime = static_cast<int64_t>(mtime);
-      entries.push_back(std::move(e));
+      addEntry(std::move(e));
       continue;
     }
 
     throw std::runtime_error("Unexpected ADB sync directory entry");
   }
+
+  if (!followSymlinks)
+    return entries;
 
   // Resolve symlinks (e.g. /sdcard -> /storage/self/primary) on the same sync fd.
   std::string base = (dirPath == "/") ? "/" : (dirPath + "/");
@@ -896,7 +922,7 @@ int AdbClient::openShellV2(const std::string& serial,
                            const std::string& command,
                            int timeoutMs) const
 {
-  FdGuard fd(connectDaemon(timeoutMs));
+  FdGuard fd(connectDaemon(timeoutMs), &activeFd_);
   selectTransport(fd.get(), serial);
 
   sendCommand(fd.get(), "shell,v2:" + command);
@@ -977,11 +1003,14 @@ AdbShellResult AdbClient::runShell(const std::string& serial,
 {
   AdbShellResult res;
   if (useShellV2) {
-    FdGuard fd(openShellV2(serial, command, timeoutMs));
+    FdGuard fd(openShellV2(serial, command, timeoutMs), &activeFd_);
     shellV2CloseStdin(fd.get());
     uint8_t id = 0;
     std::vector<uint8_t> payload;
     while (shellV2ReadPacket(fd.get(), &id, &payload)) {
+      if (payload.size() > kMaxShellOutput - res.stdoutData.size() -
+                           res.stderrData.size())
+        throw std::runtime_error("ADB shell output limit exceeded");
       if (id == kShellV2IdStdout) {
         res.stdoutData.append(reinterpret_cast<const char*>(payload.data()),
                               payload.size());
@@ -1000,7 +1029,7 @@ AdbShellResult AdbClient::runShell(const std::string& serial,
   static const char kSentinel[] = "__SCRCPY_ADB_RC__";
   std::string wrapped =
     command + "; printf '\\n" + kSentinel + "%d\\n' $?";
-  FdGuard fd(connectDaemon(timeoutMs));
+  FdGuard fd(connectDaemon(timeoutMs), &activeFd_);
   selectTransport(fd.get(), serial);
   sendCommand(fd.get(), "shell:" + wrapped);
   std::string err;
@@ -1014,6 +1043,8 @@ AdbShellResult AdbClient::runShell(const std::string& serial,
   while (true) {
     ssize_t n = ::recv(fd.get(), buf, sizeof(buf), 0);
     if (n > 0) {
+      if (static_cast<size_t>(n) > kMaxShellOutput - output.size())
+        throw std::runtime_error("ADB shell output limit exceeded");
       output.append(buf, static_cast<size_t>(n));
     } else if (n < 0 && errno == EINTR) {
       continue;
