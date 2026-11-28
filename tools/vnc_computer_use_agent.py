@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Gemini Computer Use desktop agent over TigerVNC's -AgentSocket IPC bridge.
+"""Gemini Computer Use agent over TigerVNC's -AgentSocket IPC bridge.
 
 Thin CLI entrypoint and backwards-compatible re-export facade for the modular
 ``vnc_agent`` package.

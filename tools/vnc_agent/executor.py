@@ -3,6 +3,7 @@
 import codecs
 import io
 import json
+import math
 import os
 import select
 import struct
@@ -651,13 +652,15 @@ class VncDesktopExecutor:
                 raise AgentPausedError(resp.get("message", "Agent input paused by operator"))
             raise RuntimeError(f"TEXT_TYPE failed: {resp}")
 
-    def _click_px(self, x: int, y: int, btn_bit: int = 1, count: int = 1) -> None:
+    def _click_px(self, x: int, y: int, btn_bit: int = 1, count: int = 1, hold_seconds: float = 0.05) -> None:
         self._pointer(x, y, 0)
         time.sleep(0.04)
         for idx in range(count):
             self._pointer(x, y, btn_bit)
-            time.sleep(0.05)
-            self._pointer(x, y, 0)
+            try:
+                time.sleep(hold_seconds)
+            finally:
+                self._pointer(x, y, 0)
             if idx + 1 < count:
                 time.sleep(0.08)
         self.button_mask = 0
@@ -990,6 +993,16 @@ class VncDesktopExecutor:
                 time.sleep(0.25)
             return {"status": "ok", "pixel_x": px, "pixel_y": py}
 
+        if fname == "long_press":
+            seconds = float(args.get("seconds", 2))
+            if not math.isfinite(seconds):
+                raise ValueError("long_press requires a finite duration")
+            seconds = min(max(seconds, 0.1), 30.0)
+            px = denormalize_x(args["x"], self.width)
+            py = denormalize_y(args["y"], self.height)
+            self._click_px(px, py, hold_seconds=seconds)
+            return {"status": "ok", "pixel_x": px, "pixel_y": py, "held_seconds": seconds}
+
         if fname == "drag_and_drop":
             sx = denormalize_x(args["start_x"], self.width)
             sy = denormalize_y(args["start_y"], self.height)
@@ -1037,6 +1050,11 @@ class VncDesktopExecutor:
             press_enter = bool(args.get("press_enter", False))
             self._type_text_impl(text, press_enter)
             return {"status": "ok", "chars_typed": len(text), "press_enter": press_enter}
+
+        if fname in ("go_back", "go_forward"):
+            keysym = KEY_MAP["browser_back" if fname == "go_back" else "browser_forward"]
+            self._hotkey_syms([keysym])
+            return {"status": "ok", "keysym": keysym}
 
         if fname == "press_key":
             raw_key = str(args["key"])
@@ -1320,4 +1338,4 @@ class VncDesktopExecutor:
                 "note": "Run with --collaborate for interactive human takeover.",
             }
 
-        return {"error": f"Unsupported desktop action: {fname}"}
+        return {"error": f"Unsupported Computer Use action: {fname}"}
