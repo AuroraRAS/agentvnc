@@ -80,6 +80,11 @@ public:
   void handleClipboardAnnounce(bool available);
   void handleClipboardData(const char* data);
 
+  // GII extended input
+  void enableGII();
+  void disableGII();
+  void handleGIIDeviceCreated(uint32_t deviceOrigin);
+
   // Fl_Window callback methods
   void show() override;
   void draw() override;

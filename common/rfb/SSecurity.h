@@ -56,6 +56,7 @@ namespace rfb {
     virtual ~SSecurity() {}
     virtual bool processMsg() = 0;
     virtual int getType() const = 0;
+    virtual int getEffectiveType() const { return getType(); }
     virtual const char* getUserName() const = 0;
 
     virtual AccessRights getAccessRights() const { return AccessDefault; }

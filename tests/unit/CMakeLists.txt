@@ -77,6 +77,10 @@ if(NOT WIN32)
   gtest_discover_tests(ftpbridge)
 endif()
 
+add_executable(gii gii.cxx ../../vncviewer/GIIDeviceManager.cxx)
+target_link_libraries(gii PRIVATE rfbclient rfbserver rfb network rdr core GTest::gtest_main)
+gtest_discover_tests(gii)
+
 if(ENABLE_H264)
   add_executable(h264decoder h264decoder.cxx)
   target_link_libraries(h264decoder PRIVATE rfbclient GTest::gtest_main)
@@ -85,10 +89,7 @@ endif()
 
 if(UNIX AND NOT APPLE)
   add_executable(scrcpyvncserver_test scrcpyvncserver.cxx)
-  target_link_libraries(scrcpyvncserver_test PRIVATE scrcpyvncserver_core GTest::gtest_main)
-  if(ENABLE_H264)
-    target_link_libraries(scrcpyvncserver_test PRIVATE rfbclient)
-  endif()
+  target_link_libraries(scrcpyvncserver_test PRIVATE scrcpyvncserver_core rfbclient ${ZLIB_LIBRARIES} GTest::gtest_main)
   gtest_discover_tests(scrcpyvncserver_test)
 endif()
 

@@ -44,6 +44,7 @@
 #include <network/Socket.h>
 #include <rdr/FdOutStream.h>
 #include <rfb/ServerCore.h>
+#include <rfb/giiTypes.h>
 
 static core::LogWriter vlog("ScrcpyServer");
 static core::LogWriter connectionsLog("Connections");
@@ -79,6 +80,8 @@ ScrcpyServer::ScrcpyServer()
     pointerClientTime_(0),
     clipboardClient_(nullptr),
     shellFd_(-1),
+    adbHost_("127.0.0.1"),
+    adbPort_(5037),
     clipboardSeq_(1),
     lastIdrHasInlineSpsPps_(false),
     lastIdrValid_(false),
@@ -242,13 +245,16 @@ void ScrcpyServer::startScrcpy()
   if (static_cast<int>(scid) >= 0)
     socketName = core::format("scrcpy_%08x", static_cast<int>(scid));
 
-  AdbClient adb(static_cast<const char*>(adbHost), static_cast<int>(adbPort));
-  std::string devSerial = adb.resolveSerial(static_cast<const char*>(serial));
+  AdbClient adb(static_cast<const char*>(::adbHost), static_cast<int>(::adbPort));
+  std::string devSerial = adb.resolveSerial(static_cast<const char*>(::serial));
+  adbHost_ = static_cast<const char*>(::adbHost);
+  adbPort_ = static_cast<int>(::adbPort);
+  deviceSerial_ = devSerial;
 
   vlog.info("Using Android device '%s' via %s:%d (localabstract:%s)",
             devSerial.c_str(),
-            static_cast<const char*>(adbHost),
-            static_cast<int>(adbPort),
+            static_cast<const char*>(::adbHost),
+            static_cast<int>(::adbPort),
             socketName.c_str());
 
   if (static_cast<bool>(attachMode)) {
@@ -392,6 +398,14 @@ void ScrcpyServer::attachStreamsForTest(int videoFd, int controlFd,
   desktopName_ = cfgName.empty() ? deviceName : cfgName;
 }
 
+void ScrcpyServer::setAdbTargetForTest(const std::string& host, int port,
+                                       const std::string& targetSerial)
+{
+  adbHost_ = host;
+  adbPort_ = port;
+  deviceSerial_ = targetSerial;
+}
+
 bool ScrcpyServer::addSocket(network::Socket* sock,
                              rfb::AccessRights accessRights)
 {
@@ -498,6 +512,12 @@ int ScrcpyServer::authClientCount() const
 void ScrcpyServer::clearBlacklist(const char* address)
 {
   blacklist_.clearBlackmark(address);
+}
+
+void ScrcpyServer::noteClientActivity()
+{
+  if (rfb::Server::maxIdleTime)
+    idleTimer_.start(core::secsToMillis(rfb::Server::maxIdleTime));
 }
 
 void ScrcpyServer::clientReady(ScrcpyClient* client, bool shared)
@@ -613,6 +633,46 @@ void ScrcpyServer::clientClipboardData(ScrcpyClient* client, const char* data)
   control_.sendSetClipboard(clipboardSeq_++, data, false);
 }
 
+bool ScrcpyServer::supportsGII() const
+{
+  return static_cast<bool>(::gii) && (control_.fd() >= 0);
+}
+
+uint32_t ScrcpyServer::clientGIIDeviceCreate(ScrcpyClient* /*client*/,
+                                             const rfb::GIIDevice& device)
+{
+  if (!supportsGII())
+    return 0;
+
+  return control_.createGIIDevice(device);
+}
+
+void ScrcpyServer::clientGIIDeviceDestroy(ScrcpyClient* /*client*/,
+                                          uint32_t deviceOrigin)
+{
+  control_.destroyGIIDevice(deviceOrigin, width(), height());
+}
+
+void ScrcpyServer::clientGIIEvent(ScrcpyClient* /*client*/,
+                                  const rfb::GIIEvent& event)
+{
+  if (!supportsGII())
+    return;
+
+  if (rfb::giiIsKeyEvent(event.type)) {
+    if (!rfb::Server::acceptKeyEvents)
+      return;
+  } else if (rfb::giiIsPointerEvent(event.type)) {
+    if (!rfb::Server::acceptPointerEvents)
+      return;
+  } else {
+    return;
+  }
+
+  noteClientActivity();
+  control_.handleGIIEvent(event, width(), height());
+}
+
 void ScrcpyServer::onResize(int newWidth, int newHeight)
 {
   vlog.info("Android display resized to %dx%d", newWidth, newHeight);
@@ -700,6 +760,7 @@ bool ScrcpyServer::step(const std::list<network::SocketListener*>& listeners,
   std::vector<struct pollfd> pfds;
   std::vector<network::SocketListener*> listenerOrder;
   std::vector<ScrcpyClient*> clientOrder;
+  std::vector<std::pair<ScrcpyClient*, size_t>> ftWakeups;
 
   for (network::SocketListener* l : listeners) {
     struct pollfd pfd;
@@ -717,6 +778,16 @@ bool ScrcpyServer::step(const std::list<network::SocketListener*>& listeners,
     pfd.revents = 0;
     pfds.push_back(pfd);
     clientOrder.push_back(c);
+
+    int wfd = c->fileTransferWakeupFd();
+    if (wfd >= 0) {
+      struct pollfd wpfd;
+      wpfd.fd = wfd;
+      wpfd.events = POLLIN;
+      wpfd.revents = 0;
+      ftWakeups.emplace_back(c, pfds.size());
+      pfds.push_back(wpfd);
+    }
   }
 
   size_t videoIdx = static_cast<size_t>(-1);
@@ -796,6 +867,15 @@ bool ScrcpyServer::step(const std::list<network::SocketListener*>& listeners,
       c->processSocketReadEvent();
     if (revents & POLLOUT)
       c->processSocketWriteEvent();
+  }
+
+  // Handle asynchronous ADB file transfer replies
+  for (const auto& entry : ftWakeups) {
+    ScrcpyClient* c = entry.first;
+    if ((pfds[entry.second].revents & POLLIN) &&
+        c->state() == rfb::SConnection::RFBSTATE_NORMAL) {
+      c->processFileTransferEvents();
+    }
   }
 
   // Handle scrcpy control channel

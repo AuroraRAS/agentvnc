@@ -22,8 +22,11 @@
 #endif
 
 #include <stdio.h>
+#include <string.h>
 
 #include <vector>
+
+#include <zlib.h>
 
 #include <core/Configuration.h>
 #include <core/LogWriter.h>
@@ -35,7 +38,10 @@
 
 #include <rfb/msgTypes.h>
 #include <rfb/qemuTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/clipboardTypes.h>
+#include <rfb/fileTransferTypes.h>
+#include <rfb/TightCapability.h>
 #include <rfb/Exception.h>
 #include <rfb/PixelFormat.h>
 #include <rfb/ScreenSet.h>
@@ -51,13 +57,194 @@ static core::IntParameter maxCutText(
   _("Maximum permitted length of an incoming clipboard update"),
   256*1024, 0, INT_MAX);
 
+static const uint32_t maxFileTransferPayload = 16*1024*1024;
+static const uint32_t maxTight2StringLen = 65536;
+
+struct rfb::Tight2InflateState {
+  z_stream zs;
+  bool initialized;
+  int windowBits;
+
+  Tight2InflateState() : initialized(false), windowBits(15)
+  {
+    memset(&zs, 0, sizeof(zs));
+  }
+
+  ~Tight2InflateState()
+  {
+    if (initialized)
+      inflateEnd(&zs);
+  }
+};
+
+static uint64_t readU64(rdr::InStream* is)
+{
+  uint64_t hi = is->readU32();
+  uint64_t lo = is->readU32();
+  return (hi << 32) | lo;
+}
+
+static bool readTight2String(rdr::InStream* is, std::string* out)
+{
+  if (!is->hasDataOrRestore(4))
+    return false;
+  uint32_t len = is->readU32();
+  if (len > maxTight2StringLen) {
+    is->clearRestorePoint();
+    throw protocol_error(_("TightVNC string is too long"));
+  }
+  if (!is->hasDataOrRestore(len))
+    return false;
+  out->assign(len, '\0');
+  if (len > 0)
+    is->readBytes(reinterpret_cast<uint8_t*>(&(*out)[0]), len);
+  return true;
+}
+
+static bool runTight2InflateBlock(z_stream* zs,
+                                  const uint8_t* in, size_t inLen,
+                                  uint8_t* outBuf, size_t outLen,
+                                  bool* hitStreamEnd)
+{
+  *hitStreamEnd = false;
+  uint8_t dummy = 0;
+  zs->next_in = (inLen > 0 && in != nullptr)
+    ? const_cast<Bytef*>(in) : &dummy;
+  zs->avail_in = static_cast<uInt>(inLen);
+  zs->next_out = (outLen > 0 && outBuf != nullptr) ? outBuf : &dummy;
+  zs->avail_out = static_cast<uInt>(outLen);
+
+  int rc = Z_OK;
+  int guard = 0;
+  while (zs->avail_out > 0 && (rc == Z_OK || rc == Z_BUF_ERROR) &&
+         guard++ < 64) {
+    uInt prevIn = zs->avail_in;
+    uInt prevOut = zs->avail_out;
+    rc = inflate(zs, Z_SYNC_FLUSH);
+    if (rc == Z_STREAM_END)
+      break;
+    if (rc == Z_BUF_ERROR && zs->avail_in == prevIn && zs->avail_out == prevOut)
+      break;
+  }
+
+  if (zs->avail_out != 0)
+    return false;
+
+  // Drain any trailing Z_SYNC_FLUSH marker or Z_FINISH trailer
+  guard = 0;
+  while (rc != Z_STREAM_END && zs->avail_in > 0 && guard++ < 64) {
+    uint8_t extra[16];
+    zs->next_out = extra;
+    zs->avail_out = sizeof(extra);
+    uInt prevIn = zs->avail_in;
+    rc = inflate(zs, Z_SYNC_FLUSH);
+    if (zs->avail_out != sizeof(extra))
+      return false;
+    if (rc == Z_STREAM_END)
+      break;
+    if (rc == Z_BUF_ERROR && zs->avail_in == prevIn)
+      break;
+    if (rc != Z_OK && rc != Z_BUF_ERROR)
+      return false;
+  }
+
+  *hitStreamEnd = (rc == Z_STREAM_END);
+  return zs->avail_in == 0 &&
+         (rc == Z_OK || rc == Z_BUF_ERROR || rc == Z_STREAM_END);
+}
+
+static std::vector<uint8_t> inflateTightBlock(const uint8_t* compressed,
+                                              size_t compressedSize,
+                                              size_t uncompressedSize)
+{
+  if (uncompressedSize == 0)
+    return std::vector<uint8_t>();
+
+  std::vector<uint8_t> out(uncompressedSize);
+  const int windowModes[2] = { 15, -15 };
+
+  for (int i = 0; i < 2; i++) {
+    z_stream zs;
+    memset(&zs, 0, sizeof(zs));
+    if (inflateInit2(&zs, windowModes[i]) != Z_OK)
+      continue;
+
+    zs.next_in = const_cast<Bytef*>(compressed);
+    zs.avail_in = static_cast<uInt>(compressedSize);
+    zs.next_out = out.data();
+    zs.avail_out = static_cast<uInt>(uncompressedSize);
+
+    int rc = Z_OK;
+    int guard = 0;
+    while ((rc == Z_OK || rc == Z_BUF_ERROR) &&
+           zs.total_out < uncompressedSize && guard++ < 64) {
+      rc = inflate(&zs, Z_SYNC_FLUSH);
+      if (rc == Z_STREAM_END)
+        break;
+    }
+
+    bool ok = (zs.total_out == uncompressedSize);
+    inflateEnd(&zs);
+    if (ok)
+      return out;
+  }
+
+  throw protocol_error(_("Failed to decompress file transfer data"));
+}
+
 SMsgReader::SMsgReader(SMsgHandler* handler_, rdr::InStream* is_)
-  : handler(handler_), is(is_), state(MSGSTATE_IDLE)
+  : handler(handler_), is(is_), state(MSGSTATE_IDLE),
+    currentMsgType(0), tight2Inflate(nullptr)
 {
 }
 
 SMsgReader::~SMsgReader()
 {
+  delete tight2Inflate;
+}
+
+std::vector<uint8_t> SMsgReader::inflateTight2Block(const uint8_t* compressed,
+                                                      size_t compressedSize,
+                                                      size_t uncompressedSize)
+{
+  if (compressedSize == 0 && uncompressedSize == 0)
+    return std::vector<uint8_t>();
+
+  if (tight2Inflate == nullptr)
+    tight2Inflate = new Tight2InflateState();
+
+  std::vector<uint8_t> out(uncompressedSize);
+  uint8_t* outPtr = out.empty() ? nullptr : out.data();
+
+  if (!tight2Inflate->initialized) {
+    const int windowModes[2] = { 15, -15 };
+    for (int i = 0; i < 2; i++) {
+      memset(&tight2Inflate->zs, 0, sizeof(tight2Inflate->zs));
+      if (inflateInit2(&tight2Inflate->zs, windowModes[i]) != Z_OK)
+        continue;
+      bool hitStreamEnd = false;
+      if (runTight2InflateBlock(&tight2Inflate->zs, compressed, compressedSize,
+                                outPtr, uncompressedSize, &hitStreamEnd)) {
+        tight2Inflate->initialized = true;
+        tight2Inflate->windowBits = windowModes[i];
+        if (hitStreamEnd)
+          inflateReset(&tight2Inflate->zs);
+        return out;
+      }
+      inflateEnd(&tight2Inflate->zs);
+    }
+    throw protocol_error(_("Failed to decompress file transfer data"));
+  }
+
+  bool hitStreamEnd = false;
+  if (runTight2InflateBlock(&tight2Inflate->zs, compressed, compressedSize,
+                            outPtr, uncompressedSize, &hitStreamEnd)) {
+    if (hitStreamEnd)
+      inflateReset(&tight2Inflate->zs);
+    return out;
+  }
+
+  throw protocol_error(_("Failed to decompress file transfer data"));
 }
 
 bool SMsgReader::readClientInit()
@@ -109,8 +296,67 @@ bool SMsgReader::readMsg()
   case msgTypeClientCutText:
     ret = readClientCutText();
     break;
+  case msgTypeTightFileListRequest:
+    if (!handler->client.tightEnabled) {
+      vlog.error(_("Unknown message type %d"), currentMsgType);
+      throw protocol_error(_("Unknown message type"));
+    }
+    ret = readTight13FileListRequest();
+    break;
+  case msgTypeTightFileDownloadRequest:
+    if (!handler->client.tightEnabled) {
+      vlog.error(_("Unknown message type %d"), currentMsgType);
+      throw protocol_error(_("Unknown message type"));
+    }
+    ret = readTight13FileDownloadRequest();
+    break;
+  case msgTypeTightFileUploadRequest:
+    if (!handler->client.tightEnabled) {
+      vlog.error(_("Unknown message type %d"), currentMsgType);
+      throw protocol_error(_("Unknown message type"));
+    }
+    ret = readTight13FileUploadRequest();
+    break;
+  case msgTypeTightFileUploadData:
+    if (!handler->client.tightEnabled) {
+      vlog.error(_("Unknown message type %d"), currentMsgType);
+      throw protocol_error(_("Unknown message type"));
+    }
+    ret = readTight13FileUploadData();
+    break;
+  case msgTypeTightFileDownloadCancel:
+    if (!handler->client.tightEnabled) {
+      vlog.error(_("Unknown message type %d"), currentMsgType);
+      throw protocol_error(_("Unknown message type"));
+    }
+    ret = readTight13FileDownloadCancel();
+    break;
+  case msgTypeTightFileUploadFailed:
+    if (!handler->client.tightEnabled) {
+      vlog.error(_("Unknown message type %d"), currentMsgType);
+      throw protocol_error(_("Unknown message type"));
+    }
+    ret = readTight13FileUploadFailed();
+    break;
+  case msgTypeTightFileCreateDirRequest:
+    if (!handler->client.tightEnabled) {
+      vlog.error(_("Unknown message type %d"), currentMsgType);
+      throw protocol_error(_("Unknown message type"));
+    }
+    ret = readTight13FileCreateDirRequest();
+    break;
+  case msgTypeTightExt:
+    if (!handler->client.tightEnabled) {
+      vlog.error(_("Unknown message type %d"), currentMsgType);
+      throw protocol_error(_("Unknown message type"));
+    }
+    ret = readTight2Message();
+    break;
   case msgTypeQEMUClientMessage:
     ret = readQEMUMessage();
+    break;
+  case msgTypeGIIClientMessage:
+    ret = readGIIClientMessage();
     break;
   default:
     vlog.error(_("Unknown message type %d"), currentMsgType);
@@ -512,5 +758,554 @@ bool SMsgReader::readQEMUKeyEvent()
     return true;
   }
   handler->keyEvent(keysym, keycode, down);
+  return true;
+}
+
+bool SMsgReader::readTight13FileListRequest()
+{
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+  uint8_t flags = is->readU8();
+  uint16_t dirLen = is->readU16();
+  if (!is->hasDataOrRestore(dirLen))
+    return false;
+
+  std::string dir(dirLen, '\0');
+  if (dirLen > 0)
+    is->readBytes(reinterpret_cast<uint8_t*>(&dir[0]), dirLen);
+  is->clearRestorePoint();
+
+  handler->tight13FileListRequest(flags, dir);
+  return true;
+}
+
+bool SMsgReader::readTight13FileDownloadRequest()
+{
+  if (!is->hasData(1 + 2 + 4))
+    return false;
+
+  is->setRestorePoint();
+  uint8_t compressLevel = is->readU8();
+  uint16_t pathLen = is->readU16();
+  uint32_t position = is->readU32();
+  if (!is->hasDataOrRestore(pathLen))
+    return false;
+
+  std::string path(pathLen, '\0');
+  if (pathLen > 0)
+    is->readBytes(reinterpret_cast<uint8_t*>(&path[0]), pathLen);
+  is->clearRestorePoint();
+
+  handler->tight13FileDownloadRequest(compressLevel, position, path);
+  return true;
+}
+
+bool SMsgReader::readTight13FileUploadRequest()
+{
+  if (!is->hasData(1 + 2 + 4))
+    return false;
+
+  is->setRestorePoint();
+  uint8_t compressLevel = is->readU8();
+  uint16_t pathLen = is->readU16();
+  uint32_t position = is->readU32();
+  if (!is->hasDataOrRestore(pathLen))
+    return false;
+
+  std::string path(pathLen, '\0');
+  if (pathLen > 0)
+    is->readBytes(reinterpret_cast<uint8_t*>(&path[0]), pathLen);
+  is->clearRestorePoint();
+
+  handler->tight13FileUploadRequest(compressLevel, position, path);
+  return true;
+}
+
+bool SMsgReader::readTight13FileUploadData()
+{
+  if (!is->hasData(1 + 2 + 2))
+    return false;
+
+  is->setRestorePoint();
+  uint8_t compressLevel = is->readU8();
+  uint16_t realSize = is->readU16();
+  uint16_t compSize = is->readU16();
+
+  if (realSize == 0 && compSize == 0) {
+    if (!is->hasDataOrRestore(4))
+      return false;
+    uint32_t modTime = is->readU32();
+    is->clearRestorePoint();
+    handler->tight13FileUploadEnd(modTime);
+    return true;
+  }
+
+  if (!is->hasDataOrRestore(compSize))
+    return false;
+
+  std::vector<uint8_t> rawData(compSize);
+  if (compSize > 0)
+    is->readBytes(rawData.data(), compSize);
+  is->clearRestorePoint();
+
+  if (compressLevel != 0 && compSize != realSize) {
+    std::vector<uint8_t> out = inflateTightBlock(rawData.data(), rawData.size(),
+                                                 realSize);
+    handler->tight13FileUploadData(out.empty() ? nullptr : out.data(),
+                                   out.size());
+  } else {
+    handler->tight13FileUploadData(rawData.empty() ? nullptr : rawData.data(),
+                                   rawData.size());
+  }
+  return true;
+}
+
+bool SMsgReader::readTight13FileDownloadCancel()
+{
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+  is->skip(1);
+  uint16_t len = is->readU16();
+  if (!is->hasDataOrRestore(len))
+    return false;
+
+  std::string reason(len, '\0');
+  if (len > 0)
+    is->readBytes(reinterpret_cast<uint8_t*>(&reason[0]), len);
+  is->clearRestorePoint();
+
+  handler->tight13FileDownloadCancel(reason);
+  return true;
+}
+
+bool SMsgReader::readTight13FileUploadFailed()
+{
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+  is->skip(1);
+  uint16_t len = is->readU16();
+  if (!is->hasDataOrRestore(len))
+    return false;
+
+  std::string reason(len, '\0');
+  if (len > 0)
+    is->readBytes(reinterpret_cast<uint8_t*>(&reason[0]), len);
+  is->clearRestorePoint();
+
+  handler->tight13FileUploadFailed(reason);
+  return true;
+}
+
+bool SMsgReader::readTight13FileCreateDirRequest()
+{
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+  is->skip(1);
+  uint16_t len = is->readU16();
+  if (!is->hasDataOrRestore(len))
+    return false;
+
+  std::string dir(len, '\0');
+  if (len > 0)
+    is->readBytes(reinterpret_cast<uint8_t*>(&dir[0]), len);
+  is->clearRestorePoint();
+
+  handler->tight13FileCreateDirRequest(dir);
+  return true;
+}
+
+bool SMsgReader::readTight2Message()
+{
+  if (!is->hasData(3))
+    return false;
+
+  is->setRestorePoint();
+
+  uint8_t b1 = is->readU8();
+  uint8_t b2 = is->readU8();
+  uint8_t b3 = is->readU8();
+  uint32_t msgId = (static_cast<uint32_t>(msgTypeTightExt) << 24) |
+                   (static_cast<uint32_t>(b1) << 16) |
+                   (static_cast<uint32_t>(b2) << 8) |
+                   static_cast<uint32_t>(b3);
+
+  switch (msgId) {
+  case tight2CompressionSupportReq:
+    is->clearRestorePoint();
+    handler->tight2CompressionSupportRequest();
+    return true;
+
+  case tight2FileListReq: {
+    if (!is->hasDataOrRestore(1))
+      return false;
+    uint8_t compressLevel = is->readU8();
+    std::string path;
+    if (!readTight2String(is, &path))
+      return false;
+    is->clearRestorePoint();
+    handler->tight2FileListRequest(compressLevel, path);
+    return true;
+  }
+
+  case tight2Md5Req: {
+    std::string path;
+    if (!readTight2String(is, &path))
+      return false;
+    if (!is->hasDataOrRestore(8 + 8))
+      return false;
+    uint64_t offset = readU64(is);
+    uint64_t dataLen = readU64(is);
+    is->clearRestorePoint();
+    handler->tight2Md5Request(path, offset, dataLen);
+    return true;
+  }
+
+  case tight2UploadStartReq: {
+    std::string path;
+    if (!readTight2String(is, &path))
+      return false;
+    if (!is->hasDataOrRestore(1 + 8))
+      return false;
+    uint8_t flags = is->readU8();
+    uint64_t offset = readU64(is);
+    is->clearRestorePoint();
+    handler->tight2UploadStartRequest(path, flags, offset);
+    return true;
+  }
+
+  case tight2UploadDataReq: {
+    if (!is->hasDataOrRestore(1 + 4 + 4))
+      return false;
+    uint8_t compressLevel = is->readU8();
+    uint32_t csize = is->readU32();
+    uint32_t usize = is->readU32();
+    if (csize > maxFileTransferPayload || usize > maxFileTransferPayload) {
+      is->clearRestorePoint();
+      throw protocol_error(_("TightVNC file transfer block is too large"));
+    }
+    if (compressLevel == 0 && csize != usize) {
+      is->clearRestorePoint();
+      throw protocol_error(_("Invalid uncompressed TightVNC upload size"));
+    }
+    if (!is->hasDataOrRestore(csize))
+      return false;
+    std::vector<uint8_t> raw(csize);
+    if (csize > 0)
+      is->readBytes(raw.data(), csize);
+    is->clearRestorePoint();
+
+    std::vector<uint8_t> block;
+    if (compressLevel != 0 && (csize > 0 || usize > 0))
+      block = inflateTight2Block(raw.data(), raw.size(), usize);
+    else
+      block.swap(raw);
+
+    handler->tight2UploadDataRequest(block.empty() ? nullptr : block.data(),
+                                     block.size());
+    return true;
+  }
+
+  case tight2UploadEndReq: {
+    if (!is->hasDataOrRestore(2 + 8))
+      return false;
+    uint16_t fileFlags = is->readU16();
+    uint64_t modTimeMs = readU64(is);
+    is->clearRestorePoint();
+    handler->tight2UploadEndRequest(fileFlags, modTimeMs);
+    return true;
+  }
+
+  case tight2DownloadStartReq: {
+    std::string path;
+    if (!readTight2String(is, &path))
+      return false;
+    if (!is->hasDataOrRestore(8))
+      return false;
+    uint64_t offset = readU64(is);
+    is->clearRestorePoint();
+    handler->tight2DownloadStartRequest(path, offset);
+    return true;
+  }
+
+  case tight2DownloadDataReq: {
+    if (!is->hasDataOrRestore(1 + 4))
+      return false;
+    uint8_t compressLevel = is->readU8();
+    uint32_t reqSize = is->readU32();
+    is->clearRestorePoint();
+    handler->tight2DownloadDataRequest(compressLevel, reqSize);
+    return true;
+  }
+
+  case tight2MkdirReq: {
+    std::string path;
+    if (!readTight2String(is, &path))
+      return false;
+    is->clearRestorePoint();
+    handler->tight2MkdirRequest(path);
+    return true;
+  }
+
+  case tight2RemoveReq: {
+    std::string path;
+    if (!readTight2String(is, &path))
+      return false;
+    is->clearRestorePoint();
+    handler->tight2RemoveRequest(path);
+    return true;
+  }
+
+  case tight2RenameReq: {
+    std::string oldPath;
+    std::string newPath;
+    if (!readTight2String(is, &oldPath))
+      return false;
+    if (!readTight2String(is, &newPath))
+      return false;
+    is->clearRestorePoint();
+    handler->tight2RenameRequest(oldPath, newPath);
+    return true;
+  }
+
+  case tight2DirSizeReq: {
+    std::string path;
+    if (!readTight2String(is, &path))
+      return false;
+    is->clearRestorePoint();
+    handler->tight2DirSizeRequest(path);
+    return true;
+  }
+
+  default:
+    is->clearRestorePoint();
+    throw protocol_error(
+      core::format(_("Unknown TightVNC extension message 0x%08x"), msgId));
+  }
+}
+
+static uint16_t readEU16(rdr::InStream* is, bool bigEndian)
+{
+  uint8_t b0 = is->readU8();
+  uint8_t b1 = is->readU8();
+  if (bigEndian)
+    return ((uint16_t)b0 << 8) | (uint16_t)b1;
+  else
+    return ((uint16_t)b1 << 8) | (uint16_t)b0;
+}
+
+static uint32_t readEU32(rdr::InStream* is, bool bigEndian)
+{
+  uint8_t b0 = is->readU8();
+  uint8_t b1 = is->readU8();
+  uint8_t b2 = is->readU8();
+  uint8_t b3 = is->readU8();
+  if (bigEndian)
+    return ((uint32_t)b0 << 24) | ((uint32_t)b1 << 16) |
+           ((uint32_t)b2 << 8) | (uint32_t)b3;
+  else
+    return ((uint32_t)b3 << 24) | ((uint32_t)b2 << 16) |
+           ((uint32_t)b1 << 8) | (uint32_t)b0;
+}
+
+static int32_t readES32(rdr::InStream* is, bool bigEndian)
+{
+  return (int32_t)readEU32(is, bigEndian);
+}
+
+static std::string readFixedString(rdr::InStream* is, size_t fieldLen)
+{
+  std::vector<char> buf(fieldLen);
+  is->readBytes((uint8_t*)buf.data(), fieldLen);
+  size_t len = 0;
+  while (len < fieldLen - 1 && buf[len] != '\0')
+    len++;
+  return std::string(buf.data(), len);
+}
+
+bool SMsgReader::readGIIClientMessage()
+{
+  uint8_t endianAndSubType;
+  bool bigEndian;
+  uint8_t subType;
+  uint16_t length;
+
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+
+  endianAndSubType = is->readU8();
+  bigEndian = (endianAndSubType & giiBigEndian) != 0;
+  subType = endianAndSubType & giiSubTypeMask;
+
+  length = readEU16(is, bigEndian);
+
+  if (!is->hasDataOrRestore(length))
+    return false;
+
+  is->clearRestorePoint();
+
+  switch (subType) {
+  case giiClientVersion:
+    if (length != 2)
+      throw protocol_error(_("Invalid GII version message"));
+    handler->giiVersion(readEU16(is, bigEndian));
+    break;
+
+  case giiClientDeviceCreate: {
+    if (length < giiDeviceCreateFixedSize)
+      throw protocol_error(_("Invalid GII device creation message"));
+
+    GIIDevice device;
+    device.name = readFixedString(is, giiDeviceNameLen);
+    device.vendorID = readEU32(is, bigEndian);
+    device.productID = readEU32(is, bigEndian);
+    device.canGenerate = readEU32(is, bigEndian);
+    device.numRegisters = readEU32(is, bigEndian);
+    uint32_t numValuators = readEU32(is, bigEndian);
+    device.numButtons = readEU32(is, bigEndian);
+
+    if ((numValuators > giiMaxValuatorsPerDevice) ||
+        (length != giiDeviceCreateFixedSize +
+                   numValuators * giiValuatorWireSize))
+      throw protocol_error(_("Invalid GII device creation message"));
+
+    device.valuators.resize(numValuators);
+    for (uint32_t i = 0; i < numValuators; i++) {
+      GIIValuator& val = device.valuators[i];
+      val.index = readEU32(is, bigEndian);
+      val.longName = readFixedString(is, giiValuatorLongNameLen);
+      val.shortName = readFixedString(is, giiValuatorShortNameLen);
+      val.rangeMin = readES32(is, bigEndian);
+      val.rangeCenter = readES32(is, bigEndian);
+      val.rangeMax = readES32(is, bigEndian);
+      val.siUnit = readEU32(is, bigEndian);
+      val.siAdd = readES32(is, bigEndian);
+      val.siMul = readES32(is, bigEndian);
+      val.siDiv = readES32(is, bigEndian);
+      val.siShift = readES32(is, bigEndian);
+    }
+
+    handler->giiDeviceCreate(device);
+    break;
+  }
+
+  case giiClientDeviceDestroy:
+    if (length != 4)
+      throw protocol_error(_("Invalid GII device destruction message"));
+    handler->giiDeviceDestroy(readEU32(is, bigEndian));
+    break;
+
+  case giiClientEvent: {
+    size_t remaining = length;
+    std::vector<GIIEvent> events;
+
+    while (remaining > 0) {
+      if (remaining < 2)
+        throw protocol_error(_("Invalid GII event message"));
+
+      uint8_t eventSize = is->readU8();
+      uint8_t eventType = is->readU8();
+
+      if ((eventSize < 8) || (eventSize > remaining))
+        throw protocol_error(_("Invalid GII event size"));
+
+      switch (eventType) {
+      case giiEventKeyPress:
+      case giiEventKeyRelease:
+      case giiEventKeyRepeat: {
+        if (eventSize != giiKeyEventSize)
+          throw protocol_error(_("Invalid GII key event size"));
+        is->skip(2);
+        GIIEvent ev;
+        ev.type = eventType;
+        ev.origin = readEU32(is, bigEndian);
+        ev.modifiers = readEU32(is, bigEndian);
+        ev.symbol = readEU32(is, bigEndian);
+        ev.label = readEU32(is, bigEndian);
+        ev.button = readEU32(is, bigEndian);
+        events.push_back(ev);
+        break;
+      }
+
+      case giiEventPtrRelative:
+      case giiEventPtrAbsolute: {
+        if (eventSize != giiPtrMoveEventSize)
+          throw protocol_error(_("Invalid GII pointer move event size"));
+        is->skip(2);
+        GIIEvent ev;
+        ev.type = eventType;
+        ev.origin = readEU32(is, bigEndian);
+        ev.x = readES32(is, bigEndian);
+        ev.y = readES32(is, bigEndian);
+        ev.z = readES32(is, bigEndian);
+        ev.wheel = readES32(is, bigEndian);
+        events.push_back(ev);
+        break;
+      }
+
+      case giiEventPtrButtonPress:
+      case giiEventPtrButtonRelease: {
+        if (eventSize != giiPtrButtonEventSize)
+          throw protocol_error(_("Invalid GII pointer button event size"));
+        is->skip(2);
+        GIIEvent ev;
+        ev.type = eventType;
+        ev.origin = readEU32(is, bigEndian);
+        ev.button = readEU32(is, bigEndian);
+        events.push_back(ev);
+        break;
+      }
+
+      case giiEventValuatorRelative:
+      case giiEventValuatorAbsolute: {
+        if ((eventSize < giiValuatorEventHeaderSize) ||
+            (((eventSize - giiValuatorEventHeaderSize) % 4) != 0))
+          throw protocol_error(_("Invalid GII valuator event size"));
+        is->skip(2);
+        GIIEvent ev;
+        ev.type = eventType;
+        ev.origin = readEU32(is, bigEndian);
+        ev.first = readEU32(is, bigEndian);
+        uint32_t count = readEU32(is, bigEndian);
+        if ((count > giiMaxValuatorsPerEvent) ||
+            (eventSize != giiValuatorEventHeaderSize + count * 4))
+          throw protocol_error(_("Invalid GII valuator count"));
+        ev.values.resize(count);
+        for (uint32_t i = 0; i < count; i++)
+          ev.values[i] = readES32(is, bigEndian);
+        events.push_back(ev);
+        break;
+      }
+
+      default:
+        vlog.debug("Ignoring unknown GII event type %d (size %d)",
+                   (int)eventType, (int)eventSize);
+        is->skip(eventSize - 2);
+        break;
+      }
+
+      remaining -= eventSize;
+    }
+
+    for (const GIIEvent& ev : events)
+      handler->giiEvent(ev);
+    break;
+  }
+
+  default:
+    vlog.error(_("Unknown GII client submessage type %d"), (int)subType);
+    is->skip(length);
+    break;
+  }
+
   return true;
 }

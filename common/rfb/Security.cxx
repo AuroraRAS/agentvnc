@@ -88,7 +88,8 @@ const std::list<uint32_t> Security::GetEnabledExtSecTypes(void)
   std::list<uint32_t> result;
 
   for (uint32_t type : enabledSecTypes)
-    if (type != secTypeVeNCrypt) /* Do not include VeNCrypt type to avoid loops */
+    // These wrappers can negotiate other security types themselves.
+    if (type != secTypeVeNCrypt && type != secTypeTight)
       result.push_back(type);
 
   return result;

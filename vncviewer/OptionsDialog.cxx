@@ -377,6 +377,9 @@ void OptionsDialog::loadOptions(void)
   ftpBindAddressInput->value(ftpBindAddress.getValueStr().c_str());
   handleFtpServer(ftpServerCheckbox, this);
 #endif
+#if !defined(WIN32) && !defined(__APPLE__)
+  giiCheckbox->value(enableGII);
+#endif
   alwaysCursorCheckbox->value(alwaysCursor);
   if (cursorType == "system") {
     cursorTypeChoice->value(1);
@@ -556,6 +559,9 @@ void OptionsDialog::storeOptions(void)
   }
   if (ftpBindAddressInput->value()[0] != '\0')
     ftpBindAddress.setParam(ftpBindAddressInput->value());
+#endif
+#if !defined(WIN32) && !defined(__APPLE__)
+  enableGII.setParam(giiCheckbox->value());
 #endif
   alwaysCursor.setParam(alwaysCursorCheckbox->value());
 
@@ -1353,6 +1359,14 @@ void OptionsDialog::createMiscPage(int tx, int ty, int tw, int th)
                                      160, INPUT_HEIGHT, _("FTP bind address"));
   ftpBindAddressInput->align(FL_ALIGN_RIGHT);
   ty += INPUT_HEIGHT + TIGHT_MARGIN;
+#endif
+
+#if !defined(WIN32) && !defined(__APPLE__)
+  giiCheckbox = new Fl_Check_Button(LBLRIGHT(tx, ty,
+                                             CHECK_MIN_WIDTH,
+                                             CHECK_HEIGHT,
+                                             _("Enable extended input devices (GII)")));
+  ty += CHECK_HEIGHT + TIGHT_MARGIN;
 #endif
 
   group->end();

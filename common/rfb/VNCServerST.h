@@ -43,6 +43,8 @@ namespace rfb {
   class PixelBuffer;
   class KeyRemapper;
   class SDesktop;
+  struct GIIDevice;
+  struct GIIEvent;
 
   class VNCServerST : public VNCServer,
                       public core::Timer::Callback {
@@ -140,6 +142,12 @@ namespace rfb {
     void keyEvent(uint32_t keysym, uint32_t keycode, bool down);
     void pointerEvent(VNCSConnectionST* client,
                       const core::Point& pos, uint16_t buttonMask);
+
+    bool supportsGII() const;
+    uint32_t giiDeviceCreate(VNCSConnectionST* client,
+                             const GIIDevice& device);
+    void giiDeviceDestroy(VNCSConnectionST* client, uint32_t deviceOrigin);
+    void giiEvent(VNCSConnectionST* client, const GIIEvent& event);
 
     void handleClipboardRequest(VNCSConnectionST* client);
     void handleClipboardAnnounce(VNCSConnectionST* client, bool available);

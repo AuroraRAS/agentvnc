@@ -202,6 +202,9 @@ protected:
   void handleAudioEnd() override;
   void handleAudioData(const uint8_t* data, size_t length) override;
 
+  void handleGIIEnabled(uint16_t version) override;
+  void handleGIIDeviceCreated(uint32_t deviceOrigin) override;
+
 private:
 
   void resizeFramebuffer() override;

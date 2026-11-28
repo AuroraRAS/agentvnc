@@ -93,6 +93,7 @@ namespace rfb {
                              const uint8_t server2client[32]);
     void onServerInit();
     void onFenceReply();
+    void onTight13CancelFenceReply();
 
     void onTight13FileListData(uint8_t flags,
                                const std::vector<FileEntry>& entries);

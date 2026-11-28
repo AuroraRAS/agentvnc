@@ -179,6 +179,9 @@ protected:
   Fl_Int_Input *ftpPortInput;
   Fl_Input *ftpBindAddressInput;
 #endif
+#if !defined(WIN32) && !defined(__APPLE__)
+  Fl_Check_Button *giiCheckbox;
+#endif
 
 private:
   static int fltk_event_handler(int event);

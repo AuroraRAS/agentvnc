@@ -23,6 +23,12 @@
 #endif
 
 #include <stdio.h>
+#include <string.h>
+
+#include <algorithm>
+#include <stdexcept>
+
+#include <zlib.h>
 
 #include <core/LogWriter.h>
 #include <core/string.h>
@@ -33,6 +39,7 @@
 
 #include <rfb/msgTypes.h>
 #include <rfb/fenceTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/clipboardTypes.h>
 #include <rfb/ClientParams.h>
 #include <rfb/Cursor.h>
@@ -47,27 +54,163 @@ using namespace rfb;
 
 static core::LogWriter vlog("SMsgWriter");
 
+struct rfb::Tight2DeflateState {
+  z_stream zs;
+  bool initialized;
+
+  Tight2DeflateState() : initialized(false)
+  {
+    memset(&zs, 0, sizeof(zs));
+  }
+
+  ~Tight2DeflateState()
+  {
+    if (initialized)
+      deflateEnd(&zs);
+  }
+};
+
+static void writeU64(rdr::OutStream* os, uint64_t val)
+{
+  os->writeU32(static_cast<uint32_t>(val >> 32));
+  os->writeU32(static_cast<uint32_t>(val & 0xFFFFFFFFU));
+}
+
+static void writeBE16(std::vector<uint8_t>* out, uint16_t v)
+{
+  out->push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+  out->push_back(static_cast<uint8_t>(v & 0xFF));
+}
+
+static void writeBE32(std::vector<uint8_t>* out, uint32_t v)
+{
+  out->push_back(static_cast<uint8_t>((v >> 24) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 16) & 0xFF));
+  out->push_back(static_cast<uint8_t>((v >> 8) & 0xFF));
+  out->push_back(static_cast<uint8_t>(v & 0xFF));
+}
+
+static void writeBE64(std::vector<uint8_t>* out, uint64_t v)
+{
+  writeBE32(out, static_cast<uint32_t>(v >> 32));
+  writeBE32(out, static_cast<uint32_t>(v & 0xFFFFFFFFU));
+}
+
+static std::vector<uint8_t> deflateTight13Block(const uint8_t* data, size_t len,
+                                                int level)
+{
+  if (len == 0 || data == nullptr)
+    return std::vector<uint8_t>();
+
+  z_stream zs;
+  memset(&zs, 0, sizeof(zs));
+  int zlevel = std::max(1, std::min(level, 9));
+  if (deflateInit2(&zs, zlevel, Z_DEFLATED, 15, 8, Z_DEFAULT_STRATEGY) != Z_OK)
+    throw std::runtime_error("zlib deflateInit2 failed");
+
+  std::vector<uint8_t> out(deflateBound(&zs, static_cast<uLong>(len)) + 32);
+  zs.next_in = const_cast<Bytef*>(data);
+  zs.avail_in = static_cast<uInt>(len);
+  zs.next_out = out.data();
+  zs.avail_out = static_cast<uInt>(out.size());
+
+  int rc = deflate(&zs, Z_FINISH);
+  size_t written = zs.total_out;
+  uInt remainingIn = zs.avail_in;
+  deflateEnd(&zs);
+  if (rc != Z_STREAM_END || remainingIn != 0)
+    throw std::runtime_error("zlib deflate failed");
+
+  out.resize(written);
+  return out;
+}
+
 SMsgWriter::SMsgWriter(ClientParams* client_, rdr::OutStream* os_)
   : client(client_), os(os_),
     nRectsInUpdate(0), nRectsInHeader(0),
     needSetDesktopName(false), needCursor(false),
     needCursorPos(false), needLEDState(false),
-    needQEMUKeyEvent(false), needExtMouseButtonsEvent(false)
+    needQEMUKeyEvent(false), needExtMouseButtonsEvent(false),
+    tight2Deflate(nullptr)
 {
 }
 
 SMsgWriter::~SMsgWriter()
 {
+  delete tight2Deflate;
+}
+
+std::vector<uint8_t> SMsgWriter::deflateTight2Block(const uint8_t* data,
+                                                      size_t len)
+{
+  if (len == 0 || data == nullptr)
+    return std::vector<uint8_t>();
+
+  if (tight2Deflate == nullptr)
+    tight2Deflate = new Tight2DeflateState();
+
+  if (!tight2Deflate->initialized) {
+    memset(&tight2Deflate->zs, 0, sizeof(tight2Deflate->zs));
+    if (deflateInit2(&tight2Deflate->zs, Z_DEFAULT_COMPRESSION, Z_DEFLATED,
+                     15, 8, Z_DEFAULT_STRATEGY) != Z_OK) {
+      throw std::runtime_error("Tight2 deflateInit2 failed");
+    }
+    tight2Deflate->initialized = true;
+  }
+
+  z_stream& zs = tight2Deflate->zs;
+  std::vector<uint8_t> out(deflateBound(&zs, static_cast<uLong>(len)) + 32);
+  zs.next_in = const_cast<Bytef*>(data);
+  zs.avail_in = static_cast<uInt>(len);
+  zs.next_out = out.data();
+  zs.avail_out = static_cast<uInt>(out.size());
+
+  uLong before = zs.total_out;
+  int rc = deflate(&zs, Z_SYNC_FLUSH);
+  if (rc != Z_OK || zs.avail_in != 0)
+    throw std::runtime_error("Tight2 deflate failed");
+
+  out.resize(zs.total_out - before);
+  return out;
 }
 
 void SMsgWriter::writeServerInit(uint16_t width, uint16_t height,
                                  const PixelFormat& pf, const char* name)
+{
+  writeServerInit(width, height, pf, name, {}, {}, {});
+}
+
+void SMsgWriter::writeServerInit(uint16_t width, uint16_t height,
+                                 const PixelFormat& pf, const char* name,
+                                 const std::vector<TightCapability>& serverMsgs,
+                                 const std::vector<TightCapability>& clientMsgs,
+                                 const std::vector<TightCapability>& encodings)
 {
   os->writeU16(width);
   os->writeU16(height);
   pf.write(os);
   os->writeU32(strlen(name));
   os->writeBytes((const uint8_t*)name, strlen(name));
+
+  if (client->tightEnabled) {
+    auto writeCaps = [this](const std::vector<TightCapability>& caps) {
+      for (const TightCapability& cap : caps) {
+        os->writeS32(cap.code);
+        os->writeBytes(reinterpret_cast<const uint8_t*>(cap.vendor), 4);
+        os->writeBytes(reinterpret_cast<const uint8_t*>(cap.signature), 8);
+      }
+    };
+
+    os->writeU16(static_cast<uint16_t>(serverMsgs.size()));
+    os->writeU16(static_cast<uint16_t>(clientMsgs.size()));
+    os->writeU16(static_cast<uint16_t>(encodings.size()));
+    os->writeU16(0);
+
+    writeCaps(serverMsgs);
+    writeCaps(clientMsgs);
+    writeCaps(encodings);
+  }
+
   endMsg();
 }
 
@@ -767,4 +910,299 @@ void SMsgWriter::writeExtendedMouseButtonsRect()
   os->writeU16(0);
   os->writeU16(0);
   os->writeU32(pseudoEncodingExtendedMouseButtons);
+}
+
+void SMsgWriter::writeTight2CompressionSupportReply(bool supported)
+{
+  os->writeU32(tight2CompressionSupportReply);
+  os->writeU8(supported ? 1 : 0);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2FileListReply(uint8_t compressLevel,
+                                          const std::vector<FileEntry>& entries)
+{
+  std::vector<uint8_t> raw;
+  writeBE32(&raw, static_cast<uint32_t>(entries.size()));
+  for (const FileEntry& entry : entries) {
+    writeBE64(&raw, entry.isDir ? 0 : entry.size);
+    uint64_t mtimeMs = (entry.mtime > 0)
+      ? static_cast<uint64_t>(entry.mtime) * 1000ULL : 0ULL;
+    writeBE64(&raw, mtimeMs);
+    uint16_t flags = (entry.isDir ? tight2FlagDir : 0) |
+                     (entry.isExecutable ? tight2FlagExec : 0);
+    writeBE16(&raw, flags);
+    writeBE32(&raw, static_cast<uint32_t>(entry.name.size()));
+    raw.insert(raw.end(), entry.name.begin(), entry.name.end());
+  }
+
+  os->writeU32(tight2FileListReply);
+  if (compressLevel != 0 && !raw.empty()) {
+    std::vector<uint8_t> packed = deflateTight2Block(raw.data(), raw.size());
+    os->writeU8(1);
+    os->writeU32(static_cast<uint32_t>(packed.size()));
+    os->writeU32(static_cast<uint32_t>(raw.size()));
+    if (!packed.empty())
+      os->writeBytes(packed.data(), packed.size());
+  } else {
+    os->writeU8(0);
+    os->writeU32(static_cast<uint32_t>(raw.size()));
+    os->writeU32(static_cast<uint32_t>(raw.size()));
+    if (!raw.empty())
+      os->writeBytes(raw.data(), raw.size());
+  }
+  endMsg();
+}
+
+void SMsgWriter::writeTight2Md5Reply(const uint8_t digest[16])
+{
+  os->writeU32(tight2Md5Reply);
+  os->writeBytes(digest, 16);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2UploadStartReply()
+{
+  os->writeU32(tight2UploadStartReply);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2UploadDataReply()
+{
+  os->writeU32(tight2UploadDataReply);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2UploadEndReply()
+{
+  os->writeU32(tight2UploadEndReply);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2DownloadStartReply()
+{
+  os->writeU32(tight2DownloadStartReply);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2DownloadDataReply(uint8_t compressLevel,
+                                              const uint8_t* data, size_t len)
+{
+  os->writeU32(tight2DownloadDataReply);
+  if (compressLevel != 0 && len > 0 && data != nullptr) {
+    std::vector<uint8_t> packed = deflateTight2Block(data, len);
+    os->writeU8(1);
+    os->writeU32(static_cast<uint32_t>(packed.size()));
+    os->writeU32(static_cast<uint32_t>(len));
+    if (!packed.empty())
+      os->writeBytes(packed.data(), packed.size());
+  } else {
+    os->writeU8(0);
+    os->writeU32(static_cast<uint32_t>(len));
+    os->writeU32(static_cast<uint32_t>(len));
+    if (len > 0 && data != nullptr)
+      os->writeBytes(data, len);
+  }
+  endMsg();
+}
+
+void SMsgWriter::writeTight2DownloadEndReply(uint8_t fileFlags,
+                                             uint64_t modTimeMs)
+{
+  os->writeU32(tight2DownloadEndReply);
+  os->writeU8(fileFlags);
+  writeU64(os, modTimeMs);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2MkdirReply()
+{
+  os->writeU32(tight2MkdirReply);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2RemoveReply()
+{
+  os->writeU32(tight2RemoveReply);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2RenameReply()
+{
+  os->writeU32(tight2RenameReply);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2DirSizeReply(uint64_t size)
+{
+  os->writeU32(tight2DirSizeReply);
+  writeU64(os, size);
+  endMsg();
+}
+
+void SMsgWriter::writeTight2LastRequestFailedReply(const std::string& message)
+{
+  os->writeU32(tight2LastRequestFailedReply);
+  os->writeU32(static_cast<uint32_t>(message.size()));
+  if (!message.empty())
+    os->writeBytes(reinterpret_cast<const uint8_t*>(message.data()),
+                   message.size());
+  endMsg();
+}
+
+void SMsgWriter::writeTight13FileListData(uint8_t flags,
+                                          const std::vector<FileEntry>& entries)
+{
+  if ((flags & tight13FlagError) != 0) {
+    startMsg(msgTypeTightFileListData);
+    os->writeU8(flags);
+    os->writeU16(0);
+    os->writeU16(0);
+    os->writeU16(0);
+    endMsg();
+    return;
+  }
+
+  bool dirOnly = (flags & tight13FlagDirOnly) != 0;
+  std::vector<const FileEntry*> filtered;
+  std::string rawNames;
+
+  for (const FileEntry& e : entries) {
+    if (dirOnly && !e.isDir)
+      continue;
+    size_t addLen = e.name.size() + 1;
+    if (addLen > 65535 - rawNames.size()) {
+      writeTight13FileListData(flags | tight13FlagError, {});
+      return;
+    }
+    filtered.push_back(&e);
+    rawNames.append(e.name);
+    rawNames.push_back('\0');
+  }
+
+  uint8_t outFlags = flags;
+  uint8_t compLevel = flags & 0x0F;
+  std::vector<uint8_t> compNames;
+  bool sendCompressed = false;
+
+  if (compLevel != 0 && !rawNames.empty()) {
+    compNames = deflateTight13Block(
+      reinterpret_cast<const uint8_t*>(rawNames.data()),
+      rawNames.size(), compLevel);
+    if (compNames.size() < rawNames.size() && compNames.size() <= 65535)
+      sendCompressed = true;
+    else
+      outFlags &= static_cast<uint8_t>(~0x0F);
+  } else {
+    outFlags &= static_cast<uint8_t>(~0x0F);
+  }
+
+  startMsg(msgTypeTightFileListData);
+  os->writeU8(outFlags);
+  os->writeU16(static_cast<uint16_t>(filtered.size()));
+  os->writeU16(static_cast<uint16_t>(rawNames.size()));
+  os->writeU16(static_cast<uint16_t>(sendCompressed ? compNames.size()
+                                                    : rawNames.size()));
+
+  for (const FileEntry* e : filtered) {
+    uint32_t sz = e->isDir
+      ? tight13DirSize
+      : static_cast<uint32_t>(std::min<uint64_t>(e->size, tight13DirSize - 1));
+    uint32_t mt = (e->mtime > 0) ? static_cast<uint32_t>(e->mtime) : 0;
+    os->writeU32(sz);
+    os->writeU32(mt);
+  }
+
+  if (sendCompressed) {
+    if (!compNames.empty())
+      os->writeBytes(compNames.data(), compNames.size());
+  } else if (!rawNames.empty()) {
+    os->writeBytes(reinterpret_cast<const uint8_t*>(rawNames.data()),
+                   rawNames.size());
+  }
+
+  endMsg();
+}
+
+void SMsgWriter::writeTight13FileDownloadData(uint8_t compressLevel,
+                                              const uint8_t* data, uint16_t len)
+{
+  if (len == 0 || data == nullptr)
+    return;
+
+  startMsg(msgTypeTightFileDownloadData);
+  if (compressLevel != 0) {
+    std::vector<uint8_t> comp = deflateTight13Block(data, len, compressLevel);
+    if (comp.size() < len && comp.size() <= 65535) {
+      os->writeU8(compressLevel);
+      os->writeU16(len);
+      os->writeU16(static_cast<uint16_t>(comp.size()));
+      os->writeBytes(comp.data(), comp.size());
+      endMsg();
+      return;
+    }
+  }
+
+  os->writeU8(0);
+  os->writeU16(len);
+  os->writeU16(len);
+  os->writeBytes(data, len);
+  endMsg();
+}
+
+void SMsgWriter::writeTight13FileDownloadEnd(uint32_t modTime)
+{
+  startMsg(msgTypeTightFileDownloadData);
+  os->writeU8(0);
+  os->writeU16(0);
+  os->writeU16(0);
+  os->writeU32(modTime);
+  endMsg();
+}
+
+void SMsgWriter::writeTight13FileUploadCancel(const std::string& reason)
+{
+  uint16_t len = static_cast<uint16_t>(std::min<size_t>(reason.size(), 65535));
+  startMsg(msgTypeTightFileUploadCancel);
+  os->writeU8(0);
+  os->writeU16(len);
+  if (len > 0)
+    os->writeBytes(reinterpret_cast<const uint8_t*>(reason.data()), len);
+  endMsg();
+}
+
+void SMsgWriter::writeTight13FileDownloadFailed(const std::string& reason)
+{
+  uint16_t len = static_cast<uint16_t>(std::min<size_t>(reason.size(), 65535));
+  startMsg(msgTypeTightFileDownloadFailed);
+  os->writeU8(0);
+  os->writeU16(len);
+  if (len > 0)
+    os->writeBytes(reinterpret_cast<const uint8_t*>(reason.data()), len);
+  endMsg();
+}
+
+void SMsgWriter::writeGIIVersion(uint16_t maxVersion, uint16_t minVersion)
+{
+  if (!client->supportsGII())
+    throw std::logic_error("Client does not support GII");
+
+  startMsg(msgTypeGIIServerMessage);
+  os->writeU8(giiBigEndian | giiServerVersion);
+  os->writeU16(4);
+  os->writeU16(maxVersion);
+  os->writeU16(minVersion);
+  endMsg();
+}
+
+void SMsgWriter::writeGIIDeviceCreateResponse(uint32_t deviceOrigin)
+{
+  if (!client->supportsGII())
+    throw std::logic_error("Client does not support GII");
+
+  startMsg(msgTypeGIIServerMessage);
+  os->writeU8(giiBigEndian | giiServerDeviceCreateResponse);
+  os->writeU16(4);
+  os->writeU32(deviceOrigin);
+  endMsg();
 }

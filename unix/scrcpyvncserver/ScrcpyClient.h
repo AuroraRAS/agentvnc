@@ -22,13 +22,14 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <map>
+#include <memory>
 #include <string>
 #include <vector>
 
-#include <map>
-
 #include <rfb/SConnection.h>
 
+#include "AdbFileTransfer.h"
 #include "ZeroCopyOutStream.h"
 
 namespace network { class Socket; }
@@ -44,6 +45,8 @@ public:
   void init();
   void processSocketReadEvent();
   void processSocketWriteEvent();
+  int fileTransferWakeupFd() const;
+  void processFileTransferEvents();
 
   bool hasBufferedWriteData();
 
@@ -82,14 +85,68 @@ protected:
   void handleClipboardRequest() override;
   void handleClipboardAnnounce(bool available) override;
   void handleClipboardData(const char* data) override;
+  void supportsGII() override;
+  void giiVersion(uint16_t version) override;
+  void giiDeviceCreate(const rfb::GIIDevice& device) override;
+  void giiDeviceDestroy(uint32_t deviceOrigin) override;
+  void giiEvent(const rfb::GIIEvent& event) override;
+
+  void getTightCapabilities(std::vector<rfb::TightCapability>* serverMsgs,
+                            std::vector<rfb::TightCapability>* clientMsgs,
+                            std::vector<rfb::TightCapability>* encodings) override;
+
+  void tight2CompressionSupportRequest() override;
+  void tight2FileListRequest(uint8_t compressLevel,
+                             const std::string& path) override;
+  void tight2Md5Request(const std::string& path, uint64_t offset,
+                        uint64_t dataLen) override;
+  void tight2UploadStartRequest(const std::string& path, uint8_t flags,
+                                uint64_t offset) override;
+  void tight2UploadDataRequest(const uint8_t* data, size_t len) override;
+  void tight2UploadEndRequest(uint16_t fileFlags,
+                              uint64_t modTimeMs) override;
+  void tight2DownloadStartRequest(const std::string& path,
+                                  uint64_t offset) override;
+  void tight2DownloadDataRequest(uint8_t compressLevel,
+                                 uint32_t reqSize) override;
+  void tight2MkdirRequest(const std::string& path) override;
+  void tight2RemoveRequest(const std::string& path) override;
+  void tight2RenameRequest(const std::string& oldPath,
+                           const std::string& newPath) override;
+  void tight2DirSizeRequest(const std::string& path) override;
+
+  void tight13FileListRequest(uint8_t flags, const std::string& dir) override;
+  void tight13FileDownloadRequest(uint8_t compressLevel, uint32_t position,
+                                  const std::string& path) override;
+  void tight13FileUploadRequest(uint8_t compressLevel, uint32_t position,
+                                const std::string& path) override;
+  void tight13FileUploadData(const uint8_t* data, size_t len) override;
+  void tight13FileUploadEnd(uint32_t modTime) override;
+  void tight13FileDownloadCancel(const std::string& reason) override;
+  void tight13FileUploadFailed(const std::string& reason) override;
+  void tight13FileCreateDirRequest(const std::string& dir) override;
 
 private:
   void requireKeyFrame();
   void requestPendingKeyFrame();
   void flushNoDataUpdateIfReady();
+  bool fileTransferEnabled() const;
+  bool ensureFileTransferReady(bool isTight13, uint8_t tight13Flags = 0,
+                               bool isDownload = false, bool isUpload = false);
+  void destroyAllGIIDevices();
+  void noteActivity();
+
+  struct GIIDeviceLimits {
+    uint32_t eventMask;
+    uint32_t buttons;
+    size_t valuators;
+  };
 
   ScrcpyServer* server_;
   ZeroCopyOutStream zeroCopyOs_;
+  std::unique_ptr<AdbFileTransferSession> ftSession_;
+  bool tight13DownloadPendingWrite_;
+  uint64_t tight13DownloadSerial_ = 0;
   bool inProcessMessages_;
   bool receivedEncodings_;
   bool continuousUpdates_;
@@ -99,7 +156,9 @@ private:
   bool needsKeyFrame_;
   bool needsReset_;
   bool needsResetAll_;
+  bool giiVersionSent_;
   std::map<std::pair<bool, uint32_t>, uint32_t> pressedKeys_;
+  std::map<uint32_t, GIIDeviceLimits> giiDevices_;
 
   core::Timer idleTimer_;
   std::string closeReason_;

@@ -40,6 +40,11 @@ namespace network {
   class SocketListener;
 }
 
+namespace rfb {
+  struct GIIDevice;
+  struct GIIEvent;
+}
+
 class ScrcpyClient;
 
 class ScrcpyServer : public ScrcpyStream::Callbacks,
@@ -58,6 +63,8 @@ public:
                             ScrcpyProtocol protocol,
                             int width, int height,
                             const std::string& deviceName);
+  void setAdbTargetForTest(const std::string& host, int port,
+                           const std::string& serial);
 
   // Main poll() event loop. Runs until caughtSignal becomes true or
   // terminate() is called.
@@ -78,10 +85,14 @@ public:
   int width() const { return stream_.width(); }
   int height() const { return stream_.height(); }
   const std::string& desktopName() const { return desktopName_; }
+  const std::string& adbHost() const { return adbHost_; }
+  int adbPort() const { return adbPort_; }
+  const std::string& deviceSerial() const { return deviceSerial_; }
 
   // Called by ScrcpyClient
   void clientReady(ScrcpyClient* client, bool shared);
   void clearBlacklist(const char* address);
+  void noteClientActivity();
   void clientRequestsKeyFrame(ScrcpyClient* client);
   void clientPointerEvent(ScrcpyClient* client,
                           int x, int y, uint16_t buttonMask);
@@ -89,6 +100,12 @@ public:
   void clientClipboardRequest(ScrcpyClient* client);
   void clientClipboardAnnounce(ScrcpyClient* client, bool available);
   void clientClipboardData(ScrcpyClient* client, const char* data);
+  bool supportsGII() const;
+  uint32_t clientGIIDeviceCreate(ScrcpyClient* client,
+                                 const rfb::GIIDevice& device);
+  void clientGIIDeviceDestroy(ScrcpyClient* client, uint32_t deviceOrigin);
+  void clientGIIEvent(ScrcpyClient* client, const rfb::GIIEvent& event);
+  size_t activeGIIDeviceCount() const { return control_.activeGIIDeviceCount(); }
 
   // ScrcpyStream::Callbacks
   void onResize(int width, int height) override;
@@ -123,6 +140,9 @@ private:
   std::string detectedShellVersion_;
 
   std::string desktopName_;
+  std::string adbHost_;
+  int adbPort_;
+  std::string deviceSerial_;
   std::string deviceClipboard_;
   uint64_t clipboardSeq_;
 

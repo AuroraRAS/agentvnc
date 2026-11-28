@@ -892,6 +892,22 @@ void DesktopWindow::handleClipboardData(const char* data)
 }
 
 
+void DesktopWindow::enableGII()
+{
+  viewport->enableGII();
+}
+
+void DesktopWindow::disableGII()
+{
+  viewport->disableGII();
+}
+
+void DesktopWindow::handleGIIDeviceCreated(uint32_t deviceOrigin)
+{
+  viewport->handleGIIDeviceCreated(deviceOrigin);
+}
+
+
 void DesktopWindow::resize(int x, int y, int w, int h)
 {
   bool moving, resizing, rescale;

@@ -263,6 +263,12 @@ right and/or from the bottom of the screen.  Offsets are optional and the
 window will be placed by the window manager by default.
 .
 .TP
+.B \-GII
+Forward events from extended input devices such as graphics tablets and
+multi-axis controllers using the RFB General Input Interface (GII) extension.
+This option is enabled by default on X11 and requires GII support on the server.
+.
+.TP
 .B \-GnuTLSPriority \fIpriority\fP
 GnuTLS priority string that controls the TLS session’s handshake algorithms.
 See the GnuTLS manual for possible values. Default is \fBNORMAL\fP.

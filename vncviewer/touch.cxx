@@ -24,6 +24,7 @@
 #include <assert.h>
 
 #include <map>
+#include <vector>
 
 #if defined(WIN32)
 #include <windows.h>
@@ -57,6 +58,12 @@ static int xi_major;
 
 typedef std::map<Window, class BaseTouchHandler*> HandlerMap;
 static HandlerMap handlers;
+
+#if !defined(WIN32) && !defined(__APPLE__)
+typedef std::map<Fl_Window*, XInputGIIObserver*> GIIObserverMap;
+static GIIObserverMap giiObservers;
+static bool hierarchySelected = false;
+#endif
 
 #if defined(WIN32)
 LRESULT CALLBACK win32WindowProc(HWND hWnd, UINT uMsg, WPARAM wParam,
@@ -173,6 +180,38 @@ void x11_ungrab_pointer(Fl_Window* win)
   // Restore XI_TouchOwnership now that the grab is gone
   x11_change_touch_ownership(true);
 }
+
+void x11_register_gii_observer(Fl_Window* win, XInputGIIObserver* observer)
+{
+  if (win == nullptr)
+    return;
+
+  giiObservers[win] = observer;
+
+  if (!hierarchySelected) {
+    XIEventMask eventmask;
+    unsigned char flags[XIMaskLen(XI_LASTEVENT)] = { 0 };
+
+    eventmask.deviceid = XIAllDevices;
+    eventmask.mask_len = sizeof(flags);
+    eventmask.mask = flags;
+    XISetMask(flags, XI_HierarchyChanged);
+
+    XISelectEvents(fl_display, DefaultRootWindow(fl_display), &eventmask, 1);
+    hierarchySelected = true;
+  }
+}
+
+void x11_unregister_gii_observer(Fl_Window* win, XInputGIIObserver* observer)
+{
+  for (GIIObserverMap::iterator it = giiObservers.begin();
+       it != giiObservers.end(); ) {
+    if ((it->first == win) || (it->second == observer))
+      giiObservers.erase(it++);
+    else
+      ++it;
+  }
+}
 #endif
 
 static int handleTouchEvent(void *event, void* /*data*/)
@@ -223,7 +262,35 @@ static int handleTouchEvent(void *event, void* /*data*/)
         return 1;
       }
 
+      if (xevent->xcookie.evtype == XI_HierarchyChanged) {
+        std::vector<XInputGIIObserver*> observers;
+        observers.reserve(giiObservers.size());
+        for (GIIObserverMap::const_iterator it = giiObservers.begin();
+             it != giiObservers.end(); ++it)
+          observers.push_back(it->second);
+        for (XInputGIIObserver* obs : observers)
+          obs->handleXIHierarchyEvent(xevent->xcookie.data);
+        XFreeEventData(fl_display, &xevent->xcookie);
+        return 1;
+      }
+
+      if (xevent->xcookie.evtype == XI_DeviceChanged) {
+        XFreeEventData(fl_display, &xevent->xcookie);
+        return 1;
+      }
+
       devev = (XIDeviceEvent*)xevent->xcookie.data;
+
+      for (GIIObserverMap::iterator obsIt = giiObservers.begin();
+           obsIt != giiObservers.end(); ++obsIt) {
+        if (fl_xid(obsIt->first) == devev->event) {
+          if (obsIt->second->handleXIDeviceEvent(devev)) {
+            XFreeEventData(fl_display, &xevent->xcookie);
+            return 1;
+          }
+          break;
+        }
+      }
 
       if (handlers.count(devev->event) == 0) {
         // We get these when the mouse is grabbed implicitly, so just

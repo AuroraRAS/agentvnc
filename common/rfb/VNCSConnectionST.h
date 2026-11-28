@@ -38,6 +38,8 @@
 #include <rfb/SConnection.h>
 
 namespace rfb {
+  struct GIIDevice;
+  struct GIIEvent;
   class VNCServerST;
 
   class VNCSConnectionST : public SConnection,
@@ -161,6 +163,11 @@ namespace rfb {
     void supportsFence() override;
     void supportsContinuousUpdates() override;
     void supportsLEDState() override;
+    void supportsGII() override;
+    void giiVersion(uint16_t version) override;
+    void giiDeviceCreate(const GIIDevice& device) override;
+    void giiDeviceDestroy(uint32_t deviceOrigin) override;
+    void giiEvent(const GIIEvent& event) override;
 
     // Timer callbacks
     void handleTimeout(core::Timer* t) override;
@@ -220,6 +227,13 @@ namespace rfb {
     time_t pointerEventTime;
     core::Point pointerEventPos;
     bool clientHasCursor;
+    bool giiVersionSent;
+    struct GIIDeviceLimits {
+      uint32_t eventMask;
+      uint32_t buttons;
+      size_t valuators;
+    };
+    std::map<uint32_t, GIIDeviceLimits> giiDevices;
 
     bool h264Synced;
     bool h264NeedsReset;

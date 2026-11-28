@@ -33,6 +33,7 @@ namespace rfb
   const AccessRights AccessCutText        = 0x0008;
   const AccessRights AccessSetDesktopSize = 0x0010;
   const AccessRights AccessNonShared      = 0x0020;
+  const AccessRights AccessFileTransfer   = 0x0040;
   const AccessRights AccessDefault        = 0x03ff;
   const AccessRights AccessNoQuery        = 0x0400;
   const AccessRights AccessFull           = 0xffff;

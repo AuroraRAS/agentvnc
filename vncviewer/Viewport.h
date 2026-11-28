@@ -25,6 +25,7 @@
 #include <FL/Fl_Widget.H>
 
 #include "EmulateMB.h"
+#include "GIIDeviceManager.h"
 #include "Keyboard.h"
 #include "ShortcutHandler.h"
 
@@ -32,12 +33,13 @@ class Fl_Menu_Button;
 class Fl_RGB_Image;
 
 class CConn;
+class GIIInput;
 class Keyboard;
 class PlatformPixelBuffer;
 class Surface;
 
 class Viewport : public Fl_Widget, protected EmulateMB,
-                 protected KeyboardHandler {
+                 protected KeyboardHandler, protected GIIEventSender {
 public:
 
   Viewport(int w, int h, CConn* cc_);
@@ -77,6 +79,11 @@ public:
   void handleClipboardAnnounce(bool available);
   void handleClipboardData(const char* data);
 
+  // GII extended input
+  void enableGII();
+  void disableGII();
+  void handleGIIDeviceCreated(uint32_t deviceOrigin);
+
   // Fl_Widget callback methods
 
   void draw() override;
@@ -86,6 +93,10 @@ public:
 protected:
   void sendPointerEvent(const core::Point& pos,
                         uint16_t buttonMask) override;
+
+  void createGIIDevice(const rfb::GIIDevice& device) override;
+  void destroyGIIDevice(uint32_t deviceOrigin) override;
+  void sendGIIEvents(const std::vector<rfb::GIIEvent>& events) override;
 
 private:
   bool hasFocus();
@@ -148,6 +159,8 @@ private:
   Fl_RGB_Image *cursor;
   core::Point cursorHotspot;
   bool cursorIsBlank;
+
+  GIIInput* giiInput;
 };
 
 #endif

@@ -24,6 +24,21 @@ resizes, they must also support DesktopSize (\-223) or ExtendedDesktopSize
 (\-308). ContinuousUpdates (\-313) lets the server stream frames without
 waiting for individual update requests. With an H.264-enabled
 \fBvncviewer\fP(1), use \fB\-AutoSelect=0 \-PreferredEncoding=H.264\fP.
+.PP
+When \fB\-FileTransfer\fP is enabled (the default), \fBscrcpyvncserver\fP also
+advertises the Tight security type (16) and TightVNC 2.x and 1.3.x File
+Transfer extensions, performing directory listing, download, upload, resume,
+MD5 checksum, directory size, mkdir, rename, and remove operations on the
+connected Android device over ADB. Viewers such as \fBvncviewer \-FtpServer\fP
+automatically negotiate Tight capability exchange when connecting.
+.PP
+When \fB\-GII\fP is enabled (the default) and \fB\-Control\fP is active,
+\fBscrcpyvncserver\fP negotiates the RFB General Input Interface (GII)
+extension (\-305, message type 253, version 1) with supporting viewers such
+as \fBvncviewer \-GII\fP, bridging virtual extended input devices (styluses,
+drawing tablets, multi-touch pointers, scroll wheels, buttons, and keys)
+over the scrcpy control channel with scaled coordinates, continuous pressure,
+and automatic disconnect cleanup.
 .SH OPTIONS
 Parameters can be specified as \fB\-\fIParam\fR, \fB\-\fIParam\fP=0\fR,
 or \fB\-\fIParam\fP=\fIvalue\fR. Run \fBscrcpyvncserver \-h\fP for the full
@@ -47,6 +62,20 @@ its control, dummy byte, and device metadata settings. Use
 .BI \-HostsFile " path"
 Apply IP access rules to TCP listeners, including systemd-activated
 listeners. Connections that require interactive approval are rejected.
+.TP
+.BI \-FileTransfer " [0|1]"
+Enable or disable TightVNC File Transfer over ADB (enabled by default).
+.TP
+.BI \-FileTransferRoot " path"
+Resolve TightVNC File Transfer paths under this directory on the Android
+device and reject paths that resolve outside it. An empty value exposes the
+full device filesystem accessible to ADB. Use a directory tree whose paths
+are controlled by trusted Android users, since ADB resolves and opens paths
+in separate operations.
+.TP
+.BI \-GII " [0|1]"
+Enable or disable RFB General Input Interface (GII) extended input
+devices (enabled by default).
 .SH SEE ALSO
 .BR vncviewer (1),
 .BR x0vncserver (1),

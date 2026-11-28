@@ -83,28 +83,10 @@ bool CSecurityTight::isSubAuthAllowed(uint32_t subType) const
   if (security->IsSupported(subType))
     return true;
 
-  // If the user explicitly restricted SecurityTypes to only Tight (without
-  // explicitly listing or omitting None/VncAuth/Plain), permit standard Tight
-  // authentication capabilities.
-  bool explicitAuthConfigured =
-    security->IsSupported(secTypeNone) ||
-    security->IsSupported(secTypeVncAuth) ||
-    security->IsSupported(secTypePlain) ||
-    security->IsSupported(secTypeTLSNone) ||
-    security->IsSupported(secTypeTLSVnc) ||
-    security->IsSupported(secTypeTLSPlain) ||
-    security->IsSupported(secTypeX509None) ||
-    security->IsSupported(secTypeX509Vnc) ||
-    security->IsSupported(secTypeX509Plain);
-
-  if (!explicitAuthConfigured) {
-    if (subType == secTypeNone ||
-        subType == secTypeVncAuth ||
-        subType == secTypePlain)
-      return true;
-  }
-
-  return false;
+  // A client configured with Tight alone accepts the standard Tight schemes.
+  return security->GetEnabledExtSecTypes().empty() &&
+         (subType == secTypeNone || subType == secTypeVncAuth ||
+          subType == secTypePlain);
 }
 
 static void readCapability(rdr::InStream* is, TightCapability* cap)

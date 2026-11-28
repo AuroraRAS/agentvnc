@@ -38,6 +38,7 @@
 
 #include <rfb/msgTypes.h>
 #include <rfb/qemuTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/clipboardTypes.h>
 #include <rfb/fileTransferTypes.h>
 #include <rfb/TightCapability.h>
@@ -382,6 +383,80 @@ bool CMsgReader::readQEMUServerMessage()
   return true;
 }
 
+static uint16_t readEU16(rdr::InStream* is, bool bigEndian)
+{
+  uint8_t b0 = is->readU8();
+  uint8_t b1 = is->readU8();
+  if (bigEndian)
+    return ((uint16_t)b0 << 8) | (uint16_t)b1;
+  else
+    return ((uint16_t)b1 << 8) | (uint16_t)b0;
+}
+
+static uint32_t readEU32(rdr::InStream* is, bool bigEndian)
+{
+  uint8_t b0 = is->readU8();
+  uint8_t b1 = is->readU8();
+  uint8_t b2 = is->readU8();
+  uint8_t b3 = is->readU8();
+  if (bigEndian)
+    return ((uint32_t)b0 << 24) | ((uint32_t)b1 << 16) |
+           ((uint32_t)b2 << 8) | (uint32_t)b3;
+  else
+    return ((uint32_t)b3 << 24) | ((uint32_t)b2 << 16) |
+           ((uint32_t)b1 << 8) | (uint32_t)b0;
+}
+
+bool CMsgReader::readGIIServerMessage()
+{
+  uint8_t endianAndSubType;
+  bool bigEndian;
+  uint8_t subType;
+  uint16_t length;
+
+  if (!is->hasData(1 + 2))
+    return false;
+
+  is->setRestorePoint();
+
+  endianAndSubType = is->readU8();
+  bigEndian = (endianAndSubType & giiBigEndian) != 0;
+  subType = endianAndSubType & giiSubTypeMask;
+
+  length = readEU16(is, bigEndian);
+
+  if (!is->hasDataOrRestore(length))
+    return false;
+
+  is->clearRestorePoint();
+
+  switch (subType) {
+  case giiServerVersion:
+    if (length != 4)
+      throw protocol_error(_("Invalid GII version message"));
+    {
+      uint16_t maxVersion = readEU16(is, bigEndian);
+      uint16_t minVersion = readEU16(is, bigEndian);
+      handler->giiServerVersion(maxVersion, minVersion);
+    }
+    break;
+  case giiServerDeviceCreateResponse:
+    if (length != 4)
+      throw protocol_error(_("Invalid GII device creation response"));
+    {
+      uint32_t origin = readEU32(is, bigEndian);
+      handler->giiDeviceCreated(origin);
+    }
+    break;
+  default:
+    vlog.error(_("Unknown GII server submessage type %d"), (int)subType);
+    is->skip(length);
+    break;
+  }
+
+  return true;
+}
+
 bool CMsgReader::readMsg()
 {
   if (state == MSGSTATE_IDLE) {
@@ -434,6 +509,9 @@ bool CMsgReader::readMsg()
       break;
     case msgTypeQEMUServerMessage:
       ret = readQEMUServerMessage();
+      break;
+    case msgTypeGIIServerMessage:
+      ret = readGIIServerMessage();
       break;
     default:
       throw protocol_error(
@@ -1435,14 +1513,17 @@ bool CMsgReader::readTight2Message()
     }
 
     std::vector<FileEntry> entries;
-    if (block.size() >= 4) {
+    if (!block.empty()) {
+      if (block.size() < 4)
+        throw protocol_error(_("Truncated TightVNC file list"));
       uint32_t count = readBE32FromBuf(block.data());
       size_t off = 4;
-      if (count > 1000000)
-        throw protocol_error(_("Too many entries in TightVNC file list"));
+      constexpr size_t entryHeaderSize = 8 + 8 + 2 + 4;
+      if (count > (block.size() - off) / entryHeaderSize)
+        throw protocol_error(_("Truncated TightVNC file list"));
       entries.reserve(count);
       for (uint32_t i = 0; i < count; i++) {
-        if (off + 8 + 8 + 2 + 4 > block.size())
+        if (entryHeaderSize > block.size() - off)
           throw protocol_error(_("Truncated TightVNC file list entry"));
         FileEntry entry;
         entry.size = readBE64FromBuf(block.data() + off);

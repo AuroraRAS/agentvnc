@@ -96,6 +96,10 @@ core::BoolParameter
                  _("Enable scrcpy control channel for input and clipboard"),
                  true);
 core::BoolParameter
+  gii("GII",
+      _("Enable RFB General Input Interface (GII) extended input"),
+      true);
+core::BoolParameter
   stayAwake("StayAwake",
             _("Keep the Android device awake while connected"), false);
 core::BoolParameter
@@ -104,3 +108,10 @@ core::BoolParameter
 core::BoolParameter
   sendDeviceMeta("SendDeviceMeta",
                  _("Expect 64-byte device name header on video socket"), true);
+core::BoolParameter
+  fileTransfer("FileTransfer",
+               _("Enable TightVNC file transfer over ADB"), true);
+core::StringParameter
+  fileTransferRoot("FileTransferRoot",
+                   _("Optional Android root directory for TightVNC file transfer"),
+                   "");

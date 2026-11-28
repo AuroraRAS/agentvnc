@@ -104,11 +104,16 @@ namespace rfb {
     bool supportsFence() const;
     bool supportsContinuousUpdates() const;
     bool supportsExtendedMouseButtons() const;
+    bool supportsGII() const;
+
+    uint16_t giiVersion() const { return giiVersion_; }
+    void setGIIVersion(uint16_t version);
 
     int compressLevel;
     int qualityLevel;
     int fineQualityLevel;
     int subsampling;
+    bool tightEnabled;
 
   private:
 
@@ -124,6 +129,7 @@ namespace rfb {
     unsigned int ledState_;
     uint32_t clipFlags;
     uint32_t clipSizes[16];
+    uint16_t giiVersion_;
   };
 }
 #endif
