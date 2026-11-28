@@ -1577,6 +1577,12 @@ public:
     return nodes_.find(path) != nodes_.end();
   }
 
+  void addSymlink(const std::string& path, const std::string& target)
+  {
+    std::lock_guard<std::mutex> lk(mu_);
+    nodes_[path] = {false, true, false, target, {}, 1700000000LL};
+  }
+
 private:
   static void putLe32(uint8_t* p, uint32_t v)
   {
@@ -1977,7 +1983,24 @@ private:
     };
     std::string core = stripSuffix(cmd);
 
-    if (core.compare(0, 9, "mkdir -- ") == 0) {
+    if (core.compare(0, 15, "readlink -e -- ") == 0 ||
+        core.compare(0, 15, "readlink -f -- ") == 0) {
+      size_t next = 0;
+      std::string path = unquoteSingle(core, 15, &next);
+      std::lock_guard<std::mutex> lk(mu_);
+      for (const auto& node : nodes_) {
+        if (node.second.isSymlink &&
+            (path == node.first || path.compare(0, node.first.size() + 1,
+                                                node.first + "/") == 0)) {
+          path = node.second.linkTarget + path.substr(node.first.size());
+          break;
+        }
+      }
+      if (core[10] == 'e' && !nodes_.count(path))
+        rc = 1;
+      else
+        out = path + "\n";
+    } else if (core.compare(0, 9, "mkdir -- ") == 0) {
       size_t next = 0;
       std::string path = unquoteSingle(core, 9, &next);
       std::lock_guard<std::mutex> lk(mu_);
@@ -2004,9 +2027,9 @@ private:
             ++it;
         }
       }
-    } else if (core.compare(0, 6, "mv -- ") == 0) {
+    } else if (core.compare(0, 9, "mv -T -- ") == 0) {
       size_t next = 0;
-      std::string oldP = unquoteSingle(core, 6, &next);
+      std::string oldP = unquoteSingle(core, 9, &next);
       std::string newP = unquoteSingle(core, next + 1, &next);
       std::lock_guard<std::mutex> lk(mu_);
       auto it = nodes_.find(oldP);
@@ -2444,6 +2467,16 @@ TEST(AdbFileTransferTest, PathNormalizationAndConfinement)
     withEmbedNul, "", false, &dev, &virt, &err));
 }
 
+TEST(SSecurityTightTest, VeNCryptOnlyOffersLeafSecurityTypes)
+{
+  rfb::SecurityServer security;
+  std::list<uint32_t> types = {rfb::secTypeTight, rfb::secTypeVeNCrypt,
+                               rfb::secTypeTLSVnc, rfb::secTypeVncAuth};
+  security.SetSecTypes(types);
+  EXPECT_EQ(security.GetEnabledExtSecTypes(),
+            (std::list<uint32_t>{rfb::secTypeTLSVnc, rfb::secTypeVncAuth}));
+}
+
 TEST(AdbClientTest, SyncV1FallbackAndShellV1V2)
 {
   for (bool v2 : {true, false}) {
@@ -2471,6 +2504,43 @@ TEST(AdbClientTest, SyncV1FallbackAndShellV1V2)
 
     AdbShellResult res = adb.runShell("mock-dev", "echo hi", feat.shellV2);
     EXPECT_EQ(res.exitCode, 0);
+  }
+}
+
+TEST(AdbFileTransferTest, ResolvesDevicePathsWithinConfiguredRoot)
+{
+  using Kind = AdbFileTransferSession::Reply::Kind;
+  for (bool v2 : {true, false}) {
+    MockAdbFileDaemon mock(v2);
+    mock.addSymlink("/data/local/export", "/data/local/tmp");
+    mock.addSymlink("/data/local/tmp/alias.txt", "/data/local/tmp/hello.txt");
+    mock.addSymlink("/data/local/tmp/outside", "/system");
+    ASSERT_TRUE(mock.start());
+
+    AdbFileTransferSession session("127.0.0.1", mock.port(), "mock-dev",
+                                   "/data/local/export");
+    auto getReply = [&] {
+      struct pollfd pfd = {session.wakeupFd(), POLLIN, 0};
+      EXPECT_GT(::poll(&pfd, 1, 3000), 0);
+      auto replies = session.drainReplies();
+      EXPECT_EQ(replies.size(), 1u);
+      return replies.empty() ? AdbFileTransferSession::Reply{} : replies.front();
+    };
+
+    session.enqueueTight2FileList(0, "/");
+    EXPECT_EQ(getReply().kind, Kind::Tight2FileList);
+
+    session.enqueueTight2DownloadStart("/alias.txt", 0);
+    EXPECT_EQ(getReply().kind, Kind::Tight2DownloadStart);
+
+    session.enqueueTight2FileList(0, "/outside");
+    auto reply = getReply();
+    EXPECT_EQ(reply.kind, Kind::Tight2Failed);
+    EXPECT_EQ(reply.text, "Path is outside FileTransferRoot");
+
+    session.enqueueTight2Mkdir("/new");
+    EXPECT_EQ(getReply().kind, Kind::Tight2Mkdir);
+    EXPECT_TRUE(mock.hasPath("/data/local/tmp/new"));
   }
 }
 
@@ -2772,6 +2842,15 @@ TEST(ScrcpyVncEndToEndTest, Tight2AndTight13FileTransferWithH264)
     EXPECT_TRUE(ft.dlCompleteOk);
     EXPECT_EQ(std::string(ft.dlData.begin(), ft.dlData.end()), "Hello Android!");
 
+    ft.resetOp();
+    cli.fileTransferClient().startDownload("/data/local/tmp/hello.txt", 0);
+    cli.fileTransferClient().cancelDownload();
+    EXPECT_TRUE(cli.fileTransferClient().isBusy());
+    pumpUntil([&]() { return ft.cancelDone; });
+    EXPECT_FALSE(cli.fileTransferClient().isBusy());
+    EXPECT_TRUE(ft.dlData.empty());
+    EXPECT_FALSE(ft.dlComplete);
+
     // Tight 1.3 upload + Fence sync
     ft.resetOp();
     cli.fileTransferClient().startUpload("/data/local/tmp/t13.txt", true, 0);
@@ -3031,6 +3110,27 @@ void expectNoControlInput(int fd, int waitMs = 20)
 }
 
 } // namespace
+
+TEST(ScrcpyControlTest, DisconnectDuringGIIEventAllowsDeviceCleanup)
+{
+  int fds[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+  ScrcpyControl ctrl;
+  ctrl.attach(fds[0]);
+  rfb::GIIDevice device;
+  uint32_t origin = ctrl.createGIIDevice(device);
+  ASSERT_NE(origin, 0u);
+  ::close(fds[1]);
+
+  rfb::GIIEvent press;
+  press.origin = origin;
+  press.type = rfb::giiEventPtrButtonPress;
+  press.button = 1;
+  ctrl.handleGIIEvent(press, 100, 100);
+  EXPECT_EQ(ctrl.fd(), -1);
+  ctrl.destroyGIIDevice(origin, 100, 100);
+  EXPECT_EQ(ctrl.activeGIIDeviceCount(), 0u);
+}
 
 TEST(ScrcpyControlTest, GIIStylusMultiTouchButtonsWheelAndKeys)
 {
