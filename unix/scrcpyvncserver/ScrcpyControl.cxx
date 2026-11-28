@@ -23,7 +23,9 @@
 #include "ScrcpyControl.h"
 
 #include <algorithm>
+#include <cctype>
 #include <cerrno>
+#include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fcntl.h>
@@ -40,6 +42,7 @@
 #define XK_LATIN1
 #define XK_MISCELLANY
 #define XK_XKB_KEYS
+#include <rfb/giiTypes.h>
 #include <rfb/keysymdef.h>
 #include <rfb/XF86keysym.h>
 
@@ -104,6 +107,8 @@ enum AndroidMetaState : uint32_t {
 };
 
 static const uint64_t kPointerIdMouse = UINT64_C(-1);
+static const uint64_t kPointerIdGiiBase = UINT64_C(0x4749490000000000);
+static const size_t kMaxTotalGIIDevices = 256;
 static const size_t kMaxTextLength = 300;
 static const size_t kMaxClipboardLength = (1u << 18) - 14u;
 static const size_t kMaxDeviceMsgSize = (1u << 18);
@@ -304,6 +309,134 @@ uint32_t normalizeCombinedMeta(uint32_t m)
   return m;
 }
 
+std::string toLowerAscii(const std::string& s)
+{
+  std::string out(s);
+  for (size_t i = 0; i < out.size(); ++i)
+    out[i] = static_cast<char>(std::tolower(static_cast<unsigned char>(out[i])));
+  return out;
+}
+
+bool containsSubstr(const std::string& haystack, const char* needle)
+{
+  return haystack.find(needle) != std::string::npos;
+}
+
+bool isXValuatorName(const std::string& lowerLong, const std::string& lowerShort)
+{
+  return lowerLong == "x" || lowerLong == "abs x" || lowerLong == "rel x" ||
+         lowerLong == "abs_x" || lowerLong == "rel_x" ||
+         lowerLong == "abs mt position x" || lowerLong == "mt position x" ||
+         lowerShort == "x";
+}
+
+bool isYValuatorName(const std::string& lowerLong, const std::string& lowerShort)
+{
+  return lowerLong == "y" || lowerLong == "abs y" || lowerLong == "rel y" ||
+         lowerLong == "abs_y" || lowerLong == "rel_y" ||
+         lowerLong == "abs mt position y" || lowerLong == "mt position y" ||
+         lowerShort == "y";
+}
+
+bool isZValuatorName(const std::string& lowerLong, const std::string& lowerShort)
+{
+  return lowerLong == "z" || lowerLong == "abs z" || lowerLong == "rel z" ||
+         lowerLong == "abs_z" || lowerLong == "rel_z" ||
+         lowerShort == "z";
+}
+
+int scaleValuatorToScreen(int32_t value, int32_t rangeMin, int32_t rangeMax,
+                          int screenExtent)
+{
+  if (screenExtent <= 1)
+    return 0;
+
+  if (rangeMax > rangeMin) {
+    int32_t clamped = std::max(rangeMin, std::min(value, rangeMax));
+    double frac = (static_cast<double>(clamped) -
+                   static_cast<double>(rangeMin)) /
+                  (static_cast<double>(rangeMax) -
+                   static_cast<double>(rangeMin));
+    long long scaled = std::llround(frac * static_cast<double>(screenExtent - 1));
+    if (scaled < 0)
+      return 0;
+    if (scaled > screenExtent - 1)
+      return screenExtent - 1;
+    return static_cast<int>(scaled);
+  }
+
+  return std::max(0, std::min(static_cast<int>(value), screenExtent - 1));
+}
+
+float scaleValuatorToUnit(int32_t value, int32_t rangeMin, int32_t rangeMax)
+{
+  if (rangeMax > rangeMin) {
+    int32_t clamped = std::max(rangeMin, std::min(value, rangeMax));
+    double frac = (static_cast<double>(clamped) -
+                   static_cast<double>(rangeMin)) /
+                  (static_cast<double>(rangeMax) -
+                   static_cast<double>(rangeMin));
+    if (frac < 0.0)
+      frac = 0.0;
+    if (frac > 1.0)
+      frac = 1.0;
+    return static_cast<float>(frac);
+  }
+  return value > 0 ? 1.0f : 0.0f;
+}
+
+int clampScreenCoord(double coord, int screenExtent)
+{
+  if (screenExtent <= 1)
+    return 0;
+  long long rounded = std::llround(coord);
+  if (rounded < 0)
+    return 0;
+  if (rounded > screenExtent - 1)
+    return screenExtent - 1;
+  return static_cast<int>(rounded);
+}
+
+uint32_t mapGiiModifiersToAndroidMeta(uint32_t modifiers)
+{
+  uint32_t meta = 0;
+  if (modifiers & 0x01u)
+    meta |= kMetaShiftOn | kMetaShiftLeftOn;
+  if (modifiers & 0x02u)
+    meta |= kMetaCtrlOn | kMetaCtrlLeftOn;
+  if (modifiers & 0x04u)
+    meta |= kMetaAltOn | kMetaAltLeftOn;
+  if (modifiers & (0x08u | 0x10u))
+    meta |= kMetaMetaOn | kMetaMetaLeftOn;
+  return meta;
+}
+
+uint32_t mapGiiSymbolToKeysym(uint32_t symbol, uint32_t label)
+{
+  uint32_t sym = symbol ? symbol : label;
+  if (sym == 0)
+    return 0;
+
+  switch (sym) {
+  case 0x08: return XK_BackSpace;
+  case 0x09: return XK_Tab;
+  case 0x0A:
+  case 0x0D: return XK_Return;
+  case 0x1B: return XK_Escape;
+  case 0x7F: return XK_Delete;
+  default:   break;
+  }
+
+  if ((sym >= 0x0020 && sym <= 0x00ff) ||
+      mapKeysymToAndroidKeycode(sym, nullptr) != 0)
+    return sym;
+
+  if (sym <= 0x10ffffu)
+    return 0x01000000u | sym;
+
+  return 0;
+}
+
 } // namespace
 
 ScrcpyControl::ScrcpyControl()
@@ -316,7 +449,8 @@ ScrcpyControl::ScrcpyControl()
     lastY_(0),
     metaState_(0),
     supportsVideoReset_(true),
-    scrollRange_(16.0f)
+    scrollRange_(16.0f),
+    nextGiiOrigin_(1)
 {
 }
 
@@ -362,6 +496,7 @@ void ScrcpyControl::close()
   androidButtons_ = 0;
   lastVncMask_ = 0;
   metaState_ = 0;
+  giiDevices_.clear();
 }
 
 void ScrcpyControl::enqueue(const uint8_t* data, size_t len)
@@ -617,6 +752,28 @@ uint32_t ScrcpyControl::vncButtonsToAndroid(uint16_t mask) const
   return btns;
 }
 
+uint32_t ScrcpyControl::giiMouseButtons() const
+{
+  uint32_t btns = 0;
+  for (const auto& entry : giiDevices_)
+    btns |= entry.second.mouseButtons;
+  return btns;
+}
+
+uint32_t ScrcpyControl::combinedMouseButtons() const
+{
+  return androidButtons_ | giiMouseButtons();
+}
+
+bool ScrcpyControl::anyGiiTouchDown() const
+{
+  for (const auto& entry : giiDevices_) {
+    if (entry.second.touchDown)
+      return true;
+  }
+  return false;
+}
+
 void ScrcpyControl::handleVncPointer(int x, int y, uint16_t buttonMask,
                                      int screenW, int screenH)
 {
@@ -629,14 +786,20 @@ void ScrcpyControl::handleVncPointer(int x, int y, uint16_t buttonMask,
   uint16_t h = static_cast<uint16_t>(screenH);
 
   uint32_t newButtons = vncButtonsToAndroid(buttonMask);
+  uint32_t giiBtns = giiMouseButtons();
+  uint32_t effectiveButtons = newButtons | giiBtns;
   uint32_t pressed = newButtons & ~androidButtons_;
   uint32_t released = androidButtons_ & ~newButtons;
 
   if (pressed == 0 && released == 0) {
     if (clampedX != lastX_ || clampedY != lastY_) {
-      uint8_t action = newButtons ? kMotionActionMove : kMotionActionHoverMove;
-      sendTouchEvent(action, kPointerIdMouse, clampedX, clampedY, w, h,
-                     newButtons ? 1.0f : 0.0f, 0, newButtons);
+      if (effectiveButtons != 0) {
+        sendTouchEvent(kMotionActionMove, kPointerIdMouse, clampedX, clampedY, w, h,
+                       1.0f, 0, effectiveButtons);
+      } else if (!anyGiiTouchDown()) {
+        sendTouchEvent(kMotionActionHoverMove, kPointerIdMouse, clampedX, clampedY, w, h,
+                       0.0f, 0, 0);
+      }
     }
   } else {
     static const uint32_t kButtonOrder[] = {
@@ -646,17 +809,22 @@ void ScrcpyControl::handleVncPointer(int x, int y, uint16_t buttonMask,
       kAndroidButtonBack,
       kAndroidButtonForward,
     };
-    uint32_t cur = androidButtons_;
+    uint32_t cur = androidButtons_ | giiBtns;
     for (uint32_t bit : kButtonOrder) {
       if (pressed & bit) {
+        bool wasHeldByGii = (cur & bit) != 0;
         cur |= bit;
-        sendTouchEvent(kMotionActionDown, kPointerIdMouse,
-                       clampedX, clampedY, w, h, 1.0f, bit, cur);
+        if (!wasHeldByGii) {
+          sendTouchEvent(kMotionActionDown, kPointerIdMouse,
+                         clampedX, clampedY, w, h, 1.0f, bit, cur);
+        }
       }
       if (released & bit) {
-        cur &= ~bit;
-        sendTouchEvent(kMotionActionUp, kPointerIdMouse,
-                       clampedX, clampedY, w, h, 0.0f, bit, cur);
+        if (!(giiBtns & bit)) {
+          cur &= ~bit;
+          sendTouchEvent(kMotionActionUp, kPointerIdMouse,
+                         clampedX, clampedY, w, h, 0.0f, bit, cur);
+        }
       }
     }
     androidButtons_ = newButtons;
@@ -675,7 +843,7 @@ void ScrcpyControl::handleVncPointer(int x, int y, uint16_t buttonMask,
   if (wheelRising & 0x0040u)
     hscroll += 1.0f;
   if (vscroll != 0.0f || hscroll != 0.0f)
-    sendScrollEvent(clampedX, clampedY, w, h, hscroll, vscroll, newButtons);
+    sendScrollEvent(clampedX, clampedY, w, h, hscroll, vscroll, effectiveButtons);
 
   lastVncMask_ = buttonMask;
   lastX_ = clampedX;
@@ -685,6 +853,38 @@ void ScrcpyControl::handleVncPointer(int x, int y, uint16_t buttonMask,
 void ScrcpyControl::releasePointer(int screenW, int screenH)
 {
   handleVncPointer(lastX_, lastY_, 0, screenW, screenH);
+}
+
+void ScrcpyControl::injectKey(uint32_t keysym, bool down, uint32_t repeat,
+                              uint32_t extraMeta)
+{
+  bool shiftOverride = false;
+  uint32_t androidKey = mapKeysymToAndroidKeycode(keysym, &shiftOverride);
+  if (androidKey != 0) {
+    uint32_t meta = normalizeCombinedMeta(metaState_ | extraMeta);
+    if (shiftOverride)
+      meta |= kMetaShiftOn | kMetaShiftLeftOn;
+    sendKeycode(down ? kKeyActionDown : kKeyActionUp, androidKey, repeat, meta);
+    return;
+  }
+
+  if (!down)
+    return;
+
+  // Fallback to text injection for printable Latin-1 / Unicode keysyms
+  unsigned ucs4 = 0;
+  if (keysym >= 0x0020 && keysym <= 0x00ff) {
+    ucs4 = keysym;
+  } else if (keysym >= 0x01000000 && keysym <= 0x0110ffff) {
+    ucs4 = keysym - 0x01000000;
+  }
+
+  if (ucs4 != 0) {
+    char utf8[5];
+    size_t len = core::ucs4ToUTF8(ucs4, utf8);
+    if (len > 0)
+      sendText(std::string(utf8, len));
+  }
 }
 
 void ScrcpyControl::handleVncKey(uint32_t keysym, uint32_t /*keycode*/,
@@ -714,31 +914,515 @@ void ScrcpyControl::handleVncKey(uint32_t keysym, uint32_t /*keycode*/,
     metaState_ = normalizeCombinedMeta(metaState_);
   }
 
-  bool shiftOverride = false;
-  uint32_t androidKey = mapKeysymToAndroidKeycode(keysym, &shiftOverride);
-  if (androidKey != 0) {
-    uint32_t meta = metaState_;
-    if (shiftOverride)
-      meta |= kMetaShiftOn | kMetaShiftLeftOn;
-    sendKeycode(down ? kKeyActionDown : kKeyActionUp, androidKey, 0, meta);
+  injectKey(keysym, down, 0, 0);
+}
+
+uint32_t ScrcpyControl::createGIIDevice(const rfb::GIIDevice& device)
+{
+  if (fd_ < 0 || giiDevices_.size() >= kMaxTotalGIIDevices)
+    return 0;
+
+  while (nextGiiOrigin_ == 0 || giiDevices_.count(nextGiiOrigin_) != 0)
+    ++nextGiiOrigin_;
+  uint32_t origin = nextGiiOrigin_++;
+
+  GIIDeviceState state;
+  state.pointerId = kPointerIdGiiBase | static_cast<uint64_t>(origin);
+  state.canGenerate = device.canGenerate;
+  state.numButtons = device.numButtons;
+  state.valuators.resize(device.valuators.size());
+
+  for (size_t i = 0; i < device.valuators.size(); ++i) {
+    const rfb::GIIValuator& val = device.valuators[i];
+    GIIValuatorState& vs = state.valuators[i];
+    vs.rangeMin = val.rangeMin;
+    vs.rangeMax = val.rangeMax;
+
+    std::string lowerLong = toLowerAscii(val.longName);
+    std::string lowerShort = toLowerAscii(val.shortName);
+
+    if (isXValuatorName(lowerLong, lowerShort)) {
+      vs.role = GIIValuatorRole::X;
+      if (state.xValIdx == -1)
+        state.xValIdx = static_cast<int>(i);
+    } else if (isYValuatorName(lowerLong, lowerShort)) {
+      vs.role = GIIValuatorRole::Y;
+      if (state.yValIdx == -1)
+        state.yValIdx = static_cast<int>(i);
+    } else if (val.siUnit == rfb::giiUnitPressure ||
+               val.siUnit == rfb::giiUnitForce ||
+               containsSubstr(lowerLong, "pressure") ||
+               lowerShort == "prs") {
+      vs.role = GIIValuatorRole::Pressure;
+      if (state.pressureValIdx == -1)
+        state.pressureValIdx = static_cast<int>(i);
+    } else if (containsSubstr(lowerLong, "tilt x") ||
+               containsSubstr(lowerLong, "tilt_x") ||
+               lowerShort == "tltx") {
+      vs.role = GIIValuatorRole::TiltX;
+    } else if (containsSubstr(lowerLong, "tilt y") ||
+               containsSubstr(lowerLong, "tilt_y") ||
+               lowerShort == "tlty") {
+      vs.role = GIIValuatorRole::TiltY;
+    } else if ((containsSubstr(lowerLong, "horiz") &&
+                (containsSubstr(lowerLong, "wheel") ||
+                 containsSubstr(lowerLong, "scroll"))) ||
+               containsSubstr(lowerLong, "hwheel") ||
+               containsSubstr(lowerLong, "hscroll")) {
+      vs.role = GIIValuatorRole::WheelH;
+    } else if (containsSubstr(lowerLong, "wheel") ||
+               containsSubstr(lowerLong, "scroll") ||
+               lowerShort == "whl") {
+      vs.role = GIIValuatorRole::WheelV;
+    } else if (isZValuatorName(lowerLong, lowerShort)) {
+      vs.role = GIIValuatorRole::Z;
+    }
+  }
+
+  if (state.xValIdx == -1 && state.yValIdx == -1 &&
+      device.valuators.size() >= 2 &&
+      state.valuators[0].role == GIIValuatorRole::Unknown &&
+      state.valuators[1].role == GIIValuatorRole::Unknown &&
+      device.valuators[0].longName.empty() &&
+      device.valuators[0].shortName.empty() &&
+      device.valuators[1].longName.empty() &&
+      device.valuators[1].shortName.empty()) {
+    state.valuators[0].role = GIIValuatorRole::X;
+    state.valuators[1].role = GIIValuatorRole::Y;
+    state.xValIdx = 0;
+    state.yValIdx = 1;
+  }
+
+  giiDevices_.emplace(origin, std::move(state));
+  return origin;
+}
+
+void ScrcpyControl::destroyGIIDevice(uint32_t origin, int screenW, int screenH)
+{
+  auto it = giiDevices_.find(origin);
+  if (it == giiDevices_.end())
+    return;
+
+  GIIDeviceState dev = std::move(it->second);
+  giiDevices_.erase(it);
+
+  if (fd_ < 0)
+    return;
+
+  if (screenW > 0 && screenH > 0) {
+    int x = dev.hasPosition ? clampScreenCoord(dev.posX, screenW)
+                            : std::max(0, std::min(screenW / 2, screenW - 1));
+    int y = dev.hasPosition ? clampScreenCoord(dev.posY, screenH)
+                            : std::max(0, std::min(screenH / 2, screenH - 1));
+    uint16_t w = static_cast<uint16_t>(screenW);
+    uint16_t h = static_cast<uint16_t>(screenH);
+
+    if (dev.touchDown) {
+      sendTouchEvent(kMotionActionUp, dev.pointerId, x, y, w, h,
+                     0.0f, kAndroidButtonPrimary, 0);
+    }
+
+    if (dev.mouseButtons != 0) {
+      static const uint32_t kMouseButtonOrder[] = {
+        kAndroidButtonSecondary,
+        kAndroidButtonTertiary,
+        kAndroidButtonBack,
+        kAndroidButtonForward,
+      };
+      for (uint32_t bit : kMouseButtonOrder) {
+        if (dev.mouseButtons & bit) {
+          dev.mouseButtons &= ~bit;
+          uint32_t rem = dev.mouseButtons | combinedMouseButtons();
+          if (!(rem & bit)) {
+            sendTouchEvent(kMotionActionUp, kPointerIdMouse, x, y, w, h,
+                           0.0f, bit, rem);
+            lastX_ = x;
+            lastY_ = y;
+          }
+        }
+      }
+    }
+  }
+
+  for (const auto& key : dev.pressedKeys)
+    injectKey(key.second, false, 0, 0);
+}
+
+void ScrcpyControl::emitGIIMotion(GIIDeviceState& dev, int x, int y,
+                                  uint16_t w, uint16_t h,
+                                  bool posChanged, bool /*pressureChanged*/)
+{
+  if (dev.touchDown) {
+    float p = (dev.pressureValIdx >= 0 && dev.hasPressureSample)
+              ? dev.pressure : 1.0f;
+    if (x != dev.lastSentX || y != dev.lastSentY ||
+        floatToU16Fp(p) != floatToU16Fp(dev.lastSentPressure)) {
+      sendTouchEvent(kMotionActionMove, dev.pointerId, x, y, w, h,
+                     p, 0, kAndroidButtonPrimary | dev.mouseButtons);
+      dev.lastSentX = x;
+      dev.lastSentY = y;
+      dev.lastSentPressure = p;
+    }
+  } else if (dev.mouseButtons != 0) {
+    if (posChanged && (x != lastX_ || y != lastY_)) {
+      sendTouchEvent(kMotionActionMove, kPointerIdMouse, x, y, w, h,
+                     1.0f, 0, combinedMouseButtons());
+      lastX_ = x;
+      lastY_ = y;
+    }
+  } else if (posChanged && combinedMouseButtons() == 0 && !anyGiiTouchDown()) {
+    if (!dev.hasHoverSent || x != dev.lastSentX || y != dev.lastSentY) {
+      sendTouchEvent(kMotionActionHoverMove, kPointerIdMouse, x, y, w, h,
+                     0.0f, 0, 0);
+      dev.lastSentX = x;
+      dev.lastSentY = y;
+      dev.hasHoverSent = true;
+      lastX_ = x;
+      lastY_ = y;
+    }
+  }
+}
+
+void ScrcpyControl::handleGIIKeyEvent(GIIDeviceState& dev,
+                                      const rfb::GIIEvent& event)
+{
+  uint32_t keysym = mapGiiSymbolToKeysym(event.symbol, event.label);
+  uint32_t extraMeta = mapGiiModifiersToAndroidMeta(event.modifiers);
+  auto lookup = std::make_pair(event.button != 0,
+                               event.button ? event.button : keysym);
+
+  if (event.type == rfb::giiEventKeyPress) {
+    if (keysym == 0 || dev.pressedKeys.count(lookup) != 0 ||
+        dev.pressedKeys.size() >= 256)
+      return;
+    dev.pressedKeys.emplace(lookup, keysym);
+    injectKey(keysym, true, 0, extraMeta);
+  } else if (event.type == rfb::giiEventKeyRepeat) {
+    auto it = dev.pressedKeys.find(lookup);
+    uint32_t useSym = (it != dev.pressedKeys.end()) ? it->second : keysym;
+    if (useSym != 0)
+      injectKey(useSym, true, 1, extraMeta);
+  } else if (event.type == rfb::giiEventKeyRelease) {
+    auto it = dev.pressedKeys.find(lookup);
+    if (it == dev.pressedKeys.end())
+      return;
+    uint32_t useSym = it->second;
+    dev.pressedKeys.erase(it);
+    injectKey(useSym, false, 0, extraMeta);
+  }
+}
+
+void ScrcpyControl::handleGIIButtonEvent(GIIDeviceState& dev,
+                                         const rfb::GIIEvent& event,
+                                         int screenW, int screenH)
+{
+  if (!dev.hasPosition) {
+    dev.posX = std::max(0, std::min(screenW / 2, screenW - 1));
+    dev.posY = std::max(0, std::min(screenH / 2, screenH - 1));
+    dev.hasPosition = true;
+  }
+
+  int x = clampScreenCoord(dev.posX, screenW);
+  int y = clampScreenCoord(dev.posY, screenH);
+  uint16_t w = static_cast<uint16_t>(screenW);
+  uint16_t h = static_cast<uint16_t>(screenH);
+  bool press = (event.type == rfb::giiEventPtrButtonPress);
+
+  if (event.button == 1) {
+    if (press) {
+      if (!dev.touchDown) {
+        dev.touchDown = true;
+        float p = (dev.pressureValIdx >= 0 && dev.hasPressureSample &&
+                   dev.pressure > 0.0f)
+                  ? dev.pressure : 1.0f;
+        sendTouchEvent(kMotionActionDown, dev.pointerId, x, y, w, h, p,
+                       kAndroidButtonPrimary,
+                       kAndroidButtonPrimary | dev.mouseButtons);
+        dev.lastSentX = x;
+        dev.lastSentY = y;
+        dev.lastSentPressure = p;
+      }
+    } else {
+      if (dev.touchDown) {
+        dev.touchDown = false;
+        sendTouchEvent(kMotionActionUp, dev.pointerId, x, y, w, h, 0.0f,
+                       kAndroidButtonPrimary, dev.mouseButtons);
+        dev.lastSentX = x;
+        dev.lastSentY = y;
+        dev.lastSentPressure = 0.0f;
+      }
+    }
     return;
   }
 
-  if (!down)
-    return;
-
-  // Fallback to text injection for printable Latin-1 / Unicode keysyms
-  unsigned ucs4 = 0;
-  if (keysym >= 0x0020 && keysym <= 0x00ff) {
-    ucs4 = keysym;
-  } else if (keysym >= 0x01000000 && keysym <= 0x0110ffff) {
-    ucs4 = keysym - 0x01000000;
+  uint32_t bit = 0;
+  switch (event.button) {
+  case 2: bit = kAndroidButtonSecondary; break;
+  case 3: bit = kAndroidButtonTertiary; break;
+  case 8: bit = kAndroidButtonBack; break;
+  case 9: bit = kAndroidButtonForward; break;
+  default: break;
   }
 
-  if (ucs4 != 0) {
-    char utf8[5];
-    size_t len = core::ucs4ToUTF8(ucs4, utf8);
-    if (len > 0)
-      sendText(std::string(utf8, len));
+  if (bit != 0) {
+    if (press) {
+      if (!(dev.mouseButtons & bit)) {
+        bool wasHeld = (combinedMouseButtons() & bit) != 0;
+        dev.mouseButtons |= bit;
+        if (!wasHeld) {
+          sendTouchEvent(kMotionActionDown, kPointerIdMouse, x, y, w, h,
+                         1.0f, bit, combinedMouseButtons());
+          lastX_ = x;
+          lastY_ = y;
+        }
+      }
+    } else {
+      if (dev.mouseButtons & bit) {
+        dev.mouseButtons &= ~bit;
+        uint32_t rem = combinedMouseButtons();
+        if (!(rem & bit)) {
+          sendTouchEvent(kMotionActionUp, kPointerIdMouse, x, y, w, h,
+                         0.0f, bit, rem);
+          lastX_ = x;
+          lastY_ = y;
+        }
+      }
+    }
+    return;
+  }
+
+  if (press && event.button >= 4 && event.button <= 7) {
+    float vscroll = 0.0f;
+    float hscroll = 0.0f;
+    if (event.button == 4)
+      vscroll = 1.0f;
+    else if (event.button == 5)
+      vscroll = -1.0f;
+    else if (event.button == 6)
+      hscroll = -1.0f;
+    else if (event.button == 7)
+      hscroll = 1.0f;
+    sendScrollEvent(x, y, w, h, hscroll, vscroll, combinedMouseButtons());
+  }
+}
+
+void ScrcpyControl::handleGIIValuatorEvent(GIIDeviceState& dev,
+                                           const rfb::GIIEvent& event,
+                                           int screenW, int screenH)
+{
+  if (event.values.empty() || event.first >= dev.valuators.size() ||
+      event.values.size() > dev.valuators.size() - event.first)
+    return;
+
+  bool isAbsolute = (event.type == rfb::giiEventValuatorAbsolute);
+  if (!isAbsolute && !dev.hasPosition) {
+    dev.posX = std::max(0, std::min(screenW / 2, screenW - 1));
+    dev.posY = std::max(0, std::min(screenH / 2, screenH - 1));
+    dev.hasPosition = true;
+  }
+
+  bool posChanged = false;
+  bool pressureChanged = false;
+  float hscroll = 0.0f;
+  float vscroll = 0.0f;
+
+  for (size_t i = 0; i < event.values.size(); ++i) {
+    GIIValuatorState& vs = dev.valuators[static_cast<size_t>(event.first) + i];
+    int32_t val = event.values[i];
+
+    switch (vs.role) {
+    case GIIValuatorRole::X:
+      if (isAbsolute) {
+        dev.posX = scaleValuatorToScreen(val, vs.rangeMin, vs.rangeMax, screenW);
+        dev.hasPosition = true;
+      } else {
+        dev.posX = std::max(0.0,
+                            std::min(dev.posX + static_cast<double>(val),
+                                     static_cast<double>(screenW - 1)));
+      }
+      posChanged = true;
+      break;
+
+    case GIIValuatorRole::Y:
+      if (isAbsolute) {
+        dev.posY = scaleValuatorToScreen(val, vs.rangeMin, vs.rangeMax, screenH);
+        dev.hasPosition = true;
+      } else {
+        dev.posY = std::max(0.0,
+                            std::min(dev.posY + static_cast<double>(val),
+                                     static_cast<double>(screenH - 1)));
+      }
+      posChanged = true;
+      break;
+
+    case GIIValuatorRole::Pressure:
+      if (isAbsolute) {
+        dev.pressure = scaleValuatorToUnit(val, vs.rangeMin, vs.rangeMax);
+      } else if (vs.rangeMax > vs.rangeMin) {
+        double delta = static_cast<double>(val) /
+                       (static_cast<double>(vs.rangeMax) -
+                        static_cast<double>(vs.rangeMin));
+        dev.pressure = std::max(0.0f,
+                                std::min(1.0f,
+                                         dev.pressure + static_cast<float>(delta)));
+      }
+      dev.hasPressureSample = true;
+      pressureChanged = true;
+      break;
+
+    case GIIValuatorRole::WheelV:
+      if (isAbsolute) {
+        if (vs.hasPrev)
+          vscroll += static_cast<float>(static_cast<int64_t>(val) -
+                                        static_cast<int64_t>(vs.prevValue));
+      } else {
+        vscroll += static_cast<float>(val);
+      }
+      break;
+
+    case GIIValuatorRole::WheelH:
+      if (isAbsolute) {
+        if (vs.hasPrev)
+          hscroll += static_cast<float>(static_cast<int64_t>(val) -
+                                        static_cast<int64_t>(vs.prevValue));
+      } else {
+        hscroll += static_cast<float>(val);
+      }
+      break;
+
+    default:
+      break;
+    }
+
+    vs.prevValue = val;
+    vs.hasPrev = true;
+  }
+
+  if (!dev.hasPosition) {
+    dev.posX = std::max(0, std::min(screenW / 2, screenW - 1));
+    dev.posY = std::max(0, std::min(screenH / 2, screenH - 1));
+    dev.hasPosition = true;
+  }
+
+  int x = clampScreenCoord(dev.posX, screenW);
+  int y = clampScreenCoord(dev.posY, screenH);
+  uint16_t w = static_cast<uint16_t>(screenW);
+  uint16_t h = static_cast<uint16_t>(screenH);
+
+  bool buttonlessPressure =
+    (dev.pressureValIdx >= 0) &&
+    ((dev.numButtons == 0) ||
+     !(dev.canGenerate & rfb::giiEventMaskPtrButtonPress));
+
+  if (buttonlessPressure && pressureChanged) {
+    if (!dev.touchDown && dev.pressure > 0.0f) {
+      dev.touchDown = true;
+      sendTouchEvent(kMotionActionDown, dev.pointerId, x, y, w, h,
+                     dev.pressure, kAndroidButtonPrimary,
+                     kAndroidButtonPrimary | dev.mouseButtons);
+      dev.lastSentX = x;
+      dev.lastSentY = y;
+      dev.lastSentPressure = dev.pressure;
+    } else if (dev.touchDown && dev.pressure <= 0.0f) {
+      dev.touchDown = false;
+      sendTouchEvent(kMotionActionUp, dev.pointerId, x, y, w, h, 0.0f,
+                     kAndroidButtonPrimary, dev.mouseButtons);
+      dev.lastSentX = x;
+      dev.lastSentY = y;
+      dev.lastSentPressure = 0.0f;
+    } else {
+      emitGIIMotion(dev, x, y, w, h, posChanged, pressureChanged);
+    }
+  } else {
+    emitGIIMotion(dev, x, y, w, h, posChanged, pressureChanged);
+  }
+
+  if (hscroll != 0.0f || vscroll != 0.0f)
+    sendScrollEvent(x, y, w, h, hscroll, vscroll, combinedMouseButtons());
+}
+
+void ScrcpyControl::handleGIIPtrMoveEvent(GIIDeviceState& dev,
+                                          const rfb::GIIEvent& event,
+                                          int screenW, int screenH)
+{
+  if (event.type == rfb::giiEventPtrAbsolute) {
+    dev.posX = std::max(0.0,
+                        std::min(static_cast<double>(event.x),
+                                 static_cast<double>(screenW - 1)));
+    dev.posY = std::max(0.0,
+                        std::min(static_cast<double>(event.y),
+                                 static_cast<double>(screenH - 1)));
+    dev.hasPosition = true;
+  } else {
+    if (!dev.hasPosition) {
+      dev.posX = std::max(0, std::min(screenW / 2, screenW - 1));
+      dev.posY = std::max(0, std::min(screenH / 2, screenH - 1));
+      dev.hasPosition = true;
+    }
+    dev.posX = std::max(0.0,
+                        std::min(dev.posX + static_cast<double>(event.x),
+                                 static_cast<double>(screenW - 1)));
+    dev.posY = std::max(0.0,
+                        std::min(dev.posY + static_cast<double>(event.y),
+                                 static_cast<double>(screenH - 1)));
+  }
+
+  int x = clampScreenCoord(dev.posX, screenW);
+  int y = clampScreenCoord(dev.posY, screenH);
+  uint16_t w = static_cast<uint16_t>(screenW);
+  uint16_t h = static_cast<uint16_t>(screenH);
+
+  emitGIIMotion(dev, x, y, w, h, true, false);
+
+  if (event.type == rfb::giiEventPtrRelative) {
+    if (event.wheel != 0)
+      sendScrollEvent(x, y, w, h, 0.0f, static_cast<float>(event.wheel),
+                      combinedMouseButtons());
+  } else {
+    if (dev.hasPtrWheel && event.wheel != dev.lastPtrWheel) {
+      float delta = static_cast<float>(static_cast<int64_t>(event.wheel) -
+                                       static_cast<int64_t>(dev.lastPtrWheel));
+      sendScrollEvent(x, y, w, h, 0.0f, delta, combinedMouseButtons());
+    }
+    dev.lastPtrWheel = event.wheel;
+    dev.hasPtrWheel = true;
+  }
+}
+
+void ScrcpyControl::handleGIIEvent(const rfb::GIIEvent& event,
+                                   int screenW, int screenH)
+{
+  if (fd_ < 0)
+    return;
+
+  auto it = giiDevices_.find(event.origin);
+  if (it == giiDevices_.end())
+    return;
+
+  GIIDeviceState& dev = it->second;
+
+  if (rfb::giiIsKeyEvent(event.type)) {
+    handleGIIKeyEvent(dev, event);
+    return;
+  }
+
+  if (screenW <= 0 || screenH <= 0)
+    return;
+
+  switch (event.type) {
+  case rfb::giiEventPtrButtonPress:
+  case rfb::giiEventPtrButtonRelease:
+    handleGIIButtonEvent(dev, event, screenW, screenH);
+    break;
+  case rfb::giiEventValuatorRelative:
+  case rfb::giiEventValuatorAbsolute:
+    handleGIIValuatorEvent(dev, event, screenW, screenH);
+    break;
+  case rfb::giiEventPtrRelative:
+  case rfb::giiEventPtrAbsolute:
+    handleGIIPtrMoveEvent(dev, event, screenW, screenH);
+    break;
+  default:
+    break;
   }
 }

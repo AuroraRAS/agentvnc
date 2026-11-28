@@ -43,6 +43,7 @@ extern core::IntParameter maxFps;
 extern core::IntParameter iFrameInterval;
 extern core::StringParameter videoEncoder;
 extern core::BoolParameter controlEnabled;
+extern core::BoolParameter gii;
 extern core::BoolParameter stayAwake;
 extern core::BoolParameter sendDummyByte;
 extern core::BoolParameter sendDeviceMeta;

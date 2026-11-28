@@ -44,6 +44,7 @@
 #include <network/Socket.h>
 #include <rdr/FdOutStream.h>
 #include <rfb/ServerCore.h>
+#include <rfb/giiTypes.h>
 
 static core::LogWriter vlog("ScrcpyServer");
 static core::LogWriter connectionsLog("Connections");
@@ -630,6 +631,46 @@ void ScrcpyServer::clientClipboardData(ScrcpyClient* client, const char* data)
   if (rfb::Server::maxIdleTime)
     idleTimer_.start(core::secsToMillis(rfb::Server::maxIdleTime));
   control_.sendSetClipboard(clipboardSeq_++, data, false);
+}
+
+bool ScrcpyServer::supportsGII() const
+{
+  return static_cast<bool>(::gii) && (control_.fd() >= 0);
+}
+
+uint32_t ScrcpyServer::clientGIIDeviceCreate(ScrcpyClient* /*client*/,
+                                             const rfb::GIIDevice& device)
+{
+  if (!supportsGII())
+    return 0;
+
+  return control_.createGIIDevice(device);
+}
+
+void ScrcpyServer::clientGIIDeviceDestroy(ScrcpyClient* /*client*/,
+                                          uint32_t deviceOrigin)
+{
+  control_.destroyGIIDevice(deviceOrigin, width(), height());
+}
+
+void ScrcpyServer::clientGIIEvent(ScrcpyClient* /*client*/,
+                                  const rfb::GIIEvent& event)
+{
+  if (!supportsGII())
+    return;
+
+  if (rfb::giiIsKeyEvent(event.type)) {
+    if (!rfb::Server::acceptKeyEvents)
+      return;
+  } else if (rfb::giiIsPointerEvent(event.type)) {
+    if (!rfb::Server::acceptPointerEvents)
+      return;
+  } else {
+    return;
+  }
+
+  noteClientActivity();
+  control_.handleGIIEvent(event, width(), height());
 }
 
 void ScrcpyServer::onResize(int newWidth, int newHeight)

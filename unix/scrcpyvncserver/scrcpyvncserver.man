@@ -31,6 +31,14 @@ Transfer extensions, performing directory listing, download, upload, resume,
 MD5 checksum, directory size, mkdir, rename, and remove operations on the
 connected Android device over ADB. Viewers such as \fBvncviewer \-FtpServer\fP
 automatically negotiate Tight capability exchange when connecting.
+.PP
+When \fB\-GII\fP is enabled (the default) and \fB\-Control\fP is active,
+\fBscrcpyvncserver\fP negotiates the RFB General Input Interface (GII)
+extension (\-305, message type 253, version 1) with supporting viewers such
+as \fBvncviewer \-GII\fP, bridging virtual extended input devices (styluses,
+drawing tablets, multi-touch pointers, scroll wheels, buttons, and keys)
+over the scrcpy control channel with scaled coordinates, continuous pressure,
+and automatic disconnect cleanup.
 .SH OPTIONS
 Parameters can be specified as \fB\-\fIParam\fR, \fB\-\fIParam\fP=0\fR,
 or \fB\-\fIParam\fP=\fIvalue\fR. Run \fBscrcpyvncserver \-h\fP for the full
@@ -61,6 +69,10 @@ Enable or disable TightVNC File Transfer over ADB (enabled by default).
 .BI \-FileTransferRoot " path"
 Confine TightVNC File Transfer operations to the specified directory on the
 Android device (empty exposes the full device filesystem).
+.TP
+.BI \-GII " [0|1]"
+Enable or disable RFB General Input Interface (GII) extended input
+devices (enabled by default).
 .SH SEE ALSO
 .BR vncviewer (1),
 .BR x0vncserver (1),

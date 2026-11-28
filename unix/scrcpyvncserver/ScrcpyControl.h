@@ -22,8 +22,15 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#include <map>
 #include <string>
+#include <utility>
 #include <vector>
+
+namespace rfb {
+  struct GIIDevice;
+  struct GIIEvent;
+}
 
 class ScrcpyControl {
 public:
@@ -63,10 +70,91 @@ public:
   void releasePointer(int screenW, int screenH);
   void handleVncKey(uint32_t keysym, uint32_t keycode, bool down);
 
+  // RFB GII (General Input Interface) device lifecycle & event translation
+  uint32_t createGIIDevice(const rfb::GIIDevice& device);
+  void destroyGIIDevice(uint32_t origin, int screenW, int screenH);
+  void handleGIIEvent(const rfb::GIIEvent& event, int screenW, int screenH);
+  size_t activeGIIDeviceCount() const { return giiDevices_.size(); }
+
 private:
+  enum class GIIValuatorRole {
+    Unknown,
+    X,
+    Y,
+    Pressure,
+    WheelV,
+    WheelH,
+    TiltX,
+    TiltY,
+    Z,
+  };
+
+  struct GIIValuatorState {
+    GIIValuatorState()
+      : role(GIIValuatorRole::Unknown), rangeMin(0), rangeMax(0),
+        hasPrev(false), prevValue(0)
+    {}
+
+    GIIValuatorRole role;
+    int32_t rangeMin;
+    int32_t rangeMax;
+    bool hasPrev;
+    int32_t prevValue;
+  };
+
+  struct GIIDeviceState {
+    GIIDeviceState()
+      : pointerId(0), canGenerate(0), numButtons(0),
+        xValIdx(-1), yValIdx(-1), pressureValIdx(-1),
+        posX(0.0), posY(0.0), hasPosition(false),
+        pressure(0.0f), hasPressureSample(false),
+        touchDown(false), mouseButtons(0),
+        lastSentX(0), lastSentY(0), lastSentPressure(0.0f),
+        hasHoverSent(false),
+        hasPtrWheel(false), lastPtrWheel(0)
+    {}
+
+    uint64_t pointerId;
+    uint32_t canGenerate;
+    uint32_t numButtons;
+    std::vector<GIIValuatorState> valuators;
+    int xValIdx;
+    int yValIdx;
+    int pressureValIdx;
+    double posX;
+    double posY;
+    bool hasPosition;
+    float pressure;
+    bool hasPressureSample;
+    bool touchDown;
+    uint32_t mouseButtons;
+    int lastSentX;
+    int lastSentY;
+    float lastSentPressure;
+    bool hasHoverSent;
+    bool hasPtrWheel;
+    int32_t lastPtrWheel;
+    std::map<std::pair<bool, uint32_t>, uint32_t> pressedKeys;
+  };
+
   void enqueue(const uint8_t* data, size_t len);
   bool processDeviceMessages(Callbacks& cb);
   uint32_t vncButtonsToAndroid(uint16_t mask) const;
+  uint32_t giiMouseButtons() const;
+  uint32_t combinedMouseButtons() const;
+  bool anyGiiTouchDown() const;
+  void injectKey(uint32_t keysym, bool down, uint32_t repeat,
+                 uint32_t extraMeta);
+  void emitGIIMotion(GIIDeviceState& dev, int x, int y,
+                     uint16_t w, uint16_t h,
+                     bool posChanged, bool pressureChanged);
+  void handleGIIKeyEvent(GIIDeviceState& dev, const rfb::GIIEvent& event);
+  void handleGIIButtonEvent(GIIDeviceState& dev, const rfb::GIIEvent& event,
+                            int screenW, int screenH);
+  void handleGIIValuatorEvent(GIIDeviceState& dev, const rfb::GIIEvent& event,
+                              int screenW, int screenH);
+  void handleGIIPtrMoveEvent(GIIDeviceState& dev, const rfb::GIIEvent& event,
+                             int screenW, int screenH);
 
   ScrcpyControl(const ScrcpyControl&) = delete;
   ScrcpyControl& operator=(const ScrcpyControl&) = delete;
@@ -84,6 +172,9 @@ private:
   uint32_t metaState_;
   bool supportsVideoReset_;
   float scrollRange_;
+
+  std::map<uint32_t, GIIDeviceState> giiDevices_;
+  uint32_t nextGiiOrigin_;
 };
 
 #endif // __SCRCPYVNCSERVER_SCRCPYCONTROL_H__

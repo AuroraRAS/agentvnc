@@ -40,6 +40,11 @@ namespace network {
   class SocketListener;
 }
 
+namespace rfb {
+  struct GIIDevice;
+  struct GIIEvent;
+}
+
 class ScrcpyClient;
 
 class ScrcpyServer : public ScrcpyStream::Callbacks,
@@ -95,6 +100,12 @@ public:
   void clientClipboardRequest(ScrcpyClient* client);
   void clientClipboardAnnounce(ScrcpyClient* client, bool available);
   void clientClipboardData(ScrcpyClient* client, const char* data);
+  bool supportsGII() const;
+  uint32_t clientGIIDeviceCreate(ScrcpyClient* client,
+                                 const rfb::GIIDevice& device);
+  void clientGIIDeviceDestroy(ScrcpyClient* client, uint32_t deviceOrigin);
+  void clientGIIEvent(ScrcpyClient* client, const rfb::GIIEvent& event);
+  size_t activeGIIDeviceCount() const { return control_.activeGIIDeviceCount(); }
 
   // ScrcpyStream::Callbacks
   void onResize(int width, int height) override;

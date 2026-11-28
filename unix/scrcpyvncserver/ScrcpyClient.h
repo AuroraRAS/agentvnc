@@ -85,6 +85,11 @@ protected:
   void handleClipboardRequest() override;
   void handleClipboardAnnounce(bool available) override;
   void handleClipboardData(const char* data) override;
+  void supportsGII() override;
+  void giiVersion(uint16_t version) override;
+  void giiDeviceCreate(const rfb::GIIDevice& device) override;
+  void giiDeviceDestroy(uint32_t deviceOrigin) override;
+  void giiEvent(const rfb::GIIEvent& event) override;
 
   void getTightCapabilities(std::vector<rfb::TightCapability>* serverMsgs,
                             std::vector<rfb::TightCapability>* clientMsgs,
@@ -128,7 +133,14 @@ private:
   bool fileTransferEnabled() const;
   bool ensureFileTransferReady(bool isTight13, uint8_t tight13Flags = 0,
                                bool isDownload = false, bool isUpload = false);
+  void destroyAllGIIDevices();
   void noteActivity();
+
+  struct GIIDeviceLimits {
+    uint32_t eventMask;
+    uint32_t buttons;
+    size_t valuators;
+  };
 
   ScrcpyServer* server_;
   ZeroCopyOutStream zeroCopyOs_;
@@ -143,7 +155,9 @@ private:
   bool needsKeyFrame_;
   bool needsReset_;
   bool needsResetAll_;
+  bool giiVersionSent_;
   std::map<std::pair<bool, uint32_t>, uint32_t> pressedKeys_;
+  std::map<uint32_t, GIIDeviceLimits> giiDevices_;
 
   core::Timer idleTimer_;
   std::string closeReason_;

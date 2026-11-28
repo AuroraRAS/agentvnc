@@ -96,6 +96,10 @@ core::BoolParameter
                  _("Enable scrcpy control channel for input and clipboard"),
                  true);
 core::BoolParameter
+  gii("GII",
+      _("Enable RFB General Input Interface (GII) extended input"),
+      true);
+core::BoolParameter
   stayAwake("StayAwake",
             _("Keep the Android device awake while connected"), false);
 core::BoolParameter

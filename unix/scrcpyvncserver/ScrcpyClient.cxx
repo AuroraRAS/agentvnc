@@ -45,6 +45,7 @@
 #include <rfb/encodings.h>
 #include <rfb/fenceTypes.h>
 #include <rfb/fileTransferTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/msgTypes.h>
 #include <rfb/screenTypes.h>
 
@@ -92,6 +93,7 @@ ScrcpyClient::ScrcpyClient(ScrcpyServer* server, network::Socket* s,
     needsKeyFrame_(true),
     needsReset_(true),
     needsResetAll_(false),
+    giiVersionSent_(false),
     idleTimer_(&idleCb_),
     idleCb_(this)
 {
@@ -119,6 +121,7 @@ ScrcpyClient::ScrcpyClient(ScrcpyServer* server, network::Socket* s,
 
 ScrcpyClient::~ScrcpyClient()
 {
+  destroyAllGIIDevices();
   if (ftSession_)
     ftSession_->stop();
   if (!closeReason_.empty()) {
@@ -156,6 +159,7 @@ void ScrcpyClient::close(const char* reason)
   for (const auto& key : pressedKeys_)
     server_->clientKeyEvent(key.second, 0, false);
   pressedKeys_.clear();
+  destroyAllGIIDevices();
 
   // Drain any pending data in ZeroCopyOutStream before SConnection::close()
   // shuts down the write half of the socket.
@@ -422,6 +426,123 @@ void ScrcpyClient::handleClipboardAnnounce(bool available)
 void ScrcpyClient::handleClipboardData(const char* data)
 {
   server_->clientClipboardData(this, data);
+}
+
+void ScrcpyClient::destroyAllGIIDevices()
+{
+  while (!giiDevices_.empty()) {
+    uint32_t origin = giiDevices_.begin()->first;
+    giiDevices_.erase(giiDevices_.begin());
+    server_->clientGIIDeviceDestroy(this, origin);
+  }
+}
+
+void ScrcpyClient::supportsGII()
+{
+  if (!server_->supportsGII())
+    return;
+
+  giiVersionSent_ = true;
+  writer()->writeGIIVersion(rfb::giiVersionMax, rfb::giiVersionMin);
+}
+
+void ScrcpyClient::giiVersion(uint16_t version)
+{
+  if (!giiVersionSent_)
+    throw rfb::protocol_error(_("Client sent unexpected GII version message"));
+
+  rfb::SConnection::giiVersion(version);
+}
+
+void ScrcpyClient::giiDeviceCreate(const rfb::GIIDevice& device)
+{
+  static const size_t kMaxGIIDevicesPerClient = 64;
+
+  if (!giiVersionSent_ || (client.giiVersion() == 0))
+    throw rfb::protocol_error(
+      _("Client sent GII message before version negotiation"));
+
+  if (!accessCheck(rfb::AccessPtrEvents) &&
+      !accessCheck(rfb::AccessKeyEvents)) {
+    vlog.debug("Rejecting unauthorized GII device creation");
+    writer()->writeGIIDeviceCreateResponse(0);
+    return;
+  }
+
+  if (giiDevices_.size() >= kMaxGIIDevicesPerClient) {
+    vlog.error(_("Client exceeded maximum number of GII devices"));
+    writer()->writeGIIDeviceCreateResponse(0);
+    return;
+  }
+
+  uint32_t origin = server_->clientGIIDeviceCreate(this, device);
+  if (origin != 0) {
+    giiDevices_.emplace(origin, GIIDeviceLimits{device.canGenerate,
+                                                device.numButtons,
+                                                device.valuators.size()});
+  }
+
+  writer()->writeGIIDeviceCreateResponse(origin);
+}
+
+void ScrcpyClient::giiDeviceDestroy(uint32_t deviceOrigin)
+{
+  if (!giiVersionSent_ || (client.giiVersion() == 0))
+    throw rfb::protocol_error(
+      _("Client sent GII message before version negotiation"));
+
+  if (giiDevices_.erase(deviceOrigin) == 0) {
+    vlog.error(_("Client tried to destroy unknown GII device %u"),
+               deviceOrigin);
+    return;
+  }
+
+  server_->clientGIIDeviceDestroy(this, deviceOrigin);
+}
+
+void ScrcpyClient::giiEvent(const rfb::GIIEvent& event)
+{
+  if (!giiVersionSent_ || (client.giiVersion() == 0))
+    throw rfb::protocol_error(
+      _("Client sent GII message before version negotiation"));
+
+  auto device = giiDevices_.find(event.origin);
+  if (device == giiDevices_.end()) {
+    vlog.error(_("Ignoring GII event for unknown device %u"), event.origin);
+    return;
+  }
+
+  if (rfb::giiIsKeyEvent(event.type)) {
+    if (!accessCheck(rfb::AccessKeyEvents))
+      return;
+  } else if (rfb::giiIsPointerEvent(event.type)) {
+    if (!accessCheck(rfb::AccessPtrEvents))
+      return;
+  } else {
+    return;
+  }
+
+  const GIIDeviceLimits& limits = device->second;
+  if (!(limits.eventMask & (1U << event.type)))
+    return;
+
+  if ((event.type == rfb::giiEventPtrButtonPress) ||
+      (event.type == rfb::giiEventPtrButtonRelease)) {
+    if ((event.button == 0) || (event.button > limits.buttons))
+      return;
+  }
+
+  if ((event.type == rfb::giiEventValuatorRelative) ||
+      (event.type == rfb::giiEventValuatorAbsolute)) {
+    if (event.values.empty() || (event.first >= limits.valuators) ||
+        (event.values.size() > limits.valuators - event.first))
+      return;
+  }
+
+  if (rfb::Server::idleTimeout)
+    idleTimer_.start(core::secsToMillis(rfb::Server::idleTimeout));
+
+  server_->clientGIIEvent(this, event);
 }
 
 int ScrcpyClient::fileTransferWakeupFd() const
