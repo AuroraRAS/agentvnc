@@ -51,6 +51,7 @@ static const int kOpTimeoutSeconds = 60;
 static const size_t kLowWaterMark = 65536;
 static const size_t kMaxCtrlLineLen = 16384;
 static const size_t kMaxCtrlOutBuf = 262144;
+static const size_t kMaxPendingOps = 256;
 
 static std::string stripIpv4Mapped(const std::string& ip)
 {
@@ -476,7 +477,8 @@ void FtpServer::handleListenerRead(int fd)
   }
 }
 
-void FtpServer::sendReply(ClientSession* s, const std::string& line)
+void FtpServer::sendReply(ClientSession* s, const std::string& line,
+                           bool multiline)
 {
   if (s == nullptr || s->closeAfterFlush)
     return;
@@ -490,9 +492,16 @@ void FtpServer::sendReply(ClientSession* s, const std::string& line)
     updateControlWatch(s);
     return;
   }
+  size_t start = s->outBuf.size();
   s->outBuf += line;
-  if (line.size() < 2 || line.compare(line.size() - 2, 2, "\r\n") != 0)
-    s->outBuf += "\r\n";
+  if (!multiline) {
+    for (size_t i = start; i < s->outBuf.size(); ++i) {
+      char& ch = s->outBuf[i];
+      if (ch == '\r' || ch == '\n' || ch == '\0')
+        ch = ' ';
+    }
+  }
+  s->outBuf += "\r\n";
   updateControlWatch(s);
 }
 
@@ -1147,7 +1156,7 @@ void FtpServer::processControlLine(ClientSession* s, const std::string& rawLine)
       " MLST type*;size*;modify*;\r\n"
       " MLSD\r\n"
       " UTF8\r\n"
-      "211 End");
+      "211 End", true);
     return;
   }
 
@@ -1476,7 +1485,8 @@ void FtpServer::processControlLine(ClientSession* s, const std::string& rawLine)
         rootEntry.name = "/";
         rootEntry.isDir = true;
         sendReply(s, core::format("250-Listing /\r\n%s\r\n250 End",
-                                  ftp::formatMlstLine("/", rootEntry).c_str()));
+                                  ftp::formatMlstLine("/", rootEntry).c_str()),
+                  true);
       } else {
         sendReply(s, "550 Not a regular file.");
       }
@@ -1765,6 +1775,15 @@ void FtpServer::processControlLine(ClientSession* s, const std::string& rawLine)
 
 void FtpServer::enqueueOp(const QueuedOp& op)
 {
+  if (opQueue_.size() >= kMaxPendingOps) {
+    ClientSession* s = findSession(op.sessionId);
+    if (s != nullptr) {
+      sendReply(s, "421 Too many pending file operations.");
+      s->closeAfterFlush = true;
+      updateControlWatch(s);
+    }
+    return;
+  }
   opQueue_.push_back(op);
   pumpQueue();
 }
@@ -1955,7 +1974,7 @@ void FtpServer::handleStatResult(ClientSession* s, const QueuedOp& op,
   if (op.kind == OpKind::StatMlst) {
     sendReply(s, core::format("250-Listing %s\r\n%s\r\n250 End",
                               op.path.c_str(),
-                              ftp::formatMlstLine(op.path, match).c_str()));
+                              ftp::formatMlstLine(op.path, match).c_str()), true);
     return;
   }
 
@@ -2089,6 +2108,8 @@ void FtpServer::onListComplete(bool ok,
     s->dataOutEof = true;
     time_t now = time(nullptr);
     for (size_t i = 0; i < entries.size(); i++) {
+      if (entries[i].name.find_first_of("\r\n\0", 0, 3) != std::string::npos)
+        continue;
       if (op.kind == OpKind::Mlsd)
         s->dataOutBuf += ftp::formatMlsdLine(entries[i]);
       else if (op.kind == OpKind::Nlst)

@@ -213,7 +213,8 @@ private:
   void handleDataEvent(ClientSession* s, bool readable, bool writable);
 
   void processControlLine(ClientSession* s, const std::string& line);
-  void sendReply(ClientSession* s, const std::string& line);
+  void sendReply(ClientSession* s, const std::string& line,
+                 bool multiline = false);
   void updateControlWatch(ClientSession* s);
   void updateDataWatch(ClientSession* s);
 
