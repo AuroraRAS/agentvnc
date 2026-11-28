@@ -77,6 +77,8 @@ public:
   size_t activeGIIDeviceCount() const { return giiDevices_.size(); }
 
 private:
+  void disconnect();
+
   enum class GIIValuatorRole {
     Unknown,
     X,

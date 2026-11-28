@@ -485,6 +485,12 @@ void ScrcpyControl::setServerVersion(const std::string& version)
 
 void ScrcpyControl::close()
 {
+  disconnect();
+  giiDevices_.clear();
+}
+
+void ScrcpyControl::disconnect()
+{
   if (fd_ >= 0) {
     ::close(fd_);
     fd_ = -1;
@@ -496,7 +502,6 @@ void ScrcpyControl::close()
   androidButtons_ = 0;
   lastVncMask_ = 0;
   metaState_ = 0;
-  giiDevices_.clear();
 }
 
 void ScrcpyControl::enqueue(const uint8_t* data, size_t len)
@@ -506,7 +511,8 @@ void ScrcpyControl::enqueue(const uint8_t* data, size_t len)
 
   if (len > kMaxControlQueue - (sendBuf_.size() - sendOffset_)) {
     vlog.error("Control socket output queue is full");
-    close();
+    // The caller may still be updating a device's input state.
+    disconnect();
     return;
   }
 
@@ -524,7 +530,7 @@ void ScrcpyControl::enqueue(const uint8_t* data, size_t len)
       if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
         break;
       vlog.error("Control socket write error: %s", std::strerror(errno));
-      close();
+      disconnect();
       return;
     }
     if (sent == len)
@@ -1071,7 +1077,7 @@ void ScrcpyControl::emitGIIMotion(GIIDeviceState& dev, int x, int y,
       lastY_ = y;
     }
   } else if (posChanged && combinedMouseButtons() == 0 && !anyGiiTouchDown()) {
-    if (!dev.hasHoverSent || x != dev.lastSentX || y != dev.lastSentY) {
+    if (!dev.hasHoverSent || x != lastX_ || y != lastY_) {
       sendTouchEvent(kMotionActionHoverMove, kPointerIdMouse, x, y, w, h,
                      0.0f, 0, 0);
       dev.lastSentX = x;
@@ -1099,9 +1105,8 @@ void ScrcpyControl::handleGIIKeyEvent(GIIDeviceState& dev,
     injectKey(keysym, true, 0, extraMeta);
   } else if (event.type == rfb::giiEventKeyRepeat) {
     auto it = dev.pressedKeys.find(lookup);
-    uint32_t useSym = (it != dev.pressedKeys.end()) ? it->second : keysym;
-    if (useSym != 0)
-      injectKey(useSym, true, 1, extraMeta);
+    if (it != dev.pressedKeys.end())
+      injectKey(it->second, true, 1, extraMeta);
   } else if (event.type == rfb::giiEventKeyRelease) {
     auto it = dev.pressedKeys.find(lookup);
     if (it == dev.pressedKeys.end())
@@ -1215,7 +1220,7 @@ void ScrcpyControl::handleGIIValuatorEvent(GIIDeviceState& dev,
     return;
 
   bool isAbsolute = (event.type == rfb::giiEventValuatorAbsolute);
-  if (!isAbsolute && !dev.hasPosition) {
+  if (!dev.hasPosition) {
     dev.posX = std::max(0, std::min(screenW / 2, screenW - 1));
     dev.posY = std::max(0, std::min(screenH / 2, screenH - 1));
     dev.hasPosition = true;
@@ -1296,12 +1301,6 @@ void ScrcpyControl::handleGIIValuatorEvent(GIIDeviceState& dev,
 
     vs.prevValue = val;
     vs.hasPrev = true;
-  }
-
-  if (!dev.hasPosition) {
-    dev.posX = std::max(0, std::min(screenW / 2, screenW - 1));
-    dev.posY = std::max(0, std::min(screenH / 2, screenH - 1));
-    dev.hasPosition = true;
   }
 
   int x = clampScreenCoord(dev.posX, screenW);
