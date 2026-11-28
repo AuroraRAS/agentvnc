@@ -24,13 +24,15 @@ from .constants import (
     COORDINATION_SYSTEM_INSTRUCTION,
     CUSTOM_FUNCTION_DECLARATIONS,
     DEFAULT_ASSISTANT_MODEL,
+    DEFAULT_COMPUTER_USE_ENVIRONMENT,
     DEFAULT_MODEL,
     DEFAULT_SYSTEM_ONE_MODEL,
     DEFAULT_VNCVIEWER,
+    ENVIRONMENT_SYSTEM_INSTRUCTIONS,
     FILE_FUNCTION_DECLARATIONS,
     FTP_PROTOCOLS,
     FTP_SYSTEM_INSTRUCTION,
-    PREDEFINED_DESKTOP_FUNCTIONS,
+    PREDEFINED_FUNCTIONS_BY_ENVIRONMENT,
     READ_ONLY_FUNCTIONS,
     RECOVERY_THINKING_LEVELS,
     REMOTE_MUTATING_FUNCTIONS,
@@ -42,6 +44,7 @@ from .constants import (
     SYSTEM_ONE_SYSTEM_INSTRUCTION,
     THINKING_LEVELS,
     TYPESAFE_SYSTEM_ONE_URL,
+    VNC_UNAVAILABLE_FUNCTIONS,
     WORKSPACE_FUNCTION_DECLARATIONS,
     WORKSPACE_SYSTEM_INSTRUCTION,
 )
@@ -79,7 +82,11 @@ from .system_one_fsm import SystemOneHostEngine
 from .workspace import LocalWorkspace
 
 
-def parse_excluded_actions(raw_values: Optional[List[str]]) -> List[str]:
+def parse_excluded_actions(
+    raw_values: Optional[List[str]],
+    environment: str = DEFAULT_COMPUTER_USE_ENVIRONMENT,
+) -> List[str]:
+    predefined_actions = PREDEFINED_FUNCTIONS_BY_ENVIRONMENT[environment]
     excluded: List[str] = []
     seen = set()
     for item in raw_values or []:
@@ -88,9 +95,9 @@ def parse_excluded_actions(raw_values: Optional[List[str]]) -> List[str]:
             if not name or name in seen:
                 continue
             seen.add(name)
-            if name not in PREDEFINED_DESKTOP_FUNCTIONS:
+            if name not in predefined_actions:
                 print(
-                    f"  [WARN] Excluded action {name!r} is not in PREDEFINED_DESKTOP_FUNCTIONS; "
+                    f"  [WARN] Excluded action {name!r} is not documented for the {environment} environment; "
                     "forwarding as configured."
                 )
             excluded.append(name)
@@ -106,14 +113,19 @@ def build_tools_config(
     enable_remote_transfer_tools: bool = False,
     enable_coord_tools: bool = False,
     enable_system_one_tools: bool = False,
+    environment: str = DEFAULT_COMPUTER_USE_ENVIRONMENT,
 ) -> List[Dict[str, Any]]:
     cu_cfg: Dict[str, Any] = {
         "type": "computer_use",
-        "environment": "desktop",
+        "environment": environment,
         "enable_prompt_injection_detection": True,
     }
-    if excluded_actions:
-        cu_cfg["excluded_predefined_functions"] = list(excluded_actions)
+    unavailable_actions = (
+        name for name in PREDEFINED_FUNCTIONS_BY_ENVIRONMENT[environment] if name in VNC_UNAVAILABLE_FUNCTIONS
+    )
+    exclusions = list(dict.fromkeys([*excluded_actions, *unavailable_actions]))
+    if exclusions:
+        cu_cfg["excluded_predefined_functions"] = exclusions
     if not strict_safety:
         cu_cfg["disabled_safety_policies"] = ["data_modification"]
 
@@ -271,6 +283,22 @@ def handle_safety_decision(
 
 
 def run_agent(args: argparse.Namespace) -> int:
+    environment = getattr(args, "environment", DEFAULT_COMPUTER_USE_ENVIRONMENT)
+    predefined_actions = PREDEFINED_FUNCTIONS_BY_ENVIRONMENT[environment]
+    excluded_actions = parse_excluded_actions(getattr(args, "exclude_actions", None), environment)
+    skipped_actions = {
+        name: f"This action is unavailable in the {environment} Computer Use environment."
+        for actions in PREDEFINED_FUNCTIONS_BY_ENVIRONMENT.values()
+        for name in actions
+        if name not in predefined_actions
+    }
+    skipped_actions.update({
+        name: "This action was disabled with --exclude-actions."
+        for name in excluded_actions
+        if name in predefined_actions
+    })
+    skipped_actions.update(VNC_UNAVAILABLE_FUNCTIONS)
+
     api_key = load_api_key(args.api_key_file)
     log_dir = os.path.abspath(args.log_dir) if args.log_dir else None
     if log_dir:
@@ -394,7 +422,6 @@ def run_agent(args: argparse.Namespace) -> int:
         base_thinking_level: Optional[str] = None if raw_base_thinking == "default" else raw_base_thinking
         raw_rec_thinking = str(getattr(args, "recovery_thinking_level", "high") or "high")
         recovery_thinking_level: Optional[str] = None if raw_rec_thinking == "off" else raw_rec_thinking
-        excluded_actions = parse_excluded_actions(getattr(args, "exclude_actions", None))
 
         with AgentClient(socket_path, timeout=15.0) as vnc_client:
             executor = VncDesktopExecutor(
@@ -517,6 +544,8 @@ def run_agent(args: argparse.Namespace) -> int:
             enable_system_one_tools = system_one_engine is not None
 
             instruction_parts = [SYSTEM_INSTRUCTION]
+            if environment in ENVIRONMENT_SYSTEM_INSTRUCTIONS:
+                instruction_parts.append(ENVIRONMENT_SYSTEM_INSTRUCTIONS[environment])
             if enable_file_tools:
                 instruction_parts.append(FTP_SYSTEM_INSTRUCTION)
             if enable_workspace_tools:
@@ -536,6 +565,7 @@ def run_agent(args: argparse.Namespace) -> int:
                 enable_remote_transfer_tools=enable_remote_transfer_tools,
                 enable_coord_tools=enable_coord_tools,
                 enable_system_one_tools=enable_system_one_tools,
+                environment=environment,
             )
 
             llm = InteractionsClient(
@@ -555,11 +585,11 @@ def run_agent(args: argparse.Namespace) -> int:
             )
             s1_banner = f"on ({s1_model})" if enable_system_one_tools else "off"
             print(
-                f"Session config: model={args.model} | thinking={raw_base_thinking} "
+                f"Session config: model={args.model} | environment={environment} | thinking={raw_base_thinking} "
                 f"(recovery={raw_rec_thinking}) | custom_tools={'on' if enable_custom_tools else 'off'} "
                 f"| file_tools={'on' if enable_file_tools else 'off'} | ftp={ftp_banner} "
                 f"| workspace={workspace.root} | assistant={asst_banner} | system_one={s1_banner} "
-                f"| excluded={excluded_actions or 'none'} | prompt_injection_detection=on "
+                f"| excluded={tools[0].get('excluded_predefined_functions', 'none')} | prompt_injection_detection=on "
                 f"| strict_safety={'on' if args.strict_safety else 'off'} | target={endpoint_desc} "
                 f"({'local/sandboxed' if sandboxed else 'NON-LOOPBACK'})"
             )
@@ -923,6 +953,17 @@ def run_agent(args: argparse.Namespace) -> int:
                             if ack:
                                 action_result["safety_acknowledgement"] = True
 
+                        if fname in skipped_actions:
+                            reason = skipped_actions[fname]
+                            print(f"  [SKIP] {fname}: {reason}")
+                            action_result.update(status="skipped", reason=reason)
+                            results.append((fname, call_id, action_result, False))
+                            skip_log_entry = {"name": fname, "args": fc_args, "result": action_result}
+                            if safety_audit is not None:
+                                skip_log_entry["safety_decision"] = safety_audit
+                            turn_log_actions.append(skip_log_entry)
+                            continue
+
                         px: Optional[int] = None
                         py: Optional[int] = None
                         ex: Optional[int] = None
@@ -943,7 +984,10 @@ def run_agent(args: argparse.Namespace) -> int:
                                 bmask = 4
                             elif fname == "middle_click":
                                 bmask = 2
-                            elif fname in ("click", "double_click", "triple_click", "mouse_down", "type", "paste_text_at", "click_and_type"):
+                            elif fname in (
+                                "click", "double_click", "triple_click", "mouse_down", "long_press",
+                                "type", "paste_text_at", "click_and_type",
+                            ):
                                 bmask = 1
                             pulse = (fname != "move")
 
@@ -1309,15 +1353,14 @@ def run_agent(args: argparse.Namespace) -> int:
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Run a Gemini Computer Use desktop agent over TigerVNC AgentSocket."
+        description="Run a Gemini Computer Use agent over TigerVNC AgentSocket."
     )
     parser.add_argument(
         "--prompt",
-        default=(
-            "Create a new text document on the desktop named hello.txt containing the text "
-            "'Hello from TigerVNC Computer Use Agent!' and make sure it is saved and visible on the desktop."
+        help=(
+            "Task instruction for the agent (pass '' with --collaborate to start waiting for user input). "
+            "Defaults to creating hello.txt on desktop or describing the screen in browser and mobile modes."
         ),
-        help="Task instruction for the agent (pass '' with --collaborate to start waiting for user input)",
     )
     parser.add_argument(
         "--socket",
@@ -1325,6 +1368,15 @@ def main() -> int:
         help="Existing vncviewer -AgentSocket Unix domain socket path (if omitted, spawns headless vncviewer)",
     )
     parser.add_argument("--vnc-host", default="localhost:5900", help="Target VNC server host:port")
+    parser.add_argument(
+        "--environment",
+        choices=PREDEFINED_FUNCTIONS_BY_ENVIRONMENT,
+        default=DEFAULT_COMPUTER_USE_ENVIRONMENT,
+        help=(
+            "Computer Use profile for the remote VNC session (default: %(default)s). "
+            "Browser control uses on-screen UI and VNC keys. Mobile targets Android over VNC."
+        ),
+    )
     parser.add_argument("--vncviewer-bin", default=DEFAULT_VNCVIEWER, help="Path to built vncviewer binary")
     parser.add_argument(
         "--legacy-clipboard-encoding",
@@ -1336,7 +1388,7 @@ def main() -> int:
         help="Path to Gemini API key file",
     )
     parser.add_argument("--model", default=DEFAULT_MODEL, help="Gemini model name supporting computer_use")
-    parser.add_argument("--max-turns", type=int, default=20, help="Maximum desktop agent tool turns per task")
+    parser.add_argument("--max-turns", type=int, default=20, help="Maximum agent tool turns per task")
     parser.add_argument("--log-dir", default="/tmp/vnc_agent_run", help="Directory for trace.jsonl and PNG snapshots")
     parser.add_argument(
         "--workspace",
@@ -1393,7 +1445,7 @@ def main() -> int:
         action="append",
         default=None,
         help=(
-            "Built-in computer_use actions to disable via excluded_predefined_functions "
+            "Built-in computer_use actions to disable for the selected environment "
             "(comma-separated or repeatable, e.g. --exclude-actions drag_and_drop,type)"
         ),
     )
@@ -1510,6 +1562,14 @@ def main() -> int:
         help="Disable TypeSafe System One host tools even if typesafe.key is present",
     )
     args = parser.parse_args()
+    if args.prompt is None:
+        if args.environment == DEFAULT_COMPUTER_USE_ENVIRONMENT:
+            args.prompt = (
+                "Create a new text document on the desktop named hello.txt containing the text "
+                "'Hello from TigerVNC Computer Use Agent!' and make sure it is saved and visible on the desktop."
+            )
+        else:
+            args.prompt = "Describe what is currently visible on the screen."
     if args.legacy_clipboard_encoding:
         try:
             args.legacy_clipboard_encoding = parse_legacy_clipboard_encoding(args.legacy_clipboard_encoding)

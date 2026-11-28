@@ -17,6 +17,7 @@ DEFAULT_ASSISTANT_MODEL = "gemini-3.8-flash"
 DEFAULT_SYSTEM_ONE_MODEL = "jev-latest"
 TYPESAFE_SYSTEM_ONE_URL = "https://api.typesafe.ai/v1/systemone"
 DEFAULT_VNCVIEWER = os.path.join(REPO_ROOT, "build", "vncviewer", "vncviewer")
+DEFAULT_COMPUTER_USE_ENVIRONMENT = "desktop"
 
 THINKING_LEVELS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "default")
 RECOVERY_THINKING_LEVELS: Tuple[str, ...] = ("low", "medium", "high", "xhigh", "off")
@@ -64,6 +65,43 @@ PREDEFINED_DESKTOP_FUNCTIONS: Tuple[str, ...] = (
     "wait",
     "take_screenshot",
 )
+
+PREDEFINED_FUNCTIONS_BY_ENVIRONMENT: Dict[str, Tuple[str, ...]] = {
+    "desktop": PREDEFINED_DESKTOP_FUNCTIONS,
+    "browser": PREDEFINED_DESKTOP_FUNCTIONS + ("go_back", "navigate", "go_forward"),
+    "mobile": (
+        "open_app",
+        "click",
+        "list_apps",
+        "wait",
+        "go_back",
+        "type",
+        "drag_and_drop",
+        "long_press",
+        "press_key",
+        "take_screenshot",
+    ),
+}
+
+VNC_UNAVAILABLE_FUNCTIONS = {
+    "navigate": "Direct navigation requires a browser API. Use the visible browser address bar.",
+    "open_app": "Launching an app by name requires a device API. Use the visible launcher.",
+    "list_apps": "Listing installed apps requires a device API. Inspect the visible launcher or app drawer.",
+}
+
+ENVIRONMENT_SYSTEM_INSTRUCTIONS = {
+    "browser": (
+        "## Browser over VNC\n"
+        "Use the on-screen address bar for URL entry and inspect the screenshot after navigation. "
+        "Browser history actions send Back and Forward keys over VNC, so use them with the browser focused."
+    ),
+    "mobile": (
+        "## Android over VNC\n"
+        "Use the visible launcher or app drawer to find and open apps. Use click for taps, "
+        "long_press for touch and hold, and drag_and_drop for swipes. "
+        "If the server does not map the Back key to Android Back, use the on-screen navigation controls."
+    ),
+}
 
 CUSTOM_FUNCTION_DECLARATIONS: List[Dict[str, Any]] = [
     {
@@ -1305,6 +1343,8 @@ ASSISTANT_SYSTEM_INSTRUCTION = """You are the asynchronous **Research Assistant*
 
 KEY_MAP: Dict[str, int] = {
     "backspace": 0xFF08,
+    "browser_back": 0x1008FF26,
+    "browser_forward": 0x1008FF27,
     "tab": 0xFF09,
     "return": 0xFF0D,
     "enter": 0xFF0D,

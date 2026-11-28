@@ -324,6 +324,8 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
             enable_file_tools=False,
         )
         default_names = {t["name"] for t in default_tools if t.get("type") == "function"}
+        self.assertEqual(default_tools[0]["environment"], "desktop")
+        self.assertNotIn("excluded_predefined_functions", default_tools[0])
         self.assertNotIn("workspace_read", default_names)
         self.assertNotIn("peer_send_message", default_names)
 
@@ -852,7 +854,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
             srv.shutdown()
             srv.server_close()
 
-    def test_run_agent_desktop_batches(self) -> None:
+    def test_run_agent_batches(self) -> None:
         key_file = os.path.join(self.tmp, "gemini.key")
         with open(key_file, "w", encoding="utf-8") as f:
             f.write("test-key")
@@ -863,6 +865,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
         pointer_calls: List[Dict[str, Any]] = []
         key_calls: List[Dict[str, Any]] = []
         inputs: List[Any] = []
+        interaction_configs: List[Dict[str, Any]] = []
 
         class _StubAgentClient:
             def __init__(self, socket_path: str, timeout: float = 15.0) -> None:
@@ -953,6 +956,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
         class _StubInteractionsClient:
             def __init__(self, *args: Any, **kwargs: Any) -> None:
                 self._idx = 0
+                interaction_configs.append(kwargs)
 
             def create(self, *args: Any, **kwargs: Any) -> Dict[str, Any]:
                 inputs.append(kwargs["input_payload"])
@@ -980,6 +984,7 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
             recovery_thinking_level="high",
             exclude_actions=None,
             no_custom_tools=False,
+            no_system_one=True,
             auto_confirm=False,
             strict_safety=False,
             windowed=False,
@@ -1029,6 +1034,53 @@ class WorkspaceAndAssistantTests(unittest.TestCase):
         self.assertEqual(submit["call_id"], "submit")
         self.assertEqual(json.loads(submit["result"][0]["text"])["status"], "skipped_pending_visual_verification")
         self.assertNotIn(0xFF0D, [key["keysym"] for key in key_calls])
+
+        for environment, calls, expected_exclusions, expected_keys in (
+            (
+                "browser",
+                [("navigate", {"url": "https://example.com"}), ("go_back", {}), ("go_forward", {})],
+                ["navigate"],
+                [0x1008FF26, 0x1008FF27],
+            ),
+            (
+                "mobile",
+                [("open_app", {"app_name": "Clock"}), ("list_apps", {}), ("go_back", {}),
+                 ("long_press", {"x": 250, "y": 500, "seconds": 0.1})],
+                ["open_app", "list_apps"],
+                [0x1008FF26],
+            ),
+        ):
+            with self.subTest(environment=environment):
+                ns.environment = environment
+                ns.exclude_actions = [",".join(["press_key", expected_exclusions[0]]), "press_key"]
+                pointer_calls.clear()
+                key_calls.clear()
+                calls = [("press_key", {"key": "Enter"}), *calls]
+                responses[0]["steps"] = [
+                    {"type": "function_call", "id": name, "name": name, "arguments": arguments}
+                    for name, arguments in calls
+                ]
+                with mock.patch("vnc_agent.runner.AgentClient", _StubAgentClient), mock.patch(
+                    "vnc_agent.runner.InteractionsClient", _StubInteractionsClient
+                ):
+                    self.assertEqual(agent_mod.run_agent(ns), 0)
+
+                config = interaction_configs[-1]
+                self.assertEqual(config["tools"][0]["environment"], environment)
+                self.assertEqual(config["tools"][0]["excluded_predefined_functions"], ["press_key", *expected_exclusions])
+                self.assertIn("address bar" if environment == "browser" else "app drawer", config["system_instruction"])
+                self.assertEqual([result["call_id"] for result in inputs[-1]], [name for name, _ in calls])
+                skipped = {"press_key", *expected_exclusions}
+                for result in inputs[-1]:
+                    status = json.loads(result["result"][0]["text"])["status"]
+                    self.assertEqual(status, "skipped" if result["name"] in skipped else "ok")
+                self.assertEqual(
+                    key_calls,
+                    [{"keysym": keysym, "down": down} for keysym in expected_keys for down in (True, False)],
+                )
+                self.assertEqual(pointer_calls, [
+                    {"x": 250, "y": 250, "button_mask": mask} for mask in (0, 1, 0)
+                ] if environment == "mobile" else [])
 
     def test_interactions_reports_failed_response(self) -> None:
         backend = MockGeminiBackend()
