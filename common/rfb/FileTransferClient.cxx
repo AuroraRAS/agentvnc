@@ -593,6 +593,13 @@ void FileTransferClient::cancelDownload()
 
   case FileTransferProtocol::Tight13:
     writer_->writeTight13FileDownloadCancel("Cancelled by client");
+    if (server_->supportsFence) {
+      // Discard any in-flight data before starting a new download.
+      static const uint8_t tag[4] = { 'F', 'C', '1', '3' };
+      opState_ = OpState::DrainingCancel;
+      writer_->writeFence(fenceFlagRequest | fenceFlagBlockBefore, 4, tag);
+      break;
+    }
     opState_ = OpState::Idle;
     if (handler_ != nullptr)
       handler_->onCancelComplete();
@@ -780,6 +787,15 @@ void FileTransferClient::cancelUpload()
 
 void FileTransferClient::abortPendingOp()
 {
+  if (caps_.protocol == FileTransferProtocol::Tight13) {
+    if (opState_ == OpState::Downloading && server_->supportsFence) {
+      cancelDownload();
+      return;
+    }
+    if (opState_ == OpState::DrainingCancel)
+      return;
+  }
+
   if (caps_.protocol == FileTransferProtocol::Tight2) {
     // Tight replies have no request ID. Keep the connection busy until the
     // old reply is consumed and any open remote handle has been released.
@@ -947,6 +963,18 @@ void FileTransferClient::onFenceReply()
     if (handler_ != nullptr)
       handler_->onUploadComplete(true, "");
   }
+}
+
+void FileTransferClient::onTight13CancelFenceReply()
+{
+  if (caps_.protocol != FileTransferProtocol::Tight13 ||
+      opState_ != OpState::DrainingCancel)
+    return;
+
+  opState_ = OpState::Idle;
+  downloadStarted_ = false;
+  if (handler_ != nullptr)
+    handler_->onCancelComplete();
 }
 
 void FileTransferClient::onTight13FileListData(
