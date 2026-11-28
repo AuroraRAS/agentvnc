@@ -533,6 +533,9 @@ void CConnection::fence(uint32_t flags, unsigned len, const uint8_t data[])
   if (len == 4 && data[0] == 'F' && data[1] == 'T' &&
       data[2] == '1' && data[3] == '3')
     fileTransfer.onFenceReply();
+  if (len == 4 && data[0] == 'F' && data[1] == 'C' &&
+      data[2] == '1' && data[3] == '3')
+    fileTransfer.onTight13CancelFenceReply();
 }
 
 void CConnection::endOfContinuousUpdates()

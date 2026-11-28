@@ -1513,14 +1513,17 @@ bool CMsgReader::readTight2Message()
     }
 
     std::vector<FileEntry> entries;
-    if (block.size() >= 4) {
+    if (!block.empty()) {
+      if (block.size() < 4)
+        throw protocol_error(_("Truncated TightVNC file list"));
       uint32_t count = readBE32FromBuf(block.data());
       size_t off = 4;
-      if (count > 1000000)
-        throw protocol_error(_("Too many entries in TightVNC file list"));
+      constexpr size_t entryHeaderSize = 8 + 8 + 2 + 4;
+      if (count > (block.size() - off) / entryHeaderSize)
+        throw protocol_error(_("Truncated TightVNC file list"));
       entries.reserve(count);
       for (uint32_t i = 0; i < count; i++) {
-        if (off + 8 + 8 + 2 + 4 > block.size())
+        if (entryHeaderSize > block.size() - off)
           throw protocol_error(_("Truncated TightVNC file list entry"));
         FileEntry entry;
         entry.size = readBE64FromBuf(block.data() + off);

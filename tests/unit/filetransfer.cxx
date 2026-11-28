@@ -25,6 +25,7 @@
 #include <zlib.h>
 
 #include <algorithm>
+#include <list>
 #include <string>
 #include <vector>
 
@@ -406,6 +407,27 @@ TEST(FileTransferUnit, CSecurityTight_RejectsUnsupportedTunnel)
   EXPECT_THROW(tight.processMsg(), rfb::protocol_error);
 }
 
+TEST(FileTransferUnit, TightDoesNotBroadenConfiguredAuthentication)
+{
+  TestCConnection conn;
+  rdr::MemOutStream out;
+  std::vector<uint8_t> serverBytes;
+  appendU32BE(&serverBytes, 0);
+  appendU32BE(&serverBytes, 0);
+  rdr::MemInStream in(serverBytes.data(), serverBytes.size());
+  conn.setStreams(&in, &out);
+
+  rfb::SecurityClient security;
+  std::list<uint32_t> types = {rfb::secTypeVeNCrypt, rfb::secTypeTight,
+                               rfb::secTypeRA2};
+  security.SetSecTypes(types);
+  EXPECT_EQ(security.GetEnabledExtSecTypes(),
+            (std::list<uint32_t>{rfb::secTypeRA2}));
+
+  rfb::CSecurityTight tight(&conn, &security);
+  EXPECT_THROW(tight.processMsg(), rfb::protocol_error);
+}
+
 TEST(FileTransferUnit, ReadServerInitTightInteractionCaps_Incremental)
 {
   TestCConnection conn;
@@ -644,6 +666,22 @@ TEST(FileTransferUnit, Tight2WireRoundTrip)
   EXPECT_EQ(ftHandler.lastUploadErr, "Disk full");
 }
 
+TEST(FileTransferUnit, Tight2RejectsTruncatedFileListHeader)
+{
+  TestCConnection conn;
+  conn.server.tightEnabled = true;
+  std::vector<uint8_t> wire;
+  appendU32BE(&wire, rfb::tight2FileListReply);
+  appendU8(&wire, 0);
+  appendU32BE(&wire, 2);
+  appendU32BE(&wire, 2);
+  appendU16BE(&wire, 0);
+
+  rdr::MemInStream in(wire.data(), wire.size());
+  rfb::CMsgReader reader(&conn, &in);
+  EXPECT_THROW(reader.readMsg(), rfb::protocol_error);
+}
+
 TEST(FileTransferUnit, Tight13WireRoundTrip)
 {
   TestCConnection conn;
@@ -753,6 +791,29 @@ TEST(FileTransferUnit, Tight13WireRoundTrip)
   conn.fileTransferClient().onFenceReply();
   EXPECT_EQ(ftHandler.uploadCompleteCount, 1);
   EXPECT_TRUE(ftHandler.lastUploadCompleteOk);
+
+  conn.fileTransferClient().startDownload("/fileB.txt", 0);
+  conn.fileTransferClient().cancelDownload();
+  EXPECT_TRUE(conn.fileTransferClient().isBusy());
+  EXPECT_EQ(ftHandler.cancelCompleteCount, 0);
+  ASSERT_GE(clientOut.length(), 13U);
+
+  const uint8_t cancelled[] = { 'F', 'C', '1', '3' };
+  EXPECT_TRUE(std::equal(cancelled, cancelled + sizeof(cancelled),
+                         clientOut.data() + clientOut.length() - sizeof(cancelled)));
+  conn.fileTransferClient().onTight13FileDownloadData(upData, sizeof(upData));
+  conn.fileTransferClient().onTight13FileDownloadEnd(1700000000);
+  EXPECT_TRUE(ftHandler.downloadedBytes.empty());
+  EXPECT_EQ(ftHandler.downloadCompleteCount, 1);
+  std::vector<uint8_t> fenceReply = {rfb::msgTypeServerFence, 0, 0, 0};
+  appendU32BE(&fenceReply, 0);
+  appendU8(&fenceReply, sizeof(cancelled));
+  fenceReply.insert(fenceReply.end(), cancelled, cancelled + sizeof(cancelled));
+  rdr::MemInStream fenceIn(fenceReply.data(), fenceReply.size());
+  rfb::CMsgReader fenceReader(&conn, &fenceIn);
+  EXPECT_TRUE(fenceReader.readMsg());
+  EXPECT_EQ(ftHandler.cancelCompleteCount, 1);
+  EXPECT_FALSE(conn.fileTransferClient().isBusy());
 }
 
 TEST(FileTransferUnit, UltraVNCWireRoundTrip)
