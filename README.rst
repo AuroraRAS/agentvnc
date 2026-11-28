@@ -127,8 +127,8 @@ client (uses only the Python standard library)::
 Running the Gemini Computer Use Agent
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
 
-``tools/vnc_computer_use_agent.py`` implements a Gemini Computer Use desktop
-agent over ``-AgentSocket`` and can run with the Python standard library.
+``tools/vnc_computer_use_agent.py`` runs Gemini Computer Use over
+``-AgentSocket`` and can run with the Python standard library.
 Provide an API key via ``--api-key-file`` (defaults to ``gemini.key`` in the
 repository root) or the ``GEMINI_API_KEY`` environment variable.  The file
 takes precedence when it contains a key.
@@ -153,6 +153,11 @@ Example agent invocations::
 
 Key agent flags:
 
+* ``--environment {desktop,browser,mobile}`` - Select the Gemini Computer Use
+  action profile for the remote VNC session. The default is ``desktop``.
+  With no ``--prompt``, ``browser`` and ``mobile`` describe the current screen.
+* ``--exclude-actions <names>`` - Disable predefined actions for the selected
+  profile. Separate names with commas or repeat the option.
 * ``--windowed`` - Launch ``vncviewer`` with a visible window and
   ``-AgentOverlay`` instead of ``-Headless``.
 * ``--collaborate`` - Launch with ``-AgentOverlay -AgentCollaborate`` and wait
@@ -196,6 +201,19 @@ Key agent flags:
   ``clipboard_utf8`` over ``-AgentSocket``.
 * ``--vncviewer-bin <path>`` - Path to the built ``vncviewer`` binary
   (default: ``build/vncviewer/vncviewer``).
+
+Use ``desktop`` for general desktop tasks. With ``browser``, the agent enters
+URLs through the on-screen address bar and sends Back and Forward keys to the
+focused browser. With ``mobile``, the agent uses taps, long presses and drags
+for Android input and sends the Back key through VNC. ``scrcpyvncserver`` maps
+that key to Android Back. See `Google's supported environments
+<https://aistudio.google.com/docs/computer-use#supported-environments>`_.
+
+The agent excludes direct browser navigation (``navigate``) and Android app
+lookup and launch (``list_apps`` and ``open_app``) from the relevant profiles.
+If the model returns one of these calls anyway, the agent reports that call
+as skipped and continues the batch. On Android, it uses the visible launcher
+or app drawer to find and open apps.
 
 The desktop agent and Research Assistant share files and persistent notes in
 the workspace.  The desktop agent can send a request with ``peer_send_message``
@@ -380,6 +398,12 @@ forwards rotation or resolution changes via ``ExtendedDesktopSize`` (``-308``)
 or ``DesktopSize`` (``-223``), and relays pointer, keyboard, and clipboard
 input over the scrcpy control channel.
 
+The bridge also supports TightVNC file transfer over ADB. Use ``Tight2`` for
+listing, upload, download, mkdir, rename and delete. ``Tight13`` supports
+listing, upload, download and mkdir through the viewer's FTP bridge.
+Compatible viewers can negotiate the RFB General Input Interface (GII) for
+extended input devices such as styluses and multi-touch pointers.
+
 scrcpyvncserver Options
 ~~~~~~~~~~~~~~~~~~~~~~~
 
@@ -402,6 +426,11 @@ scrcpyvncserver Options
 * ``-Control`` / ``-StayAwake`` - Enable the scrcpy input/clipboard control
   channel (default: on) and keep the device awake while connected
   (default: off).
+* ``-FileTransfer`` - Enable TightVNC file transfer over ADB (default: on).
+  ``-FileTransferRoot <path>`` confines transfers to a directory on the Android
+  device. An unset root exposes all paths accessible to ADB.
+* ``-GII`` - Enable RFB General Input Interface support (default: on when
+  control is enabled). The viewer must also have GII enabled.
 * ``-rfbport <port>`` (default: ``5900``), ``-rfbunixpath <path>``,
   ``-localhost``, ``-SecurityTypes <list>`` (default: ``TLSVnc,VncAuth``),
   ``-PasswordFile <path>``, and ``-HostsFile <path>`` - Listener, security, and
@@ -421,23 +450,71 @@ display resizes and ``ContinuousUpdates`` (``-313``) for immediate frame
 push delivery.  With an H.264-enabled ``vncviewer``, explicitly set
 ``-AutoSelect=0 -PreferredEncoding=H.264`` so it stays on Open H.264.
 
-Example::
+Build the bridge and an H.264-enabled viewer from the repository root.
 
-  # Ensure the local ADB daemon is connected to the Android target
-  adb connect 192.168.240.112:5555
+.. code-block:: sh
 
-  # Launch scrcpyvncserver on localhost port 5900 (or use -PasswordFile)
-  scrcpyvncserver -Serial 192.168.240.112:5555 \
+  cmake -S . -B build -DENABLE_H264=ON
+  cmake --build build --target scrcpyvncserver vncviewer
+
+For an ADB-over-TCP device, replace the example address and use the serial
+shown by ``adb devices``. The example uses a loopback listener with VNC
+authentication and file transfer disabled.
+
+.. code-block:: sh
+
+  android_serial=192.0.2.10:5555
+  adb connect "$android_serial"
+  adb devices
+
+  build/unix/scrcpyvncserver/scrcpyvncserver -Serial "$android_serial" \
       -ScrcpyServer /path/to/scrcpy-server -MaxSize 1920 \
-      -rfbport 5900 -localhost -SecurityTypes None
+      -rfbport 5900 -localhost -SecurityTypes None -FileTransfer=0
 
-  # Or attach to an already-running forward-tunneled scrcpy-server socket
-  scrcpyvncserver -Attach=1 -Serial 192.168.240.112:5555 \
-      -rfbport 5900 -localhost -SecurityTypes None
+Use ``-Attach`` with ``-Serial`` and the matching socket and version options
+to reuse an already running forward-tunneled ``scrcpy-server``.
 
-  # Connect with TigerVNC/AgentVNC viewer (supports -Headless / -AgentSocket)
-  vncviewer -AutoSelect=0 -PreferredEncoding=H.264 -SecurityTypes=None \
+To control Android interactively, run the viewer in another terminal.
+
+.. code-block:: sh
+
+  build/vncviewer/vncviewer -AutoSelect=0 -PreferredEncoding=H.264 \
+      -SecurityTypes=None 127.0.0.1::5900
+
+Android Computer Use
+~~~~~~~~~~~~~~~~~~~~
+
+For agent control, start a headless viewer with an AgentSocket in one
+terminal. Keep it running while the agent is connected.
+
+.. code-block:: sh
+
+  agent_socket_dir=$(mktemp -d)
+  printf '%s\n' "$agent_socket_dir/android.sock"
+  build/vncviewer/vncviewer -Headless -Shared \
+      -AgentSocket "$agent_socket_dir/android.sock" \
+      -AutoSelect=0 -PreferredEncoding=H.264 -SecurityTypes=None \
       127.0.0.1::5900
+
+In another terminal, pass the printed socket path and use the Gemini API key
+configuration described above.
+
+.. code-block:: sh
+
+  python3 tools/vnc_computer_use_agent.py --environment mobile \
+      --socket /path/from/previous/step/android.sock --no-ftp \
+      --prompt "Open Calculator from the launcher, enter 37 × 19 + 6, and report the displayed result."
+
+Android input methods can compose or change characters sent as keystrokes.
+For exact text, use ``paste_text_at`` with clipboard synchronization enabled
+and verify the resulting field before submitting.
+
+To enable agent file tools, start the bridge with ``-FileTransfer=1`` and set
+``-FileTransferRoot`` to a directory under your control on Android. Start the
+viewer with ``-FtpServer -FtpProtocol Tight2`` and omit its explicit
+``-SecurityTypes=None`` so it can negotiate Tight. Run the agent with ``--ftp``
+in place of ``--no-ftp``. The file tools map ``/`` to the configured root on
+Android, so ``/notes.txt`` refers to a file inside that directory.
 
 
 RDP-to-VNC Bridge (rdpvncserver)
