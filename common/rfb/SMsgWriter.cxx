@@ -1053,8 +1053,8 @@ void SMsgWriter::writeTight2LastRequestFailedReply(const std::string& message)
 void SMsgWriter::writeTight13FileListData(uint8_t flags,
                                           const std::vector<FileEntry>& entries)
 {
-  startMsg(msgTypeTightFileListData);
   if ((flags & tight13FlagError) != 0) {
+    startMsg(msgTypeTightFileListData);
     os->writeU8(flags);
     os->writeU16(0);
     os->writeU16(0);
@@ -1070,11 +1070,11 @@ void SMsgWriter::writeTight13FileListData(uint8_t flags,
   for (const FileEntry& e : entries) {
     if (dirOnly && !e.isDir)
       continue;
-    if (filtered.size() >= 65535)
-      break;
     size_t addLen = e.name.size() + 1;
-    if (rawNames.size() + addLen > 65535)
-      break;
+    if (addLen > 65535 - rawNames.size()) {
+      writeTight13FileListData(flags | tight13FlagError, {});
+      return;
+    }
     filtered.push_back(&e);
     rawNames.append(e.name);
     rawNames.push_back('\0');
@@ -1097,6 +1097,7 @@ void SMsgWriter::writeTight13FileListData(uint8_t flags,
     outFlags &= static_cast<uint8_t>(~0x0F);
   }
 
+  startMsg(msgTypeTightFileListData);
   os->writeU8(outFlags);
   os->writeU16(static_cast<uint16_t>(filtered.size()));
   os->writeU16(static_cast<uint16_t>(rawNames.size()));

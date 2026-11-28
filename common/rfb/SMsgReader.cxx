@@ -991,6 +991,10 @@ bool SMsgReader::readTight2Message()
       is->clearRestorePoint();
       throw protocol_error(_("TightVNC file transfer block is too large"));
     }
+    if (compressLevel == 0 && csize != usize) {
+      is->clearRestorePoint();
+      throw protocol_error(_("Invalid uncompressed TightVNC upload size"));
+    }
     if (!is->hasDataOrRestore(csize))
       return false;
     std::vector<uint8_t> raw(csize);
