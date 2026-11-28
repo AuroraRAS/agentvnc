@@ -103,7 +103,7 @@ public:
 
   void enqueueTight13FileList(uint8_t flags, const std::string& dir);
   void enqueueTight13DownloadStart(uint8_t compressLevel, uint32_t position,
-                                   const std::string& path);
+                                   const std::string& path, uint64_t serial);
   void enqueueTight13DownloadNextChunk();
   void enqueueTight13DownloadCancel();
   void enqueueTight13UploadStart(uint32_t position, const std::string& path);
@@ -190,7 +190,7 @@ private:
 
   void handleTight13FileList(uint8_t flags, const std::string& rawPath);
   void handleTight13DownloadStart(uint8_t compressLevel, uint32_t position,
-                                  const std::string& rawPath);
+                                  const std::string& rawPath, uint64_t serial);
   void handleTight13DownloadNextChunk();
   void handleTight13UploadStart(uint32_t position, const std::string& rawPath);
   void handleTight13UploadData(const std::vector<uint8_t>& data);
@@ -240,6 +240,7 @@ private:
   uint8_t downloadCompressLevel_;
   bool downloadEof_;
   bool tight13DownloadActive_;
+  uint64_t tight13DownloadSerial_ = 0;
   std::vector<uint8_t> downloadPrefetch_;
 
   UploadMode uploadMode_;

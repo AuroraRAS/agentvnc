@@ -766,6 +766,8 @@ void ScrcpyClient::tight2DownloadStartRequest(const std::string& path,
 {
   if (!ensureFileTransferReady(false))
     return;
+  tight13DownloadPendingWrite_ = false;
+  ++tight13DownloadSerial_;
   ftSession_->enqueueTight2DownloadStart(path, offset);
 }
 
@@ -821,7 +823,8 @@ void ScrcpyClient::tight13FileDownloadRequest(uint8_t compressLevel,
   if (!ensureFileTransferReady(true, 0, true, false))
     return;
   tight13DownloadPendingWrite_ = false;
-  ftSession_->enqueueTight13DownloadStart(compressLevel, position, path);
+  ftSession_->enqueueTight13DownloadStart(compressLevel, position, path,
+                                           ++tight13DownloadSerial_);
 }
 
 void ScrcpyClient::tight13FileUploadRequest(uint8_t /*compressLevel*/,
@@ -855,6 +858,7 @@ void ScrcpyClient::tight13FileDownloadCancel(const std::string& /*reason*/)
 {
   noteActivity();
   tight13DownloadPendingWrite_ = false;
+  ++tight13DownloadSerial_;
   if (ftSession_)
     ftSession_->enqueueTight13DownloadCancel();
 }
@@ -943,6 +947,8 @@ void ScrcpyClient::processFileTransferEvents()
         writer()->writeTight13FileListData(reply.flags, reply.entries);
         break;
       case Kind::Tight13DownloadData:
+        if (reply.u64Val != tight13DownloadSerial_)
+          break;
         writer()->writeTight13FileDownloadData(
           reply.compressLevel,
           reply.data.empty() ? nullptr : reply.data.data(),
@@ -954,10 +960,14 @@ void ScrcpyClient::processFileTransferEvents()
         }
         break;
       case Kind::Tight13DownloadEnd:
+        if (reply.u64Val != tight13DownloadSerial_)
+          break;
         tight13DownloadPendingWrite_ = false;
         writer()->writeTight13FileDownloadEnd(reply.u32Val);
         break;
       case Kind::Tight13DownloadFailed:
+        if (reply.u64Val != tight13DownloadSerial_)
+          break;
         tight13DownloadPendingWrite_ = false;
         writer()->writeTight13FileDownloadFailed(reply.text);
         break;

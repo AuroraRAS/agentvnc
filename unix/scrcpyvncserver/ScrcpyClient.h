@@ -146,6 +146,7 @@ private:
   ZeroCopyOutStream zeroCopyOs_;
   std::unique_ptr<AdbFileTransferSession> ftSession_;
   bool tight13DownloadPendingWrite_;
+  uint64_t tight13DownloadSerial_ = 0;
   bool inProcessMessages_;
   bool receivedEncodings_;
   bool continuousUpdates_;

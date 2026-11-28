@@ -501,7 +501,7 @@ void AdbFileTransferSession::handleRequest(const Request& req)
     handleTight13FileList(req.u8Val, req.path);
     break;
   case Request::Kind::Tight13DownloadStart:
-    handleTight13DownloadStart(req.u8Val, req.u32Val, req.path);
+    handleTight13DownloadStart(req.u8Val, req.u32Val, req.path, req.u64Val);
     break;
   case Request::Kind::Tight13DownloadNextChunk:
     handleTight13DownloadNextChunk();
@@ -1741,18 +1741,21 @@ void AdbFileTransferSession::handleTight13FileList(uint8_t flags,
 }
 
 void AdbFileTransferSession::handleTight13DownloadStart(
-  uint8_t compressLevel, uint32_t position, const std::string& rawPath)
+  uint8_t compressLevel, uint32_t position, const std::string& rawPath,
+  uint64_t serial)
 {
   std::string err;
   if (!openDownloadInternal(rawPath, position, false, &err)) {
     Reply r;
     r.kind = Reply::Kind::Tight13DownloadFailed;
+    r.u64Val = tight13DownloadSerial_;
     r.text = err;
     postReply(std::move(r));
     return;
   }
 
   tight13DownloadActive_ = true;
+  tight13DownloadSerial_ = serial;
   downloadCompressLevel_ = compressLevel;
   handleTight13DownloadNextChunk();
 }
@@ -1769,6 +1772,7 @@ void AdbFileTransferSession::handleTight13DownloadNextChunk()
     closeDownload();
     Reply r;
     r.kind = Reply::Kind::Tight13DownloadFailed;
+    r.u64Val = serial;
     r.text = err;
     postReply(std::move(r));
     return;
@@ -1779,6 +1783,7 @@ void AdbFileTransferSession::handleTight13DownloadNextChunk()
     closeDownload();
     Reply r;
     r.kind = Reply::Kind::Tight13DownloadEnd;
+    r.u64Val = tight13DownloadSerial_;
     r.u32Val = mtimeSec;
     postReply(std::move(r));
     return;
@@ -1786,6 +1791,7 @@ void AdbFileTransferSession::handleTight13DownloadNextChunk()
 
   Reply r;
   r.kind = Reply::Kind::Tight13DownloadData;
+  r.u64Val = tight13DownloadSerial_;
   r.compressLevel = downloadCompressLevel_;
   r.data = std::move(chunk);
   postReply(std::move(r));
@@ -1990,10 +1996,12 @@ void AdbFileTransferSession::enqueueTight13FileList(uint8_t flags,
 
 void AdbFileTransferSession::enqueueTight13DownloadStart(uint8_t compressLevel,
                                                          uint32_t position,
-                                                         const std::string& path)
+                                                         const std::string& path,
+                                                         uint64_t serial)
 {
   Request req;
   req.kind = Request::Kind::Tight13DownloadStart;
+  req.u64Val = serial;
   req.u8Val = compressLevel;
   req.u32Val = position;
   req.path = path;
