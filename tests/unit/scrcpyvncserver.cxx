@@ -56,9 +56,11 @@
 #include <rfb/SSecurityVncAuth.h>
 #include <rfb/SecurityClient.h>
 #include <rfb/SecurityServer.h>
+#include <rfb/ServerCore.h>
 #include <rfb/ServerParams.h>
 #include <rfb/encodings.h>
 #include <rfb/fileTransferTypes.h>
+#include <rfb/giiTypes.h>
 #include <rfb/msgTypes.h>
 #include <rfb/screenTypes.h>
 #include <rfb/obfuscate.h>
@@ -286,6 +288,12 @@ uint32_t readBe32(const uint8_t* p)
 int32_t readBeS32(const uint8_t* p)
 {
   return static_cast<int32_t>(readBe32(p));
+}
+
+uint64_t readBe64(const uint8_t* p)
+{
+  return (static_cast<uint64_t>(readBe32(p)) << 32) |
+         static_cast<uint64_t>(readBe32(p + 4));
 }
 
 void writeAll(int fd, const void* buf, size_t len)
@@ -2843,4 +2851,780 @@ TEST(ScrcpyVncEndToEndTest, Tight2AndTight13FileTransferWithH264)
   }
 
   ::close(videoFds[1]);
+}
+
+namespace {
+
+class GiiScrcpyTestCConnection : public rfb::CConnection {
+public:
+  explicit GiiScrcpyTestCConnection(bool enableGiiOpt = true)
+  {
+    supportsFileTransfer = false;
+    supportsGII = enableGiiOpt;
+    setPreferredEncoding(rfb::encodingH264);
+  }
+
+  bool initialized = false;
+  std::vector<uint16_t> enabledVersions;
+  std::vector<uint32_t> createdOrigins;
+  std::vector<uint8_t> h264Frames;
+
+  rfb::CMsgWriter* msgWriter() { return writer(); }
+
+  void initDone() override
+  {
+    initialized = true;
+    setFramebuffer(new rfb::ManagedPixelBuffer(
+      rfb::PixelFormat(32, 24, false, true, 255, 255, 255, 16, 8, 0),
+      server.width(), server.height()));
+  }
+
+  void handleGIIEnabled(uint16_t version) override
+  {
+    enabledVersions.push_back(version);
+  }
+
+  void handleGIIDeviceCreated(uint32_t deviceOrigin) override
+  {
+    createdOrigins.push_back(deviceOrigin);
+  }
+
+  void bell() override {}
+  void getUserPasswd(std::string*, std::string*) override {}
+  bool verifyCertificate(unsigned int, const uint8_t*, size_t) override
+  {
+    return true;
+  }
+  bool verifyHostKey(const uint8_t*, size_t, const char*) override
+  {
+    return true;
+  }
+
+  bool dataRect(const core::Rect& r, int encoding) override
+  {
+    if (encoding == rfb::encodingH264) {
+      if (!getInStream()->hasData(8))
+        return false;
+      getInStream()->setRestorePoint();
+      uint32_t len = getInStream()->readU32();
+      getInStream()->skip(4);
+      if (!getInStream()->hasDataOrRestore(len))
+        return false;
+      getInStream()->clearRestorePoint();
+      size_t old = h264Frames.size();
+      h264Frames.resize(old + len);
+      if (len > 0)
+        getInStream()->readBytes(h264Frames.data() + old, len);
+      return true;
+    }
+    return rfb::CConnection::dataRect(r, encoding);
+  }
+};
+
+struct GiiTestParamGuard {
+  std::string savedSecTypes;
+  bool savedGii;
+  bool savedAcceptPtr;
+  bool savedAcceptKey;
+
+  GiiTestParamGuard()
+    : savedSecTypes(rfb::SecurityServer::secTypes.getValueStr()),
+      savedGii(static_cast<bool>(gii)),
+      savedAcceptPtr(static_cast<bool>(rfb::Server::acceptPointerEvents)),
+      savedAcceptKey(static_cast<bool>(rfb::Server::acceptKeyEvents))
+  {}
+
+  ~GiiTestParamGuard()
+  {
+    rfb::SecurityServer::secTypes.setParam(savedSecTypes.c_str());
+    gii.setParam(savedGii);
+    rfb::Server::acceptPointerEvents.setParam(savedAcceptPtr);
+    rfb::Server::acceptKeyEvents.setParam(savedAcceptKey);
+  }
+};
+
+rfb::GIIDevice makeTestStylusDevice(const char* name = "Wacom Stylus")
+{
+  rfb::GIIDevice dev;
+  dev.name = name;
+  dev.vendorID = 0x056a;
+  dev.productID = 0x0357;
+  dev.canGenerate = rfb::giiEventMaskValuatorAbsolute |
+                    rfb::giiEventMaskValuatorRelative |
+                    rfb::giiEventMaskPtrButtonPress |
+                    rfb::giiEventMaskPtrButtonRelease |
+                    rfb::giiEventMaskKeyPress |
+                    rfb::giiEventMaskKeyRelease |
+                    rfb::giiEventMaskKeyRepeat;
+  dev.numButtons = 9;
+
+  rfb::GIIValuator xVal;
+  xVal.index = 0;
+  xVal.longName = "Abs X";
+  xVal.shortName = "X";
+  xVal.rangeMin = 0;
+  xVal.rangeMax = 30000;
+  dev.valuators.push_back(xVal);
+
+  rfb::GIIValuator yVal;
+  yVal.index = 1;
+  yVal.longName = "Abs Y";
+  yVal.shortName = "Y";
+  yVal.rangeMin = 0;
+  yVal.rangeMax = 20000;
+  dev.valuators.push_back(yVal);
+
+  rfb::GIIValuator pVal;
+  pVal.index = 2;
+  pVal.longName = "Abs Pressure";
+  pVal.shortName = "Prs";
+  pVal.rangeMin = 0;
+  pVal.rangeMax = 8191;
+  pVal.siUnit = rfb::giiUnitPressure;
+  dev.valuators.push_back(pVal);
+
+  rfb::GIIValuator wVal;
+  wVal.index = 3;
+  wVal.longName = "Rel Wheel";
+  wVal.shortName = "Whl";
+  dev.valuators.push_back(wVal);
+
+  return dev;
+}
+
+void expectNoReadableBytes(int fd, int waitMs = 20)
+{
+  struct pollfd pfd = { fd, POLLIN, 0 };
+  EXPECT_EQ(::poll(&pfd, 1, waitMs), 0);
+}
+
+void readControlMessageSkipReset(int fd, uint8_t* buf, size_t len,
+                                 int timeoutMs = 3000)
+{
+  ASSERT_GT(len, 0u);
+  uint8_t b = 17;
+  while (b == 17)
+    readAllTimeout(fd, &b, 1, timeoutMs);
+  buf[0] = b;
+  if (len > 1)
+    readAllTimeout(fd, buf + 1, len - 1, timeoutMs);
+}
+
+void expectNoControlInput(int fd, int waitMs = 20)
+{
+  int timeout = waitMs;
+  while (true) {
+    struct pollfd pfd = { fd, POLLIN, 0 };
+    if (::poll(&pfd, 1, timeout) <= 0)
+      break;
+    timeout = 0;
+    uint8_t b = 0;
+    ssize_t n = ::recv(fd, &b, 1, MSG_DONTWAIT);
+    if (n <= 0)
+      break;
+    if (b == 17)
+      continue;
+    ADD_FAILURE() << "Unexpected scrcpy control message byte: "
+                  << static_cast<unsigned>(b);
+    break;
+  }
+}
+
+} // namespace
+
+TEST(ScrcpyControlTest, GIIStylusMultiTouchButtonsWheelAndKeys)
+{
+  int fds[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, fds), 0);
+
+  ScrcpyControl ctrl;
+  ctrl.attach(fds[0]);
+
+  rfb::GIIDevice stylus1 = makeTestStylusDevice("Stylus 1");
+  uint32_t origin1 = ctrl.createGIIDevice(stylus1);
+  ASSERT_NE(origin1, 0u);
+  EXPECT_EQ(ctrl.activeGIIDeviceCount(), 1u);
+
+  const uint64_t expectedPtr1 = UINT64_C(0x4749490000000000) | origin1;
+  const uint64_t mousePtr = UINT64_C(-1);
+
+  // 1. Hover before press emits ACTION_HOVER_MOVE with scaled coords
+  rfb::GIIEvent hover;
+  hover.type = rfb::giiEventValuatorAbsolute;
+  hover.origin = origin1;
+  hover.first = 0;
+  hover.values = { 15000, 10000, 0 };
+  ctrl.handleGIIEvent(hover, 1920, 1080);
+
+  uint8_t touch[32];
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[0], 2); // INJECT_TOUCH_EVENT
+  EXPECT_EQ(touch[1], 7); // ACTION_HOVER_MOVE
+  EXPECT_EQ(readBe64(touch + 2), mousePtr);
+  EXPECT_EQ(readBe32(touch + 10), 960u);
+  EXPECT_EQ(readBe32(touch + 14), 540u);
+  EXPECT_EQ(readBe16(touch + 18), 1920u);
+  EXPECT_EQ(readBe16(touch + 20), 1080u);
+  EXPECT_EQ(readBe16(touch + 22), 0u);
+  EXPECT_EQ(readBe32(touch + 28), 0u);
+
+  // 2. Pressure sample + button 1 press emits ACTION_DOWN on device pointerId
+  rfb::GIIEvent prs;
+  prs.type = rfb::giiEventValuatorAbsolute;
+  prs.origin = origin1;
+  prs.first = 2;
+  prs.values = { 4096 };
+  ctrl.handleGIIEvent(prs, 1920, 1080);
+  expectNoReadableBytes(fds[1], 10);
+
+  rfb::GIIEvent btn1Down;
+  btn1Down.type = rfb::giiEventPtrButtonPress;
+  btn1Down.origin = origin1;
+  btn1Down.button = 1;
+  ctrl.handleGIIEvent(btn1Down, 1920, 1080);
+
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[0], 2);
+  EXPECT_EQ(touch[1], 0); // ACTION_DOWN
+  EXPECT_EQ(readBe64(touch + 2), expectedPtr1);
+  EXPECT_EQ(readBe32(touch + 10), 960u);
+  EXPECT_EQ(readBe32(touch + 14), 540u);
+  EXPECT_NEAR(readBe16(touch + 22), 32772u, 2u);
+  EXPECT_EQ(readBe32(touch + 24), 1u);
+  EXPECT_EQ(readBe32(touch + 28), 1u);
+
+  // 3. Pressure-only change at same coordinates emits ACTION_MOVE
+  prs.values = { 8191 };
+  ctrl.handleGIIEvent(prs, 1920, 1080);
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[1], 2); // ACTION_MOVE
+  EXPECT_EQ(readBe64(touch + 2), expectedPtr1);
+  EXPECT_EQ(readBe16(touch + 22), 65535u);
+
+  // 4. Second concurrent stylus device uses an independent pointerId
+  uint32_t origin2 = ctrl.createGIIDevice(makeTestStylusDevice("Stylus 2"));
+  ASSERT_NE(origin2, 0u);
+  ASSERT_NE(origin2, origin1);
+  const uint64_t expectedPtr2 = UINT64_C(0x4749490000000000) | origin2;
+
+  rfb::GIIEvent move2;
+  move2.type = rfb::giiEventValuatorAbsolute;
+  move2.origin = origin2;
+  move2.first = 0;
+  move2.values = { 30000, 20000 };
+  ctrl.handleGIIEvent(move2, 1920, 1080);
+  expectNoReadableBytes(fds[1], 10);
+
+  ctrl.handleVncPointer(400, 300, 0, 1920, 1080);
+  expectNoReadableBytes(fds[1], 10);
+
+  rfb::GIIEvent btn1Down2 = btn1Down;
+  btn1Down2.origin = origin2;
+  ctrl.handleGIIEvent(btn1Down2, 1920, 1080);
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[1], 0); // ACTION_DOWN
+  EXPECT_EQ(readBe64(touch + 2), expectedPtr2);
+  EXPECT_EQ(readBe32(touch + 10), 1919u);
+  EXPECT_EQ(readBe32(touch + 14), 1079u);
+
+  // Destroying origin1 while pressed releases origin1 only
+  ctrl.destroyGIIDevice(origin1, 1920, 1080);
+  EXPECT_EQ(ctrl.activeGIIDeviceCount(), 1u);
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[1], 1); // ACTION_UP
+  EXPECT_EQ(readBe64(touch + 2), expectedPtr1);
+  EXPECT_EQ(readBe32(touch + 10), 960u);
+  EXPECT_EQ(readBe32(touch + 14), 540u);
+  expectNoReadableBytes(fds[1], 10);
+
+  // Release origin2
+  rfb::GIIEvent btn1Up2;
+  btn1Up2.type = rfb::giiEventPtrButtonRelease;
+  btn1Up2.origin = origin2;
+  btn1Up2.button = 1;
+  ctrl.handleGIIEvent(btn1Up2, 1920, 1080);
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[1], 1); // ACTION_UP
+  EXPECT_EQ(readBe64(touch + 2), expectedPtr2);
+
+  // 5. Secondary/tertiary/back/forward mouse buttons & wheel on origin2
+  const struct {
+    uint32_t giiBtn;
+    uint32_t androidBit;
+  } kMouseMap[] = {
+    { 2, 1u << 1 },
+    { 3, 1u << 2 },
+    { 8, 1u << 3 },
+    { 9, 1u << 4 },
+  };
+  for (const auto& m : kMouseMap) {
+    rfb::GIIEvent p;
+    p.type = rfb::giiEventPtrButtonPress;
+    p.origin = origin2;
+    p.button = m.giiBtn;
+    ctrl.handleGIIEvent(p, 1920, 1080);
+    readAllTimeout(fds[1], touch, sizeof(touch));
+    EXPECT_EQ(touch[1], 0);
+    EXPECT_EQ(readBe64(touch + 2), mousePtr);
+    EXPECT_EQ(readBe32(touch + 24), m.androidBit);
+    EXPECT_EQ(readBe32(touch + 28), m.androidBit);
+
+    rfb::GIIEvent r;
+    r.type = rfb::giiEventPtrButtonRelease;
+    r.origin = origin2;
+    r.button = m.giiBtn;
+    ctrl.handleGIIEvent(r, 1920, 1080);
+    readAllTimeout(fds[1], touch, sizeof(touch));
+    EXPECT_EQ(touch[1], 1);
+    EXPECT_EQ(readBe32(touch + 24), m.androidBit);
+    EXPECT_EQ(readBe32(touch + 28), 0u);
+  }
+
+  rfb::GIIEvent wheelBtn;
+  wheelBtn.type = rfb::giiEventPtrButtonPress;
+  wheelBtn.origin = origin2;
+  wheelBtn.button = 4; // scroll up
+  ctrl.handleGIIEvent(wheelBtn, 1920, 1080);
+  uint8_t scroll[21];
+  readAllTimeout(fds[1], scroll, sizeof(scroll));
+  EXPECT_EQ(scroll[0], 3); // INJECT_SCROLL_EVENT
+  EXPECT_EQ(readBeS16(scroll + 15), 2048);
+
+  rfb::GIIEvent wheelVal;
+  wheelVal.type = rfb::giiEventValuatorRelative;
+  wheelVal.origin = origin2;
+  wheelVal.first = 3;
+  wheelVal.values = { -2 };
+  ctrl.handleGIIEvent(wheelVal, 1920, 1080);
+  readAllTimeout(fds[1], scroll, sizeof(scroll));
+  EXPECT_EQ(scroll[0], 3);
+  EXPECT_EQ(readBeS16(scroll + 15), -4096);
+
+  // 6. Relative pointer motion + clamping after simulated resize (1080x1920)
+  rfb::GIIEvent relPtr;
+  relPtr.type = rfb::giiEventPtrRelative;
+  relPtr.origin = origin2;
+  relPtr.x = 5000;
+  relPtr.y = -5000;
+  relPtr.wheel = 1;
+  ctrl.handleGIIEvent(relPtr, 1080, 1920);
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[1], 7);
+  EXPECT_EQ(readBe32(touch + 10), 1079u);
+  EXPECT_EQ(readBe32(touch + 14), 0u);
+  EXPECT_EQ(readBe16(touch + 18), 1080u);
+  EXPECT_EQ(readBe16(touch + 20), 1920u);
+  readAllTimeout(fds[1], scroll, sizeof(scroll));
+  EXPECT_EQ(scroll[0], 3);
+  EXPECT_EQ(readBeS16(scroll + 15), 2048);
+
+  // 7. Key press, repeat, Unicode text fallback, and release-on-destroy
+  rfb::GIIEvent keyDown;
+  keyDown.type = rfb::giiEventKeyPress;
+  keyDown.origin = origin2;
+  keyDown.symbol = 0x0061; // 'a'
+  keyDown.button = 38;
+  keyDown.modifiers = 0x01; // Shift
+  ctrl.handleGIIEvent(keyDown, 1080, 1920);
+  uint8_t keyMsg[14];
+  readAllTimeout(fds[1], keyMsg, sizeof(keyMsg));
+  EXPECT_EQ(keyMsg[0], 0); // INJECT_KEYCODE
+  EXPECT_EQ(keyMsg[1], 0); // DOWN
+  EXPECT_EQ(readBe32(keyMsg + 2), 29u); // AKEYCODE_A
+  EXPECT_EQ(readBe32(keyMsg + 6), 0u);
+  EXPECT_EQ(readBe32(keyMsg + 10), 0x41u); // META_SHIFT_ON | META_SHIFT_LEFT_ON
+
+  rfb::GIIEvent keyRep = keyDown;
+  keyRep.type = rfb::giiEventKeyRepeat;
+  ctrl.handleGIIEvent(keyRep, 1080, 1920);
+  readAllTimeout(fds[1], keyMsg, sizeof(keyMsg));
+  EXPECT_EQ(keyMsg[1], 0);
+  EXPECT_EQ(readBe32(keyMsg + 6), 1u); // repeat = 1
+
+  rfb::GIIEvent unicodeKey;
+  unicodeKey.type = rfb::giiEventKeyPress;
+  unicodeKey.origin = origin2;
+  unicodeKey.symbol = 0x00E9; // U+00E9 'é' -> UTF-8 C3 A9
+  unicodeKey.button = 99;
+  ctrl.handleGIIEvent(unicodeKey, 1080, 1920);
+  uint8_t textMsg[7];
+  readAllTimeout(fds[1], textMsg, sizeof(textMsg));
+  EXPECT_EQ(textMsg[0], 1); // INJECT_TEXT
+  EXPECT_EQ(readBe32(textMsg + 1), 2u);
+  EXPECT_EQ(textMsg[5], 0xc3);
+  EXPECT_EQ(textMsg[6], 0xa9);
+
+  // Destroy origin2 while 'a' is still held -> emits KEY_ACTION_UP for 'a'
+  ctrl.destroyGIIDevice(origin2, 1080, 1920);
+  EXPECT_EQ(ctrl.activeGIIDeviceCount(), 0u);
+  readAllTimeout(fds[1], keyMsg, sizeof(keyMsg));
+  EXPECT_EQ(keyMsg[0], 0);
+  EXPECT_EQ(keyMsg[1], 1); // UP
+  EXPECT_EQ(readBe32(keyMsg + 2), 29u);
+
+  // 8. Buttonless pressure-only device triggers synthetic DOWN/MOVE/UP
+  rfb::GIIDevice btnless = makeTestStylusDevice("Buttonless Pen");
+  btnless.numButtons = 0;
+  btnless.canGenerate = rfb::giiEventMaskValuatorAbsolute;
+  uint32_t origin3 = ctrl.createGIIDevice(btnless);
+  ASSERT_NE(origin3, 0u);
+  const uint64_t expectedPtr3 = UINT64_C(0x4749490000000000) | origin3;
+
+  rfb::GIIEvent penDown;
+  penDown.type = rfb::giiEventValuatorAbsolute;
+  penDown.origin = origin3;
+  penDown.first = 0;
+  penDown.values = { 15000, 10000, 4096 };
+  ctrl.handleGIIEvent(penDown, 1920, 1080);
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[1], 0); // ACTION_DOWN
+  EXPECT_EQ(readBe64(touch + 2), expectedPtr3);
+  EXPECT_NEAR(readBe16(touch + 22), 32772u, 2u);
+
+  penDown.values = { 15000, 10000, 0 };
+  ctrl.handleGIIEvent(penDown, 1920, 1080);
+  readAllTimeout(fds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[1], 1); // ACTION_UP
+  EXPECT_EQ(readBe64(touch + 2), expectedPtr3);
+
+  ctrl.destroyGIIDevice(origin3, 1920, 1080);
+  ::close(fds[1]);
+}
+
+TEST(ScrcpyVncEndToEndTest, GIINegotiationEventsAndDisconnectCleanup)
+{
+  GiiTestParamGuard guard;
+  rfb::SecurityServer::secTypes.setParam("None");
+  gii.setParam(true);
+
+  int videoFds[2], controlFds[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, videoFds), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, controlFds), 0);
+  network::UnixSocket videoPeer(videoFds[1]);
+  network::UnixSocket controlPeer(controlFds[1]);
+
+  ScrcpyServer server;
+  server.attachStreamsForTest(videoFds[0], controlFds[0], ScrcpyProtocol::V2,
+                              1920, 1080, "WayDroidGII");
+
+  int clientPair[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, clientPair), 0);
+  network::UnixSocket clientSock(clientPair[1]);
+  ASSERT_TRUE(server.addSocket(new network::UnixSocket(clientPair[0]),
+                               rfb::AccessDefault));
+
+  GiiScrcpyTestCConnection cli(true);
+  cli.setStreams(&clientSock.inStream(), &clientSock.outStream());
+  cli.initialiseProtocol();
+
+  auto pumpUntil = [&](auto pred) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!pred() && std::chrono::steady_clock::now() < deadline) {
+      ASSERT_TRUE(server.step({}, 2));
+      if (!cli.processMsg())
+        ::poll(nullptr, 0, 1);
+    }
+    ASSERT_TRUE(pred());
+  };
+
+  pumpUntil([&]() { return cli.initialized && cli.server.supportsGII; });
+  EXPECT_EQ(cli.server.giiVersion, 1u);
+  ASSERT_EQ(cli.enabledVersions.size(), 1u);
+  EXPECT_EQ(cli.enabledVersions[0], 1u);
+
+  // Create a stylus device over RFB GII
+  rfb::GIIDevice stylus = makeTestStylusDevice("RFB Stylus");
+  cli.createGIIDevice(stylus);
+  pumpUntil([&]() { return !cli.createdOrigins.empty(); });
+  uint32_t origin = cli.createdOrigins[0];
+  ASSERT_NE(origin, 0u);
+  EXPECT_EQ(server.activeGIIDeviceCount(), 1u);
+
+  // Send batched valuators + button 1 press + move
+  rfb::GIIEvent evVal;
+  evVal.type = rfb::giiEventValuatorAbsolute;
+  evVal.origin = origin;
+  evVal.first = 0;
+  evVal.values = { 15000, 10000, 4096 };
+
+  rfb::GIIEvent evBtn;
+  evBtn.type = rfb::giiEventPtrButtonPress;
+  evBtn.origin = origin;
+  evBtn.button = 1;
+
+  rfb::GIIEvent evMove;
+  evMove.type = rfb::giiEventValuatorAbsolute;
+  evMove.origin = origin;
+  evMove.first = 0;
+  evMove.values = { 20000, 15000, 6144 };
+
+  cli.sendGIIEvents({ evVal, evBtn, evMove });
+  ASSERT_TRUE(server.step({}, 5));
+
+  uint8_t touch[32];
+  readControlMessageSkipReset(controlFds[1], touch, sizeof(touch)); // hover from evVal
+  EXPECT_EQ(touch[1], 7);
+  readControlMessageSkipReset(controlFds[1], touch, sizeof(touch)); // down from evBtn
+  EXPECT_EQ(touch[1], 0);
+  EXPECT_EQ(readBe64(touch + 2), UINT64_C(0x4749490000000000) | origin);
+  readControlMessageSkipReset(controlFds[1], touch, sizeof(touch)); // move from evMove
+  EXPECT_EQ(touch[1], 2);
+  EXPECT_EQ(readBe32(touch + 10), 1279u);
+  EXPECT_EQ(readBe32(touch + 14), 809u);
+
+  // Verify H.264 frame delivery still works cleanly alongside GII
+  cli.msgWriter()->writeEnableContinuousUpdates(true, 0, 0, 1920, 1080);
+  sendScrcpyPacket(videoFds[1], UINT64_C(1) << 63,
+                   kFrame1080, kFrame1080SpsPpsLen);
+  sendScrcpyPacket(videoFds[1], UINT64_C(1) << 62,
+                   kFrame1080 + kFrame1080SpsPpsLen,
+                   sizeof(kFrame1080) - kFrame1080SpsPpsLen);
+  pumpUntil([&]() { return cli.h264Frames.size() >= sizeof(kFrame1080); });
+  EXPECT_EQ(cli.h264Frames.size(), sizeof(kFrame1080));
+  EXPECT_EQ(std::memcmp(cli.h264Frames.data(), kFrame1080, sizeof(kFrame1080)), 0);
+
+  // Invalid events must be dropped without forwarding to scrcpy control
+  rfb::GIIEvent badOrigin = evBtn;
+  badOrigin.origin = origin + 999;
+  rfb::GIIEvent badBtn = evBtn;
+  badBtn.button = 99;
+  rfb::GIIEvent badVal = evVal;
+  badVal.first = 10;
+  rfb::GIIEvent badMask;
+  badMask.type = rfb::giiEventPtrRelative; // not in stylus.canGenerate
+  badMask.origin = origin;
+  badMask.x = 5;
+  cli.sendGIIEvents({ badOrigin, badBtn, badVal, badMask });
+  ASSERT_TRUE(server.step({}, 5));
+  expectNoControlInput(controlFds[1], 20);
+
+  // Hold a key and disconnect even after gii is toggled off -> cleanup must still run
+  rfb::GIIEvent keyDown;
+  keyDown.type = rfb::giiEventKeyPress;
+  keyDown.origin = origin;
+  keyDown.symbol = 0x0061;
+  keyDown.button = 38;
+  cli.sendGIIEvent(keyDown);
+  ASSERT_TRUE(server.step({}, 5));
+  uint8_t keyMsg[14];
+  readControlMessageSkipReset(controlFds[1], keyMsg, sizeof(keyMsg));
+  EXPECT_EQ(keyMsg[0], 0);
+  EXPECT_EQ(keyMsg[1], 0);
+
+  gii.setParam(false);
+  cli.close();
+  ::shutdown(clientSock.getFd(), SHUT_RDWR);
+  for (int i = 0; i < 5 && server.activeGIIDeviceCount() > 0; ++i)
+    ASSERT_TRUE(server.step({}, 5));
+  EXPECT_EQ(server.activeGIIDeviceCount(), 0u);
+
+  // Disconnect cleanup emitted ACTION_UP + KEY_ACTION_UP
+  readControlMessageSkipReset(controlFds[1], touch, sizeof(touch));
+  EXPECT_EQ(touch[0], 2);
+  EXPECT_EQ(touch[1], 1); // ACTION_UP
+  EXPECT_EQ(readBe64(touch + 2), UINT64_C(0x4749490000000000) | origin);
+
+  readControlMessageSkipReset(controlFds[1], keyMsg, sizeof(keyMsg));
+  EXPECT_EQ(keyMsg[0], 0);
+  EXPECT_EQ(keyMsg[1], 1); // KEY_ACTION_UP
+  EXPECT_EQ(readBe32(keyMsg + 2), 29u);
+}
+
+TEST(ScrcpyVncEndToEndTest, GIIAccessRightsIsolationAndDisableFlags)
+{
+  GiiTestParamGuard guard;
+  rfb::SecurityServer::secTypes.setParam("None");
+  gii.setParam(true);
+
+  int videoFds[2], controlFds[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, videoFds), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, controlFds), 0);
+  network::UnixSocket videoPeer(videoFds[1]);
+  network::UnixSocket controlPeer(controlFds[1]);
+
+  ScrcpyServer server;
+  server.attachStreamsForTest(videoFds[0], controlFds[0], ScrcpyProtocol::V2,
+                              1920, 1080, "WayDroidGIISec");
+
+  int pairA[2], pairB[2], pairC[2];
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pairA), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pairB), 0);
+  ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pairC), 0);
+  network::UnixSocket sockA(pairA[1]), sockB(pairB[1]), sockC(pairC[1]);
+
+  ASSERT_TRUE(server.addSocket(new network::UnixSocket(pairA[0]),
+                               rfb::AccessDefault));
+  ASSERT_TRUE(server.addSocket(new network::UnixSocket(pairB[0]),
+                               rfb::AccessView | rfb::AccessNoQuery));
+  ASSERT_TRUE(server.addSocket(new network::UnixSocket(pairC[0]),
+                               rfb::AccessDefault));
+
+  GiiScrcpyTestCConnection cliA(true), cliB(true), cliC(true);
+  cliA.setShared(true);
+  cliB.setShared(true);
+  cliC.setShared(true);
+  cliA.setStreams(&sockA.inStream(), &sockA.outStream());
+  cliB.setStreams(&sockB.inStream(), &sockB.outStream());
+  cliC.setStreams(&sockC.inStream(), &sockC.outStream());
+  cliA.initialiseProtocol();
+  cliB.initialiseProtocol();
+  cliC.initialiseProtocol();
+
+  auto pumpAll = [&](auto pred) {
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+    while (!pred() && std::chrono::steady_clock::now() < deadline) {
+      ASSERT_TRUE(server.step({}, 2));
+      bool progress = false;
+      progress |= cliA.processMsg();
+      progress |= cliB.processMsg();
+      progress |= cliC.processMsg();
+      if (!progress)
+        ::poll(nullptr, 0, 1);
+    }
+    ASSERT_TRUE(pred());
+  };
+
+  pumpAll([&]() {
+    return cliA.initialized && cliA.server.supportsGII &&
+           cliB.initialized && cliB.server.supportsGII &&
+           cliC.initialized && cliC.server.supportsGII;
+  });
+
+  // Client A creates device
+  rfb::GIIDevice dev = makeTestStylusDevice("ClientA Stylus");
+  cliA.createGIIDevice(dev);
+  pumpAll([&]() { return cliA.createdOrigins.size() == 1; });
+  uint32_t originA = cliA.createdOrigins[0];
+  ASSERT_NE(originA, 0u);
+
+  // View-only Client B must receive origin 0 on creation
+  cliB.createGIIDevice(dev);
+  pumpAll([&]() { return cliB.createdOrigins.size() == 1; });
+  EXPECT_EQ(cliB.createdOrigins[0], 0u);
+
+  // Cross-client isolation: Client C cannot inject or destroy Client A's device
+  rfb::GIIEvent spoof;
+  spoof.type = rfb::giiEventPtrButtonPress;
+  spoof.origin = originA;
+  spoof.button = 1;
+  cliC.sendGIIEvent(spoof);
+  cliC.destroyGIIDevice(originA);
+  ASSERT_TRUE(server.step({}, 10));
+  expectNoControlInput(controlFds[1], 20);
+  EXPECT_EQ(server.activeGIIDeviceCount(), 1u);
+
+  // Server::acceptPointerEvents / acceptKeyEvents enforcement
+  rfb::Server::acceptPointerEvents.setParam(false);
+  cliA.sendGIIEvent(spoof);
+  ASSERT_TRUE(server.step({}, 5));
+  expectNoControlInput(controlFds[1], 15);
+  rfb::Server::acceptPointerEvents.setParam(true);
+
+  rfb::Server::acceptKeyEvents.setParam(false);
+  rfb::GIIEvent keyEv;
+  keyEv.type = rfb::giiEventKeyPress;
+  keyEv.origin = originA;
+  keyEv.symbol = 0x0061;
+  keyEv.button = 38;
+  cliA.sendGIIEvent(keyEv);
+  ASSERT_TRUE(server.step({}, 5));
+  expectNoControlInput(controlFds[1], 15);
+  rfb::Server::acceptKeyEvents.setParam(true);
+
+  // Protocol error if a client sends GII device create before version message
+  {
+    int badPair[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, badPair), 0);
+    network::UnixSocket badSock(badPair[1]);
+    ASSERT_TRUE(server.addSocket(new network::UnixSocket(badPair[0]),
+                                 rfb::AccessDefault));
+    ASSERT_NO_FATAL_FAILURE(initialiseRfb(server, badSock.getFd()));
+
+    uint8_t encodings[] = {
+      rfb::msgTypeSetEncodings, 0, 0, 2,
+      0, 0, 0, 0,
+      0, 0, 0, 0
+    };
+    writeBe32(encodings + 4, static_cast<uint32_t>(rfb::encodingH264));
+    writeBe32(encodings + 8, static_cast<uint32_t>(rfb::pseudoEncodingGII));
+    writeAll(badSock.getFd(), encodings, sizeof(encodings));
+    ASSERT_TRUE(server.step({}, 5));
+
+    // Drain server GII version message (8 bytes), then send giiClientDeviceCreate without giiClientVersion
+    uint8_t verMsg[8];
+    readAllTimeout(badSock.getFd(), verMsg, sizeof(verMsg));
+    EXPECT_EQ(verMsg[0], rfb::msgTypeGIIServerMessage);
+    EXPECT_EQ(verMsg[1] & rfb::giiSubTypeMask, rfb::giiServerVersion);
+    EXPECT_EQ(readBe16(verMsg + 2), 4u);
+    EXPECT_EQ(readBe16(verMsg + 4), 1u);
+    EXPECT_EQ(readBe16(verMsg + 6), 1u);
+
+    uint8_t badCreate[4 + 56] = {};
+    badCreate[0] = rfb::msgTypeGIIClientMessage;
+    badCreate[1] = rfb::giiBigEndian | rfb::giiClientDeviceCreate;
+    writeBe16(badCreate + 2, 56);
+    writeAll(badSock.getFd(), badCreate, sizeof(badCreate));
+    ASSERT_TRUE(server.step({}, 5));
+
+    uint8_t byte;
+    EXPECT_EQ(::recv(badSock.getFd(), &byte, 1, MSG_DONTWAIT), 0);
+  }
+
+  // -GII=0 disables GII negotiation
+  {
+    gii.setParam(false);
+    int pairD[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pairD), 0);
+    network::UnixSocket sockD(pairD[1]);
+    ASSERT_TRUE(server.addSocket(new network::UnixSocket(pairD[0]),
+                                 rfb::AccessDefault));
+
+    GiiScrcpyTestCConnection cliD(true);
+    cliD.setShared(true);
+    cliD.setStreams(&sockD.inStream(), &sockD.outStream());
+    cliD.initialiseProtocol();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!cliD.initialized && std::chrono::steady_clock::now() < deadline) {
+      ASSERT_TRUE(server.step({}, 5));
+      if (!cliD.processMsg())
+        ::poll(nullptr, 0, 2);
+    }
+    ASSERT_TRUE(cliD.initialized);
+    cliD.msgWriter()->writeFramebufferUpdateRequest({0, 0, 1, 1}, false);
+    ASSERT_TRUE(server.step({}, 10));
+    cliD.processMsg();
+    EXPECT_FALSE(cliD.server.supportsGII);
+    gii.setParam(true);
+  }
+
+  // Missing control channel disables GII negotiation
+  {
+    int vidOnly[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, vidOnly), 0);
+    network::UnixSocket vidPeer(vidOnly[1]);
+    ScrcpyServer noCtrlServer;
+    noCtrlServer.attachStreamsForTest(vidOnly[0], -1, ScrcpyProtocol::V2,
+                                      1920, 1080, "NoCtrl");
+
+    int pairE[2];
+    ASSERT_EQ(::socketpair(AF_UNIX, SOCK_STREAM, 0, pairE), 0);
+    network::UnixSocket sockE(pairE[1]);
+    ASSERT_TRUE(noCtrlServer.addSocket(new network::UnixSocket(pairE[0]),
+                                       rfb::AccessDefault));
+
+    GiiScrcpyTestCConnection cliE(true);
+    cliE.setStreams(&sockE.inStream(), &sockE.outStream());
+    cliE.initialiseProtocol();
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(3);
+    while (!cliE.initialized && std::chrono::steady_clock::now() < deadline) {
+      ASSERT_TRUE(noCtrlServer.step({}, 5));
+      if (!cliE.processMsg())
+        ::poll(nullptr, 0, 2);
+    }
+    ASSERT_TRUE(cliE.initialized);
+    cliE.msgWriter()->writeFramebufferUpdateRequest({0, 0, 1, 1}, false);
+    ASSERT_TRUE(noCtrlServer.step({}, 10));
+    cliE.processMsg();
+    EXPECT_FALSE(cliE.server.supportsGII);
+  }
 }
